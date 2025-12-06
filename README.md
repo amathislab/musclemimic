@@ -2,16 +2,36 @@
 
 **MyoFullBody – an open-source full-body musculoskeletal model**
 
-MyoFullBody is a physiologically realistic, muscle-driven full-body model built on top of [MyoSuite](https://github.com/myohub/myosuite).  
+MyoFullBody is part of the [**MuscleMimic**](https://github.com/amathislab/musclemimic) research project artifacts. It is a physiologically realistic, muscle-driven full-body model built on top of [MyoSuite](https://github.com/myohub/myosuite).  
 It enables **neuromuscular motor control research**, supporting full body motion tasks with **Hill-type muscle actuators** and **no torque-based control**.
 
 This repository also includes the **BimanualMuscle** environment for upper-body, fixed-base tasks, making the project useful for a wide range of motion imitation and control problems.
 
 ---
 
+## Demos of capable motions
+
+MyoFullBody enables realistic full-body motion control with pure muscle actuation. Below are example motions demonstrating the model's capabilities, all policies were trained with MuscleMimic.
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <b>Running</b><br>
+      Full-body locomotion with coordinated muscle actuation.<br>
+      <video src="https://github.com/user-attachments/assets/323cdf33-95e9-41a5-a8a0-846df99c5958" width="320" controls></video>
+    </td>
+    <td align="center" width="50%">
+      <b>Air Kick</b><br>
+      Dynamic kicking motion with balance control.<br>
+      <video src="https://github.com/user-attachments/assets/5198b62b-46f0-4d06-b541-6172a412cc4e" width="320" controls></video>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Musculoskeletal Models
 
-MyoFullBody is part of the [**MuscleMimic**](https://github.com/amathislab/musclemimic) research project artifacts.  
+ 
 We provide two complementary embodiments tailored to different applications:
 
 - **BimanualMuscle** – upper-body, fixed-base model
