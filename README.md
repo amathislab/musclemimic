@@ -27,6 +27,9 @@ MyoFullBody enables realistic full-body motion control with pure muscle actuatio
   </tr>
 </table>
 
+Below we showcase a walking motion and extract the corresponding synthetic muscle activation patterns for three leg muscles along two gait cycles.
+<video src="https://github.com/user-attachments/assets/da545e08-b241-451b-b02d-d3ad3e1ee41d" controls></video>
+    
 ---
 
 ## Musculoskeletal Models
