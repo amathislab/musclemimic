@@ -30,7 +30,7 @@ Both models are built on MyoSuite components, combining **MyoArm**, **MyoLegs**,
 
 ## BimanualMuscle Environment
 
-The **BimanualMuscle** environment is designed for **upper-body manipulation tas**
+The **BimanualMuscle** environment is designed for **upper-body manipulation task**
 
 **Key properties**
 
@@ -57,9 +57,9 @@ The **MyoFullBody** environment provides a **comprehensive full-body musculoskel
    - **123 degrees of freedom** from pelvis to fingertips
 2. **Muscle-based actuation**
    - **416 Hill-type muscle actuators** across major muscle groups  
-   - Realistic activation dynamics and muscle-tendon behaviour
+   - Realistic activation dynamics and muscle-tendon behavior
 3. **Contact-rich**
-   - We explicitly enable additional collision pairs, such as leg–leg, arm–leg, foot-foot, to capture the required self-contact behaviour, including bimanual interactions. 
+   - We explicitly enable additional collision pairs, such as leg–leg, arm–leg, foot-foot, to capture the required self-contact behavior, including bimanual interactions. 
   
       
 
@@ -72,7 +72,7 @@ The **MyoFullBody** environment provides a **comprehensive full-body musculoskel
 
 **Muscle Refinement**
 
-While building MyoFullBody and BimanualMuscle, we corrected left–right limb asymmetries and addressed several unexpected muscle-jumping behaviours. A few representative fixes are shown below.
+While building MyoFullBody and BimanualMuscle, we corrected left–right limb asymmetries and addressed several unexpected muscle-jumping behaviors. A few representative fixes are shown below.
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/c4772223-e655-46c4-9105-2db4938e6450" width="45%">
