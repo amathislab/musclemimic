@@ -1,4 +1,4 @@
-# MyoFullBody
+# MyoFullBody (Work In Progress)
 
 **MyoFullBody – an open-source full-body musculoskeletal model**
 
