@@ -1,6 +1,6 @@
 # MuscleMimic
 
-Full code, checkpoints, and retargeted dataset coming soon...
+Full code, checkpoints, and retargeted dataset coming soon (Expected date: Feb 25)...
 
 For the time being, please read our blog post: https://amathislab.github.io/mm-blog
 
