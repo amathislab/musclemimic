@@ -1,10 +1,11 @@
-import os
 import argparse
+import os
 from pathlib import Path
 
 import yaml
 
 import loco_mujoco
+
 
 def set_amass_path():
     """
@@ -26,10 +27,31 @@ def set_smpl_model_path():
     _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_SMPL_MODEL_PATH", path_to_conf=loco_mujoco.get_variables_path())
 
 
+def set_c3d_model_path():
+    """
+    Set the SMPL-X/SMPL-H model path used by C3D marker fitting.
+    """
+    parser = argparse.ArgumentParser(description="Set the C3D fitting body model path.")
+    parser.add_argument("--path", type=str, help="Path to SMPL-X/SMPL-H models used by C3D marker fitting.")
+    args = parser.parse_args()
+    _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_C3D_MODEL_PATH", path_to_conf=loco_mujoco.get_variables_path())
+
+
+def set_moshpp_assets_path():
+    """
+    Set the path to MoSh++ auxiliary assets used by C3D fitting.
+    """
+    parser = argparse.ArgumentParser(description="Set the MoSh++ auxiliary assets path.")
+    parser.add_argument("--path", type=str, help="Directory containing pose_body_prior.pkl and MoSh++ .npz assets.")
+    args = parser.parse_args()
+    _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_MOSHPP_ASSETS_PATH", path_to_conf=loco_mujoco.get_variables_path())
+
+
 def set_all_caches():
     """
     Set the path to which all converted datasets will be stored. This sets the following Variables:
     - MUSCLEMIMIC_CONVERTED_AMASS_PATH
+    - MUSCLEMIMIC_CONVERTED_C3D_PATH
     - MUSCLEMIMIC_CONVERTED_LAFAN1_PATH
     - MUSCLEMIMIC_CONVERTED_DEFAULT_PATH
 
@@ -40,14 +62,19 @@ def set_all_caches():
     parser.add_argument("--path", type=str, help="Path to which all converted datasets will be stored.")
     args = parser.parse_args()
     amass_path = os.path.join(args.path, "AMASS")
-    _set_path_in_yaml_conf(amass_path, "MUSCLEMIMIC_CONVERTED_AMASS_PATH",
-                           path_to_conf=loco_mujoco.get_variables_path())
+    _set_path_in_yaml_conf(
+        amass_path, "MUSCLEMIMIC_CONVERTED_AMASS_PATH", path_to_conf=loco_mujoco.get_variables_path()
+    )
+    c3d_path = os.path.join(args.path, "C3D")
+    _set_path_in_yaml_conf(c3d_path, "MUSCLEMIMIC_CONVERTED_C3D_PATH", path_to_conf=loco_mujoco.get_variables_path())
     lafan1_path = os.path.join(args.path, "LAFAN1")
-    _set_path_in_yaml_conf(lafan1_path, "MUSCLEMIMIC_CONVERTED_LAFAN1_PATH",
-                           path_to_conf=loco_mujoco.get_variables_path())
+    _set_path_in_yaml_conf(
+        lafan1_path, "MUSCLEMIMIC_CONVERTED_LAFAN1_PATH", path_to_conf=loco_mujoco.get_variables_path()
+    )
     default_path = os.path.join(args.path, "DEFAULT")
-    _set_path_in_yaml_conf(default_path, "MUSCLEMIMIC_CONVERTED_DEFAULT_PATH",
-                           path_to_conf=loco_mujoco.get_variables_path())
+    _set_path_in_yaml_conf(
+        default_path, "MUSCLEMIMIC_CONVERTED_DEFAULT_PATH", path_to_conf=loco_mujoco.get_variables_path()
+    )
 
 
 def set_converted_amass_path():
@@ -57,8 +84,17 @@ def set_converted_amass_path():
     parser = argparse.ArgumentParser(description="Set the path to which the converted AMASS dataset is stored.")
     parser.add_argument("--path", type=str, help="Path to which the converted AMASS dataset is stored.")
     args = parser.parse_args()
-    _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_CONVERTED_AMASS_PATH",
-                           path_to_conf=loco_mujoco.get_variables_path())
+    _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_CONVERTED_AMASS_PATH", path_to_conf=loco_mujoco.get_variables_path())
+
+
+def set_converted_c3d_path():
+    """
+    Set the path to which the converted C3D dataset is stored.
+    """
+    parser = argparse.ArgumentParser(description="Set the path to which the converted C3D dataset is stored.")
+    parser.add_argument("--path", type=str, help="Path to which the converted C3D dataset is stored.")
+    args = parser.parse_args()
+    _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_CONVERTED_C3D_PATH", path_to_conf=loco_mujoco.get_variables_path())
 
 
 def set_lafan1_path():
@@ -78,8 +114,9 @@ def set_converted_lafan1_path():
     parser = argparse.ArgumentParser(description="Set the path to which the converted LAFAN1 dataset is stored.")
     parser.add_argument("--path", type=str, help="Path to which the converted LAFAN1 dataset is stored.")
     args = parser.parse_args()
-    _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_CONVERTED_LAFAN1_PATH",
-                           path_to_conf=loco_mujoco.get_variables_path())
+    _set_path_in_yaml_conf(
+        args.path, "MUSCLEMIMIC_CONVERTED_LAFAN1_PATH", path_to_conf=loco_mujoco.get_variables_path()
+    )
 
 
 def _set_path_in_yaml_conf(path: str, attr: str, path_to_conf: str):

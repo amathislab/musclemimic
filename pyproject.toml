@@ -93,12 +93,20 @@ gmr = [
     "general-motion-retargeting @ git+https://github.com/amathislab/gmr_plus.git",
 ]
 
+# C3D file visualization
+c3d = [
+    "ezc3d",
+]
+
 [project.scripts]
 
 # Dataset path configuration
 musclemimic-set-smpl-model-path = "musclemimic.utils:set_smpl_model_path"
+musclemimic-set-c3d-model-path = "musclemimic.utils:set_c3d_model_path"
+musclemimic-set-moshpp-assets-path = "musclemimic.utils:set_moshpp_assets_path"
 musclemimic-set-amass-path = "musclemimic.utils:set_amass_path"
 musclemimic-set-conv-amass-path = "musclemimic.utils:set_converted_amass_path"
+musclemimic-set-conv-c3d-path = "musclemimic.utils:set_converted_c3d_path"
 musclemimic-set-lafan1-path = "musclemimic.utils:set_lafan1_path"
 musclemimic-set-conv-lafan1-path = "musclemimic.utils:set_converted_lafan1_path"
 musclemimic-set-all-caches = "musclemimic.utils:set_all_caches"
@@ -162,6 +170,7 @@ ignore = [
 known-first-party = ["musclemimic", "loco_mujoco"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "integration: marks tests as integration tests (may require external resources)",
 ]

@@ -1,25 +1,20 @@
-"""Minimal Viser-based viewer for MuscleMimic MuJoCo environments.
+"""Viser-based policy rollout viewer for MuscleMimic MuJoCo environments.
 
-Scope (MVP):
-- MuJoCo CPU environments only (no MJX batching yet)
-- Visual geoms per body merged into a single mesh and streamed via Viser
-- Basic controls: play/pause, reset, speed +/-
-
-Deliberately out-of-scope for MVP:
-- Ghost robot visualization (goal visuals)
-- Contact point/force visualization
-- Recording/export via Viser
+The viewer streams prebuilt body meshes by updating body poses each frame.
+Tendon visualization is delegated to ``ViserTendonLineRenderer``, which uses
+MuJoCo's own tendon visualization geoms and renders them as Viser line segments.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import mujoco
 import numpy as np
+
+from .viser_tendons import ViserTendonLineRenderer
 
 
 class ViserViewer:
@@ -49,13 +44,10 @@ class ViserViewer:
         self.frame_rate = frame_rate
         self.include_collision = include_collision
 
-        # Initialized during setup
+        # Created in _setup_viser(), after the concrete MuJoCo model is known.
         self._server = None
         self._handles = None
-        self._tendon_handle = None
-        self._tendon_scene = None
-        self._tendon_option = None
-        self._tendon_camera = None
+        self._tendon_renderer = None
         self._paused = False
         self._time_multiplier = 1.0
 
@@ -70,7 +62,7 @@ class ViserViewer:
             vars_in = {"params": ts.params, "run_stats": ts.run_stats}
             y, updates = self.agent_conf.network.apply(vars_in, obs_b, mutable=["run_stats"])
             pi, _ = y
-            ts_out = ts.replace(run_stats=updates["run_stats"])  # update stats
+            ts_out = ts.replace(run_stats=updates["run_stats"])
             a = pi.sample(seed=_rng)
             if hasattr(a, "ndim") and a.ndim > 1 and a.shape[0] == 1:
                 a = a[0]
@@ -93,21 +85,18 @@ class ViserViewer:
     def _setup_viser(self, model: mujoco.MjModel):
         try:
             import viser  # type: ignore
-            import viser.transforms as vtf  # used for type import completeness
         except Exception as e:  # pragma: no cover - optional dependency
             raise ImportError("Viser is not installed. Install optional extras with: pip install '.[viser]'") from e
 
-        # Lazy import trimesh helpers
+        # Mesh construction depends on optional visualization dependencies.
         from .viser_utils import build_body_meshes
 
         self._server = viser.ViserServer(label="musclemimic")
         self._server.scene.configure_environment_map(environment_intensity=0.8)
 
-        # GUI controls
         tabs = self._server.gui.add_tab_group()
         with tabs.add_tab("Controls", icon=viser.Icon.SETTINGS):
             self._status_html = self._server.gui.add_html("")
-            # Simulation
             with self._server.gui.add_folder("Simulation"):
                 self._pause_button = self._server.gui.add_button(
                     "Play" if self._paused else "Pause",
@@ -140,7 +129,17 @@ class ViserViewer:
                         self._time_multiplier = min(4.0, self._time_multiplier * 2.0)
                     self._update_status()
 
-        # Add ground plane grid
+            if model.ntendon > 0:
+                with self._server.gui.add_folder("Tendons"):
+                    tendon_show = self._server.gui.add_checkbox("Show", initial_value=True)
+
+                    @tendon_show.on_update
+                    def _(_ev) -> None:
+                        if self._tendon_renderer is None:
+                            return
+                        self._tendon_renderer.set_visible(bool(tendon_show.value))
+                        self._tendon_renderer.update(self._get_data())
+
         self._server.scene.add_grid(
             "/ground",
             width=10.0,
@@ -154,12 +153,11 @@ class ViserViewer:
             section_thickness=2,
         )
 
-        # Build body meshes
         body_meshes = build_body_meshes(model, include_collision=self.include_collision)
         handles = {}
         with self._server.atomic():
             for body_id, mesh in body_meshes.items():
-                # Use batched handle API even for batch=1 for future extension
+                # Batched handles keep per-frame pose updates as array assignments.
                 handle = self._server.scene.add_batched_meshes_trimesh(
                     f"/bodies/{body_id}",
                     mesh,
@@ -170,89 +168,13 @@ class ViserViewer:
                 )
                 handles[body_id] = handle
         self._handles = handles
-        self._setup_tendon_visuals(model)
+        if model.ntendon > 0:
+            self._tendon_renderer = ViserTendonLineRenderer(model, self._server, path="/tendons")
+            self._tendon_renderer.update(self._get_data())
         self._update_status()
 
-    def _setup_tendon_visuals(self, model: mujoco.MjModel) -> None:
-        if model.ntendon == 0:
-            return
-        maxgeom = max(10000, model.ngeom + model.ntendon * 20)
-        self._tendon_scene = mujoco.MjvScene(model, maxgeom=maxgeom)
-        self._tendon_option = mujoco.MjvOption()
-        self._tendon_option.flags[mujoco.mjtVisFlag.mjVIS_TENDON] = 1
-        self._tendon_camera = mujoco.MjvCamera()
-        points, colors = self._build_tendon_segments(model, self._get_data())
-        if points.size == 0:
-            return
-        self._tendon_handle = self._server.scene.add_line_segments(
-            "/tendons",
-            points=points,
-            colors=colors,
-            line_width=3,
-            visible=True,
-        )
-
-    def _build_tendon_segments(
-        self, model: mujoco.MjModel, data: mujoco.MjData
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if self._tendon_scene is None or self._tendon_option is None or self._tendon_camera is None:
-            return np.zeros((0, 2, 3), dtype=np.float32), np.zeros((0, 2, 3), dtype=np.uint8)
-        mujoco.mjv_updateScene(
-            model,
-            data,
-            self._tendon_option,
-            None,
-            self._tendon_camera,
-            mujoco.mjtCatBit.mjCAT_ALL,
-            self._tendon_scene,
-        )
-
-        # Vectorized extraction of tendon geoms
-        ngeom = self._tendon_scene.ngeom
-        if ngeom == 0:
-            return np.zeros((0, 2, 3), dtype=np.float32), np.zeros((0, 2, 3), dtype=np.uint8)
-
-        geoms = self._tendon_scene.geoms[:ngeom]
-
-        # Filter for tendon geoms only (vectorized)
-        objtype_arr = np.array([g.objtype for g in geoms], dtype=np.int32)
-        tendon_mask = objtype_arr == mujoco.mjtObj.mjOBJ_TENDON
-        tendon_indices = np.where(tendon_mask)[0]
-
-        if len(tendon_indices) == 0:
-            return np.zeros((0, 2, 3), dtype=np.float32), np.zeros((0, 2, 3), dtype=np.uint8)
-
-        # Extract data for tendon geoms (batch extraction)
-        n_tendons = len(tendon_indices)
-        positions = np.empty((n_tendons, 3), dtype=np.float32)
-        axes = np.empty((n_tendons, 3), dtype=np.float32)
-        halves = np.empty(n_tendons, dtype=np.float32)
-        rgbas = np.empty((n_tendons, 4), dtype=np.float32)
-
-        for i, idx in enumerate(tendon_indices):
-            g = geoms[idx]
-            positions[i] = g.pos
-            axes[i] = g.mat[:, 2]
-            halves[i] = g.size[2]
-            rgbas[i] = g.rgba
-
-        # Vectorized point calculation
-        offsets = axes * halves[:, np.newaxis]
-        p0 = positions - offsets
-        p1 = positions + offsets
-        points = np.stack([p0, p1], axis=1).astype(np.float32)
-
-        # Vectorized color calculation
-        rgbas = np.clip(rgbas, 0.0, 1.0)
-        rgb = rgbas[:, :3] * 0.7 * rgbas[:, 3:4]  # darker multiplier with alpha
-        colors_uint8 = (rgb * 255.0).astype(np.uint8)
-        # Each segment needs color for both endpoints
-        colors = np.stack([colors_uint8, colors_uint8], axis=1)
-
-        return points, colors
-
     def _get_data(self) -> mujoco.MjData:
-        # Navigate wrappers if any to find data
+        """Return the MuJoCo data object through common environment wrappers."""
         if hasattr(self.env, "data"):
             return self.env.data
         if hasattr(self.env, "env"):
@@ -272,11 +194,9 @@ class ViserViewer:
     def _sync_meshes(self, model: mujoco.MjModel, data: mujoco.MjData, update_tendons: bool = True) -> None:
         import numpy as _np
 
-        # body_xpos/xquat are sized to nbody
         body_xpos = _np.array(data.xpos)
         body_xquat = _np.array(data.xquat)
 
-        # Batch all updates in a single atomic context for better performance
         with self._server.atomic():
             for body_id, handle in self._handles.items():
                 if body_id >= len(body_xpos):
@@ -285,35 +205,26 @@ class ViserViewer:
                 quat = body_xquat[body_id]  # wxyz
                 handle.batched_positions = _np.array([pos], dtype=float)
                 handle.batched_wxyzs = _np.array([quat], dtype=float)
-            # Update tendons within same atomic context
-            if update_tendons and self._tendon_handle is not None:
-                points, colors = self._build_tendon_segments(model, data)
-                self._tendon_handle.points = points
-                self._tendon_handle.colors = colors
-        # push changes to clients
+            if update_tendons and self._tendon_renderer is not None:
+                self._tendon_renderer.update(data)
         self._server.flush()
 
     def _sync_tendons(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
-        if self._tendon_handle is None:
+        del model
+        if self._tendon_renderer is None:
             return
-        points, colors = self._build_tendon_segments(model, data)
-        self._tendon_handle.points = points
-        self._tendon_handle.colors = colors
+        self._tendon_renderer.update(data)
 
     def run(self, n_steps: int | None = None) -> None:
         """Main loop: sample actions, step env, and stream transforms to Viser."""
-        # Resolve model/data from environment
         model = self.env.model if hasattr(self.env, "model") else self.env.env.model
         data = self._get_data()
 
-        # Prepare policy
         plcy_call, train_state, rng = self._prepare_policy()
 
-        # Reset env and forward kinematics
         obs = self.env.reset()
         mujoco.mj_forward(model, data)
 
-        # Set up Viser (now data has valid state for tendon visualization)
         self._setup_viser(model)
         self._sync_meshes(model, data)
 
@@ -328,13 +239,11 @@ class ViserViewer:
                 t0 = time.time()
 
                 if not self._paused:
-                    # Sample and step
                     rng, _rng = jax.random.split(rng)
                     action, train_state = plcy_call(train_state, obs, _rng)
                     action = jnp.atleast_2d(action)
                     obs, _r, _abs, done, _info = self.env.step(action)
 
-                    # Sync transforms
                     mujoco.mj_forward(model, data)
                     self._sync_meshes(model, data)
 
@@ -345,7 +254,6 @@ class ViserViewer:
 
                     step_count += 1
 
-                # Frame pacing
                 elapsed = time.time() - t0
                 to_sleep = max(0.0, (target_dt / self._time_multiplier) - elapsed)
                 if to_sleep > 0:
@@ -354,7 +262,6 @@ class ViserViewer:
         except KeyboardInterrupt:
             pass
         finally:
-            # Attempt to close server cleanly
             try:
                 if self._server is not None:
                     self._server.stop()
