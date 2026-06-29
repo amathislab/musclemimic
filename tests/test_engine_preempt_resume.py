@@ -40,7 +40,6 @@ def _patch_run_experiment_dependencies(monkeypatch, tmp_path: Path, captured: di
 
     monkeypatch.setattr(engine, "setup_jax_cache", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(engine, "setup_wandb", lambda _config: (False, None))
-    monkeypatch.setattr(engine, "_auto_set_skip_body_data", lambda _config: None)
     monkeypatch.setattr(engine, "instantiate_env", lambda _config: SimpleNamespace(th=None))
     monkeypatch.setattr(engine, "_can_share_trajectory_handler", lambda _config: False)
     monkeypatch.setattr(engine, "instantiate_validation_env", lambda _config, share_trajectory=False: SimpleNamespace())

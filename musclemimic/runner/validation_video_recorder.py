@@ -53,6 +53,10 @@ class ValidationVideoRecorder:
             validation_config = agent_conf.config.experiment.validation
             env_params["terminal_state_type"] = validation_config.get("terminal_state_type", "NoTerminalStateHandler")
             env_params["terminal_state_params"] = dict(validation_config.get("terminal_state_params", {}))
+            val_init_state_type = validation_config.get("init_state_type", None)
+            if val_init_state_type is not None:
+                env_params["init_state_type"] = val_init_state_type
+                env_params["init_state_params"] = dict(validation_config.get("init_state_params", {}))
         else:
             env_params["terminal_state_type"] = "NoTerminalStateHandler"
             env_params["terminal_state_params"] = {}

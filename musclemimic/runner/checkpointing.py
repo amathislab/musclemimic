@@ -3,9 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -205,6 +203,8 @@ def resolve_checkpoint_dir(
     Returns:
         Resolved absolute checkpoint directory path.
     """
+    import os
+
     # Determine base directory
     if checkpoint_root:
         base = checkpoint_root if os.path.isabs(checkpoint_root) else os.path.join(launch_dir, checkpoint_root)
@@ -237,26 +237,6 @@ def _download_from_huggingface(repo_id: str, revision: str = None) -> str:
         revision=revision,
     )
     return local_dir
-
-
-def _symlink_or_copy(target: Path, link: Path) -> None:
-    """Create a symlink, falling back to junction/copy on Windows."""
-    try:
-        link.symlink_to(target, target_is_directory=True)
-    except OSError as e:
-        # Windows often disallows symlinks without admin/Developer Mode (WinError 1314).
-        # Prefer a directory junction as a zero-copy alias; last resort is a full copy.
-        is_windows = sys.platform.startswith("win")
-        winerr = getattr(e, "winerror", None)
-        if not (is_windows and winerr in (1314, 5)):
-            raise
-        try:
-            subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                capture_output=True, text=True, check=True,
-            )
-        except Exception:
-            shutil.copytree(target, link)
 
 
 def _canonicalize_resume_path(path_like: str, revision: str = None) -> str:
@@ -304,15 +284,17 @@ def _canonicalize_resume_path(path_like: str, revision: str = None) -> str:
 
     # Check if it's an Orbax checkpoint directory (has train_state subdir)
     if (p / "train_state").is_dir():
-        # Read step from metadata and create expected checkpoint_<step> alias
+        # Read step from metadata/metadata and create expected checkpoint_<step> structure
+        import json
         metadata_file = p / "metadata" / "metadata"
         if metadata_file.is_symlink():
             metadata_file = metadata_file.resolve()
         with open(metadata_file) as f:
             step = json.load(f).get("update_number", 0)
+        # Create symlink with expected name in parent directory
         symlink_path = p.parent / f"checkpoint_{step}"
         if not symlink_path.exists():
-            _symlink_or_copy(target=p, link=symlink_path)
+            symlink_path.symlink_to(p)
         return str(symlink_path)
 
     # Not a recognizable checkpoint location

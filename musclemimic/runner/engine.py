@@ -53,59 +53,7 @@ def setup_wandb(config) -> tuple[bool, Any]:
 
 
 # Dataset config keys that may appear in validation config
-_VAL_DATASET_CONF_KEYS = ("amass_dataset_conf", "lafan1_dataset_conf", "custom_dataset_conf")
-
-# Body-level validation quantities that require full body data
-_BODY_QUANTITIES = ("BodyPosition", "BodyOrientation", "BodyVelocity")
-
-
-def _validation_needs_body_data(config) -> bool:
-    """Check if validation metrics require body-level trajectory data."""
-    val_cfg = config.experiment.get("validation", None)
-    if not val_cfg or not val_cfg.get("active", False):
-        return False
-    quantities = val_cfg.get("quantities", None)
-    if not quantities:
-        return False
-    for q in quantities:
-        if q in _BODY_QUANTITIES:
-            return True
-    return False
-
-
-def _auto_set_skip_body_data(config) -> None:
-    """Auto-set skip_body_data=True if validation doesn't need body quantities.
-
-    When validation doesn't use BodyPosition/BodyOrientation/BodyVelocity metrics,
-    we can skip storing xpos_parent/xquat_parent and only keep cvel_parent/subtree_com_root
-    for site velocity computation. This saves additional memory.
-
-    Note: sparse_body_data=True is already the default, which skips full body arrays.
-    This function enables skip_body_data for even more savings when body metrics aren't needed.
-    """
-    if _validation_needs_body_data(config):
-        return
-
-    # Check if amass_dataset_conf exists
-    task_params = config.experiment.get("task_factory", {}).get("params", {})
-    amass_conf = task_params.get("amass_dataset_conf", None)
-    if amass_conf is None:
-        return
-
-    # Skip if already explicitly set
-    if amass_conf.get("skip_body_data", None) is not None:
-        return
-
-    # Also skip if lite mode is enabled (lite already implies minimal data)
-    if amass_conf.get("lite", False):
-        return
-
-    # Auto-enable skip_body_data
-    with open_dict(config):
-        config.experiment.task_factory.params.amass_dataset_conf.skip_body_data = True
-    logger.info(
-        "[Trajectory] Auto-enabled skip_body_data (validation doesn't use BodyPosition/BodyOrientation/BodyVelocity)."
-    )
+_VAL_DATASET_CONF_KEYS = ("amass_dataset_conf", "c3d_dataset_conf", "lafan1_dataset_conf", "custom_dataset_conf")
 
 
 def _has_validation_dataset_override(val_cfg) -> bool:
@@ -208,6 +156,15 @@ def instantiate_validation_env(config, share_trajectory: bool = False) -> Any:
     # Override terminal state handler for validation
     val_env_params["terminal_state_type"] = val_terminal_state_type
     val_env_params["terminal_state_params"] = config.experiment.validation.get("terminal_state_params", {})
+
+    # Optional validation-specific initial state handler.
+    val_init_state_type = config.experiment.validation.get("init_state_type", None)
+    val_init_state_params = config.experiment.validation.get("init_state_params", None)
+    if val_init_state_type is not None:
+        val_env_params["init_state_type"] = val_init_state_type
+        val_env_params["init_state_params"] = (
+            OmegaConf.to_container(val_init_state_params, resolve=True) if val_init_state_params is not None else {}
+        )
 
     # Start from beginning of each trajectory (random trajectory, but step 0)
     if config.experiment.validation.get("start_from_beginning", False):
@@ -442,9 +399,6 @@ def run_experiment(config, hooks: ExperimentHooks):
 
     # Wandb
     use_wandb, run = setup_wandb(config)
-
-    # Auto-optimize trajectory storage based on validation requirements
-    _auto_set_skip_body_data(config)
 
     # Env and algo - share trajectory if possible to save memory
     env = instantiate_env(config)

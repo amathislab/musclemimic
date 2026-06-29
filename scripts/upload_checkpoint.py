@@ -6,9 +6,49 @@ Usage:
 """
 
 import argparse
+import json
 from pathlib import Path
 
 from huggingface_hub import HfApi, create_repo
+
+DOWNLOAD_STATS_CONFIG = "config.json"
+
+
+def _read_checkpoint_metadata(checkpoint_path: Path) -> dict:
+    metadata_path = checkpoint_path / "metadata" / "metadata"
+    if not metadata_path.exists():
+        return {}
+    try:
+        with metadata_path.open() as f:
+            metadata = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _build_download_stats_config(checkpoint_path: Path) -> bytes:
+    """Build the root config.json used by Hugging Face download counters."""
+    metadata = _read_checkpoint_metadata(checkpoint_path)
+    config = {
+        "model_type": "musclemimic-policy",
+        "checkpoint_format": "orbax",
+        "checkpoint_name": checkpoint_path.name,
+    }
+    for key in ("algo_version", "schema_version", "backend", "env_name", "global_timestep"):
+        if key in metadata:
+            config[key] = metadata[key]
+    return json.dumps(config, indent=2, sort_keys=True).encode("utf-8")
+
+
+def _upload_download_stats_config(api: HfApi, checkpoint_path: Path, repo_id: str) -> None:
+    """Upload config.json so Hub model download stats count policy downloads."""
+    api.upload_file(
+        path_or_fileobj=_build_download_stats_config(checkpoint_path),
+        path_in_repo=DOWNLOAD_STATS_CONFIG,
+        repo_id=repo_id,
+        repo_type="model",
+        commit_message="Add download stats config",
+    )
 
 
 def upload_checkpoint(checkpoint_path: Path, repo_id: str):
@@ -41,6 +81,7 @@ def upload_checkpoint(checkpoint_path: Path, repo_id: str):
         repo_id=repo_id,
         repo_type="model",
     )
+    _upload_download_stats_config(api, checkpoint_path, repo_id)
     print(f"Done: https://huggingface.co/{repo_id}")
 
 
