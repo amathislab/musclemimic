@@ -1,4 +1,3 @@
-from typing import Union
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -12,18 +11,18 @@ def get_amass_dataset_groups() -> dict[str, list[str]]:
     """Lazily load and return the AMASS dataset group mapping."""
     from loco_mujoco.smpl.const import (
         AMASS_BIMANUAL_MARGINAL_MOTIONS,
+        AMASS_BIMANUAL_TEST_MOTIONS,
+        AMASS_BIMANUAL_TRAIN_MOTIONS,
         AMASS_EKUT_DATASETS,
         AMASS_LOCOMOTION_DATASETS,
         AMASS_RANDOM_TRAINING_MOTIONS,
         AMASS_RANDOM_TRAINING_MOTIONS_2K,
-        AMASS_BIMANUAL_TRAIN_MOTIONS,
-        AMASS_BIMANUAL_TEST_MOTIONS,
-        KIT_KINESIS_TRAINING_MOTIONS,
         AMASS_TRANSITION_MOTIONS,
-        KIT_KINESIS_TRANSITION_TRAINING_MOTIONS,
         KIT_KINESIS_TESTING_MOTIONS,
+        KIT_KINESIS_TRAINING_MOTIONS,
         KIT_KINESIS_TRAINING_MOTIONS_MINT,
         KIT_KINESIS_TRAINING_MOTIONS_MINT_STRAIGHT_FORWARDS,
+        KIT_KINESIS_TRANSITION_TRAINING_MOTIONS,
     )
     return {
         "AMASS_LOCOMOTION_DATASETS": AMASS_LOCOMOTION_DATASETS,
@@ -100,25 +99,55 @@ class AMASSDatasetConf:
         max_motions (int, optional): If set, cap the number of motion paths loaded by
             sampling a subset of this size.
         clear_cache (bool): If True, overwrite existing cached retargeted files instead of loading them.
-        sparse_body_data (bool): If True (default), skip full body arrays and extract only
-            sparse parent body data for mimic sites. Saves significant memory.
-        skip_body_data (bool): If True, skip xpos_parent/xquat_parent (only keep
-            cvel_parent/subtree_com_root for site velocity). Auto-enabled when
-            validation has no body metrics.
+        trajectory_cache_type (str): Runtime trajectory cache layout. Use "sparse"
+            to store only mimic site caches, "full" for all body/site caches, or
+            "none" for qpos/qvel only.
 
     """
-    rel_dataset_path: Union[str, list] = None
-    dataset_group: Union[str, list] = None
+    rel_dataset_path: str | list = None
+    dataset_group: str | list = None
     retargeting_method: str = None
     gmr_config: dict = None
-    max_motions: Union[int, None] = None
+    max_motions: int | None = None
     clear_cache: bool = False
-    sparse_body_data: bool = True
-    skip_body_data: bool = False
+    trajectory_cache_type: str = "sparse"
 
     def __post_init__(self):
         assert self.rel_dataset_path is not None or self.dataset_group is not None, ("Either `rel_dataset_path` or "
                                                                                      "`dataset_group` must be set.")
+        if self.max_motions is not None:
+            self.max_motions = int(self.max_motions)
+            if self.max_motions <= 0:
+                raise ValueError(f"max_motions must be > 0, got {self.max_motions}")
+
+
+@dataclass
+class C3DDatasetConf:
+    """
+    Configuration for loading converted C3D-derived trajectories.
+
+    Attributes:
+        rel_dataset_path (Union[str, list]): A relative path or a list of relative paths
+            under the converted C3D cache root.
+        retargeting_method (str): The retargeting method namespace used when saving
+            the C3D trajectory. Defaults to 'gmr'.
+        max_motions (int, optional): If set, cap the number of motion paths loaded by
+            sampling a subset of this size.
+        trajectory_cache_type (str): Runtime trajectory cache layout. Use "sparse"
+            to store only mimic site caches, "full" for all body/site caches, or
+            "none" for qpos/qvel only.
+
+    """
+
+    rel_dataset_path: str | list = None
+    retargeting_method: str = "gmr"
+    max_motions: int | None = None
+    trajectory_cache_type: str = "sparse"
+
+    def __post_init__(self):
+        assert self.rel_dataset_path is not None, "`rel_dataset_path` must be set for converted C3D datasets."
+        if self.retargeting_method not in {"smpl", "gmr"}:
+            raise ValueError(f"Unknown C3D retargeting method: {self.retargeting_method}")
         if self.max_motions is not None:
             self.max_motions = int(self.max_motions)
             if self.max_motions <= 0:
@@ -140,8 +169,9 @@ class LAFAN1DatasetConf:
 
     """
 
-    dataset_name: Union[str, list] = None
+    dataset_name: str | list = None
     dataset_group: str = None
+    trajectory_cache_type: str = "full"
 
     def __post_init__(self):
         assert self.dataset_name is not None or self.dataset_group is not None, ("Either `dataset_name` or "
@@ -158,3 +188,4 @@ class CustomDatasetConf:
 
     """
     traj: Trajectory
+    trajectory_cache_type: str = "full"

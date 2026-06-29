@@ -3,15 +3,12 @@ import hashlib
 import logging
 import os
 import time
-from dataclasses import replace
 from pathlib import Path
-from typing import Union
 
 import jax
 import jax.numpy as jnp
 import mujoco
 import numpy as np
-import yaml
 from musclemimic_models import get_xml_path
 from omegaconf import DictConfig, OmegaConf
 from scipy.spatial.transform import Rotation as sRot
@@ -20,7 +17,6 @@ from tqdm import tqdm
 try:
     import joblib
     import torch
-    from smplx.lbs import transform_mat
     from torch.autograd import Variable
 
     from loco_mujoco.smpl import SMPLH_Parser
@@ -32,8 +28,6 @@ except ImportError as e:
 
 # GMR imports
 try:
-    import inspect
-
     # Patch mink.solve_ik to disable safety_break (joint limit check)
     import mink
     from general_motion_retargeting import (
@@ -57,27 +51,34 @@ try:
         get_smplh_data_offline_fast,
         load_smplh_file,
     )
-    from mink.tasks.equality_constraint_task import EqualityConstraintTask
 
     # Patch mink.solve_ik to disable safety_break (joint limit check)
     _original_solve_ik = mink.solve_ik
-    _solve_ik_sig = inspect.signature(_original_solve_ik)
-    _solve_ik_params = list(_solve_ik_sig.parameters.keys())
-    _safety_break_idx = _solve_ik_params.index("safety_break") if "safety_break" in _solve_ik_params else None
 
-    def _solve_ik_no_safety_break(*args, **kwargs):
-        # Handle safety_break in positional args
-        if _safety_break_idx is not None and len(args) > _safety_break_idx:
-            args = list(args)
-            args[_safety_break_idx] = False
-            args = tuple(args)
-            # Don't add to kwargs if already in positional args
-            kwargs.pop("safety_break", None)
-        else:
-            # Handle safety_break in kwargs only
-            kwargs.pop("safety_break", None)
-            kwargs["safety_break"] = False
-        return _original_solve_ik(*args, **kwargs)
+    def _solve_ik_no_safety_break(
+        configuration,
+        tasks,
+        dt,
+        solver,
+        damping=1e-12,
+        safety_break=False,
+        limits=None,
+        constraints=None,
+        **kwargs,
+    ):
+        if isinstance(safety_break, list):
+            limits = safety_break
+        return _original_solve_ik(
+            configuration,
+            tasks,
+            dt,
+            solver,
+            damping=damping,
+            safety_break=False,
+            limits=limits,
+            constraints=constraints,
+            **kwargs,
+        )
 
     mink.solve_ik = _solve_ik_no_safety_break
 
@@ -90,18 +91,17 @@ except ImportError:
 import loco_mujoco
 from loco_mujoco import PATH_TO_SMPL_ROBOT_CONF
 from loco_mujoco.core.mujoco_base import Mujoco
-from loco_mujoco.core.utils.math import quat_scalarfirst2scalarlast, quat_scalarlast2scalarfirst
-from loco_mujoco.core.utils.mujoco import mj_jntname2qposid, mj_jntname2qvelid
-from loco_mujoco.datasets.data_generation import ExtendTrajData
+from loco_mujoco.core.utils.math import quat_scalarlast2scalarfirst
+from loco_mujoco.core.utils.mujoco import mj_jntname2qposid
 from loco_mujoco.datasets.data_generation.utils import add_mocap_bodies
 from loco_mujoco.smpl import SMPLH_BONE_ORDER_NAMES
 from loco_mujoco.smpl.utils.smoothing import gaussian_filter_1d_batch
 from loco_mujoco.trajectory import (
     Trajectory,
+    TrajectoryCacheType,
     TrajectoryData,
     TrajectoryInfo,
     TrajectoryModel,
-    interpolate_trajectories,
 )
 from loco_mujoco.utils import setup_logger
 from musclemimic.utils import detect_headless_environment, setup_headless_rendering
@@ -109,6 +109,12 @@ from musclemimic.utils.gmr_cache import try_download_gmr_cache
 
 OPTIMIZED_SHAPE_FILE_NAME = "shape_optimized.pkl"
 BIMANUAL_ENV_NAME = "MyoBimanualArm"
+
+
+def _fps_after_frame_skip(source_fps, skip: int) -> float:
+    if skip <= 0:
+        raise ValueError(f"skip must be positive, got {skip}")
+    return float(np.asarray(source_fps).squeeze()) / float(skip)
 
 
 def _compute_qvel_from_qpos(qpos: np.ndarray, fps: float, free_joint_name: str, model: mujoco.MjModel) -> np.ndarray:
@@ -143,6 +149,52 @@ def _compute_qvel_from_qpos(qpos: np.ndarray, fps: float, free_joint_name: str, 
     qpos_trimmed = qpos[1:-1].copy()
 
     return qpos_trimmed, qvel
+
+
+def _resolve_site_ids(model: mujoco.MjModel, site_names: list[str], *, context: str) -> list[int]:
+    """Resolve MuJoCo site names and reject missing sites before indexing arrays."""
+    site_ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name) for site_name in site_names]
+    missing = [site_name for site_name, site_id in zip(site_names, site_ids, strict=True) if site_id < 0]
+    if missing:
+        raise ValueError(f"{context} references missing MuJoCo site(s): {', '.join(missing)}")
+    return site_ids
+
+
+def _resolve_smpl_joint_indices(sites_for_mimic: list[str], robot_conf: DictConfig, *, context: str) -> list[int]:
+    """Map mimic sites to SMPL-H joint indices with clear configuration errors."""
+    matches = robot_conf.site_joint_matches
+    missing = [site_name for site_name in sites_for_mimic if site_name not in matches]
+    if missing:
+        raise ValueError(f"{context} is missing site_joint_matches entries for: {', '.join(missing)}")
+
+    joint_indices = []
+    invalid = []
+    for site_name in sites_for_mimic:
+        smpl_joint = matches[site_name].smpl_joint
+        try:
+            joint_indices.append(SMPLH_BONE_ORDER_NAMES.index(smpl_joint))
+        except ValueError:
+            invalid.append(f"{site_name}->{smpl_joint}")
+    if invalid:
+        raise ValueError(f"{context} references unknown SMPL-H joint(s): {', '.join(invalid)}")
+    return joint_indices
+
+
+def _record_site_kinematics(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    qpos: np.ndarray,
+    site_ids: list[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Forward final qpos frames and record selected site positions/orientations."""
+    site_xpos = np.zeros((len(qpos), len(site_ids), 3), dtype=np.float32)
+    site_xmat = np.zeros((len(qpos), len(site_ids), 9), dtype=np.float32)
+    for frame_idx, frame_qpos in enumerate(qpos):
+        data.qpos[:] = frame_qpos
+        mujoco.mj_forward(model, data)
+        site_xpos[frame_idx] = data.site_xpos[site_ids]
+        site_xmat[frame_idx] = data.site_xmat[site_ids]
+    return site_xpos, site_xmat
 
 
 def ensure_pytorch_precision_consistency():
@@ -403,19 +455,17 @@ def fit_smpl_motion(
     # add mocap bodies for all 'site_for_mimic' instances of an environment
     mjspec = env.mjspec
     sites_for_mimic = env.sites_for_mimic
-    site_ids = [mujoco.mj_name2id(env._model, mujoco.mjtObj.mjOBJ_SITE, s) for s in sites_for_mimic]
+    _resolve_site_ids(env._model, sites_for_mimic, context=f"{env_name} sites_for_mimic")
+    smpl2mimic_site_idx = _resolve_smpl_joint_indices(
+        sites_for_mimic,
+        robot_conf,
+        context=f"{env_name} retargeting config",
+    )
     target_mocap_bodies = ["target_mocap_body_" + s for s in sites_for_mimic]
     mjspec = add_mocap_bodies(mjspec, sites_for_mimic, target_mocap_bodies, robot_conf, add_equality_constraint=True)
     env.reload_mujoco(mjspec)
     key = jax.random.key(0)
     env.reset(key)
-
-    smpl2mimic_site_idx = []
-    for s in sites_for_mimic:
-        # find smpl name
-        for site_name, conf in robot_conf.site_joint_matches.items():
-            if site_name == s:
-                smpl2mimic_site_idx.append(SMPLH_BONE_ORDER_NAMES.index(conf.smpl_joint))
 
     smpl_parser_n = SMPLH_Parser(model_path=path_to_smpl_model, gender="neutral")
 
@@ -451,11 +501,13 @@ def fit_smpl_motion(
     qpos_init = get_init_qpos_for_motion_retargeting(env, init_mocap_pos, init_mocap_quat, robot_conf)
     env._data.qpos = qpos_init
 
+    site_ids = _resolve_site_ids(env._model, sites_for_mimic, context=f"{env_name} retarget sites")
     qpos = np.zeros((len_traj, env._model.nq))
     num_matched = len(smpl2mimic_site_idx)
+    site_xpos = np.zeros((len_traj, len(site_ids), 3), dtype=np.float32)
+    site_xmat = np.zeros((len_traj, len(site_ids), 9), dtype=np.float32)
 
     dist_array = np.zeros((len_traj, num_matched))
-    site_ids = [mujoco.mj_name2id(env._model, mujoco.mjtObj.mjOBJ_SITE, s) for s in sites_for_mimic]
 
     # max_pen = 0
     # TODO: currently with per frame offset, test will overall offset if needed for ground penetrations.
@@ -477,6 +529,8 @@ def fit_smpl_motion(
         pen, _geom_id, _floor_id = max_penetration_with_floor(env._model, env._data)
         if pen < 0:
             qpos[i][2] -= pen
+            env._data.qpos = qpos[i]
+            mujoco.mj_forward(env._model, env._data)
 
         # TODO: test with overall ground penetration
         # max_pen = min(max_pen, pen)
@@ -485,6 +539,8 @@ def fit_smpl_motion(
             current_pos = env._data.site_xpos[site_id]  # real robot site position
             target_pos = mocap_pos[k].cpu().numpy()  # target from SMPL
             dist_array[i, k] = np.linalg.norm(current_pos - target_pos)
+            site_xpos[i, k] = current_pos
+            site_xmat[i, k] = env._data.site_xmat[site_id]
 
         if visualize:
             env.render()
@@ -498,22 +554,48 @@ def fit_smpl_motion(
     # if max_pen < 0:
     #    qpos[:, 2] -= max_pen
 
-    fps = motion_data["fps"] // skip
+    fps = _fps_after_frame_skip(motion_data["fps"], skip)
 
     # Compute qvel from qpos using helper function
     qpos, qvel = _compute_qvel_from_qpos(qpos, fps, env.root_free_joint_xml_name, env._model)
+    site_xpos = site_xpos[1:-1]
+    site_xmat = site_xmat[1:-1]
 
     njnt = env._model.njnt
     jnt_type = env._model.jnt_type
     jnt_names = [mujoco.mj_id2name(env._model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(njnt)]
 
+    site_ids_array = jnp.array(site_ids)
+    traj_model = TrajectoryModel(
+        njnt=njnt,
+        jnt_type=jnp.array(jnt_type),
+        nbody=env._model.nbody,
+        body_rootid=jnp.array(env._model.body_rootid),
+        body_weldid=jnp.array(env._model.body_weldid),
+        body_mocapid=jnp.array(env._model.body_mocapid),
+        body_pos=jnp.array(env._model.body_pos),
+        body_quat=jnp.array(env._model.body_quat),
+        body_ipos=jnp.array(env._model.body_ipos),
+        body_iquat=jnp.array(env._model.body_iquat),
+        nsite=len(site_ids),
+        site_bodyid=jnp.array(env._model.site_bodyid)[site_ids_array],
+        site_pos=jnp.array(env._model.site_pos)[site_ids_array],
+        site_quat=jnp.array(env._model.site_quat)[site_ids_array],
+    )
     traj_info = TrajectoryInfo(
         jnt_names,
-        model=TrajectoryModel(njnt, jnp.array(jnt_type)),
+        model=traj_model,
         frequency=fps,
+        site_names=sites_for_mimic,
     )
 
-    traj_data = TrajectoryData(jnp.array(qpos), jnp.array(qvel), split_points=jnp.array([0, len(qpos)]))
+    traj_data = TrajectoryData(
+        jnp.array(qpos),
+        jnp.array(qvel),
+        site_xpos=jnp.array(site_xpos),
+        site_xmat=jnp.array(site_xmat),
+        split_points=jnp.array([0, len(qpos)]),
+    )
 
     analysis = {
         "pos_error": dist_array,
@@ -689,7 +771,7 @@ def fit_gmr_motion(
 
     Returns:
         tuple[Trajectory, dict]: Trajectory at GMR's native fps (~30Hz) and analysis data
-            containing pos_error and retarget_fps. Use extend_motion() to get 100Hz + full kinematics.
+            containing pos_error and retarget_fps. Use extend_motion() to get model-aligned source data.
 
     Note:
         The GMR package's offset_human_data_to_ground method uses a hardcoded ground_offset.
@@ -823,25 +905,14 @@ def fit_gmr_motion(
             retarget.robot_motor_names[motor_name] = i
         # Rebuild tasks and limits with new model
         retarget.setup_retarget_configuration()
+        retarget.ik_limits = [mink.ConfigurationLimit(retarget.model)]
+        if use_velocity_limit:
+            velocity_limits = dict.fromkeys(retarget.robot_motor_names.keys(), 3 * np.pi)
+            retarget.ik_limits.append(mink.VelocityLimit(retarget.model, velocity_limits))
         logger.info("Model replaced and GMR reconfigured")
 
-    # Add equality constraint tasks for myofullbody (enforces joint equalities)
     if gmr_robot == "myofullbody":
         model = retarget.configuration.model
-        eq_count = 0
-        # Use a configurable weight for equality constraint tasks; default is 5.0 if not specified in gmr_config
-        equality_constraint_weight = getattr(gmr_config, "equality_constraint_weight", 5.0)
-        for eq_id in range(model.neq):
-            if model.eq_type[eq_id] == mujoco.mjtEq.mjEQ_JOINT:
-                task = EqualityConstraintTask(model, eq_id)
-                # The weight controls the strength of the joint equality constraint in the optimization.
-                # Default is 5.0, which empirically balances constraint enforcement and optimization stability.
-                task.weight = equality_constraint_weight
-                retarget.tasks1.append(task)
-                retarget.tasks2.append(task)
-                eq_count += 1
-        if eq_count > 0:
-            logger.info(f"Added {eq_count} equality constraint tasks (weight={equality_constraint_weight})")
 
         # Initialize limited joints with invalid qpos0 to their range midpoints
         fixed_count = 0
@@ -884,8 +955,12 @@ def fit_gmr_motion(
     qpos_list = []
     dist_list = []
     lowest_z_list = []
-
+    model = retarget.configuration.model
     data = retarget.configuration.data
+    traj_site_names = getattr(env, "sites_for_mimic", None)
+    traj_site_ids = None
+    if traj_site_names is not None:
+        traj_site_ids = _resolve_site_ids(model, traj_site_names, context=f"{env_name} GMR trajectory sites")
 
     non_floor_geom_ids = [gid for gid in range(model.ngeom) if model.geom(gid).name != "floor"]
     use_ids = non_floor_geom_ids if non_floor_geom_ids else list(range(model.ngeom))
@@ -934,24 +1009,63 @@ def fit_gmr_motion(
 
     logger.info(f"Complete: {qpos.shape}")
 
+    if traj_site_ids is not None:
+        site_xpos_full, site_xmat_full = _record_site_kinematics(model, data, qpos, traj_site_ids)
+    else:
+        site_xpos_full = np.zeros((len(qpos), 0, 3), dtype=np.float32)
+        site_xmat_full = np.zeros((len(qpos), 0, 9), dtype=np.float32)
+
     # Compute velocities
-    qpos, qvel = _compute_qvel_from_qpos(qpos, aligned_fps, env.root_free_joint_xml_name, env._model)
+    qpos, qvel = _compute_qvel_from_qpos(qpos, aligned_fps, env.root_free_joint_xml_name, model)
+    site_xpos = site_xpos_full[1:-1]
+    site_xmat = site_xmat_full[1:-1]
 
     # Build Trajectory (minimal - extend_motion adds xpos/xquat/sites)
-    njnt = env._model.njnt
-    jnt_names = [mujoco.mj_id2name(env._model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(njnt)]
+    njnt = model.njnt
+    jnt_names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(njnt)]
+
+    traj_site_names = getattr(env, "sites_for_mimic", None)
+    if traj_site_names is not None:
+        traj_site_ids = _resolve_site_ids(model, traj_site_names, context=f"{env_name} trajectory model sites")
+        traj_site_ids_array = jnp.array(traj_site_ids)
+        traj_model = TrajectoryModel(
+            njnt=njnt,
+            jnt_type=jnp.array(model.jnt_type),
+            nbody=model.nbody,
+            body_rootid=jnp.array(model.body_rootid),
+            body_weldid=jnp.array(model.body_weldid),
+            body_mocapid=jnp.array(model.body_mocapid),
+            body_pos=jnp.array(model.body_pos),
+            body_quat=jnp.array(model.body_quat),
+            body_ipos=jnp.array(model.body_ipos),
+            body_iquat=jnp.array(model.body_iquat),
+            nsite=len(traj_site_ids),
+            site_bodyid=jnp.array(model.site_bodyid)[traj_site_ids_array],
+            site_pos=jnp.array(model.site_pos)[traj_site_ids_array],
+            site_quat=jnp.array(model.site_quat)[traj_site_ids_array],
+        )
+    else:
+        traj_model = TrajectoryModel(njnt, jnp.array(model.jnt_type))
 
     traj_info = TrajectoryInfo(
         jnt_names,
-        model=TrajectoryModel(njnt, jnp.array(env._model.jnt_type)),
+        model=traj_model,
         frequency=aligned_fps,
+        site_names=traj_site_names,
     )
 
-    traj_data = TrajectoryData(jnp.array(qpos), jnp.array(qvel), split_points=jnp.array([0, len(qpos)]))
+    traj_data = TrajectoryData(
+        jnp.array(qpos),
+        jnp.array(qvel),
+        site_xpos=jnp.array(site_xpos),
+        site_xmat=jnp.array(site_xmat),
+        split_points=jnp.array([0, len(qpos)]),
+    )
 
     analysis = {
         "pos_error": dist_array,
         "retarget_fps": retarget_fps,
+        "site_names": getattr(env, "sites_for_mimic", None),
     }
 
     return Trajectory(traj_info, traj_data), analysis
@@ -1465,113 +1579,17 @@ def extend_motion(
     env_cls = Mujoco.registered_envs[env_name]
     env = env_cls(**env_params, th_params={"random_start": False, "fixed_start_conf": (0, 0)})
 
-    # Apply standard interpolation for all environments
     original_frequency = traj.info.frequency
     target_frequency = 1.0 / env.dt
-    traj_data, traj_info = interpolate_trajectories(traj.data, traj.info, target_frequency)
-    traj = Trajectory(info=traj_info, data=traj_data)
+
+    env.load_trajectory(traj, warn=False, cache_type=TrajectoryCacheType.NONE)
+    traj = env.th.traj
+
     if logger:
         logger.info(
-            f"Interpolated trajectory from {original_frequency:.3f} Hz to {traj_info.frequency:.3f} Hz ({traj_data.n_samples} samples)"
+            f"Aligned trajectory from {original_frequency:.3f} Hz to {target_frequency:.3f} Hz "
+            f"({traj.data.n_samples} samples)"
         )
-
-    env.load_trajectory(traj, warn=False)
-    traj_data, traj_info = env.th.traj.data, env.th.traj.info
-
-    # Unified approach for all environments that need site data
-    needs_site_data = "MyoBimanualArm" in env_name or hasattr(env, "sites_for_mimic")
-    if needs_site_data:
-        if logger:
-            logger.info(
-                "Stage 3: Running forward kinematics to populate site data for environments with site tracking..."
-            )
-
-        # For MyoBimanualArm, we need to play each trajectory individually to capture all samples
-        # because play_trajectory with multiple episodes resets between trajectories
-        combined_data = {}
-        total_recorded_length = 0
-
-        for traj_idx in range(env.th.n_trajectories):
-            traj_length = env.th.len_trajectory(traj_idx)
-
-            # Create callback for this specific trajectory - only include mimic sites to save memory
-            site_names = getattr(env, "sites_for_mimic", None)
-
-            # MyoFullBody optimization: filter to only mimic sites to avoid processing all 2019 muscle sites
-            if "MyoFullBody" in env_name and site_names is None:
-                # Define 14 mimic sites for full-body tracking (matches actual trajectory sites)
-                site_names = [
-                    "pelvis_mimic",
-                    "head_mimic",
-                    "left_shoulder_mimic",
-                    "left_elbow_mimic",
-                    "left_hand_mimic",
-                    "right_shoulder_mimic",
-                    "right_elbow_mimic",
-                    "right_hand_mimic",
-                    "left_knee_mimic",
-                    "left_ankle_mimic",
-                    "left_toes_mimic",
-                    "right_knee_mimic",
-                    "right_ankle_mimic",
-                    "right_toes_mimic",
-                ]
-
-            callback = ExtendTrajData(env, model=env._model, n_samples=traj_length, site_names=site_names)
-
-            # Set the environment to start from this specific trajectory
-            env.th.fixed_start_conf = [traj_idx, 0]
-            env.th.use_fixed_start = True
-            env.th.random_start = False
-
-            # Play only this trajectory
-            env.play_trajectory(n_episodes=1, n_steps_per_episode=traj_length, render=False, callback_class=callback)
-
-            # Collect the data from this trajectory
-            for key, value in callback.recorder.items():
-                if key not in combined_data:
-                    # Initialize with the shape from the first trajectory
-                    if key in ["site_xpos", "site_xmat"]:
-                        # Site arrays: use the number of selected sites
-                        n_sites = value.shape[1]
-                        if key == "site_xpos":
-                            combined_shape = (traj_data.n_samples, n_sites, 3)
-                        else:  # site_xmat
-                            combined_shape = (traj_data.n_samples, n_sites, 9)
-                    elif key in ["xpos", "xquat", "cvel", "subtree_com"]:
-                        # Body arrays
-                        combined_shape = (traj_data.n_samples, env._model.nbody, value.shape[2])
-                    else:  # qpos, qvel
-                        combined_shape = (traj_data.n_samples, value.shape[1])
-                    combined_data[key] = np.zeros(combined_shape)
-
-                # Copy the actual recorded data
-                end_idx = total_recorded_length + callback.current_length
-                combined_data[key][total_recorded_length:end_idx] = value[: callback.current_length]
-
-            total_recorded_length += callback.current_length
-
-        # Create a single callback object with the combined data for extend_trajectory_data
-        site_names = getattr(env, "sites_for_mimic", None)
-        final_callback = ExtendTrajData(env, model=env._model, n_samples=total_recorded_length, site_names=site_names)
-        final_callback.recorder = combined_data
-        final_callback.current_length = total_recorded_length
-
-        callback = final_callback
-
-        # Reset the trajectory handler to its original state
-        env.th.use_fixed_start = False
-        env.th.random_start = True
-        env.th.fixed_start_conf = None
-    else:
-        # Standard approach for other environments - also use site filtering for memory efficiency
-        total_samples = traj_data.n_samples
-        site_names = getattr(env, "sites_for_mimic", None)
-        callback = ExtendTrajData(env, model=env._model, n_samples=total_samples, site_names=site_names)
-
-        env.play_trajectory(n_episodes=env.th.n_trajectories, render=False, callback_class=callback)
-    traj_data, traj_info = callback.extend_trajectory_data(traj_data, traj_info)
-    traj = replace(traj, data=traj_data, info=traj_info)
 
     return traj
 
@@ -2143,21 +2161,9 @@ def retarget_trajectory_for_bimanual(traj: Trajectory) -> Trajectory:
     traj_model = TrajectoryModel(njnt=len(final_joint_names), jnt_type=mapped_jnt_types)
     traj_info = TrajectoryInfo(joint_names=final_joint_names, model=traj_model, frequency=traj.info.frequency)
 
-    # Initialize site data with proper shapes for MyoBimanualArm
-    # MyoBimanualArm has exactly 7 sites as defined in sites_for_mimic
-    # Use actual data length instead of traj.data.n_samples to avoid split_points mismatch
-    actual_n_samples = mapped_qpos.shape[0]
-    n_sites = 7  # MyoBimanualArm has 7 sites for mimicking
-    site_xpos = jnp.zeros((actual_n_samples, n_sites, 3))
-    # Initialize site rotation matrices to identity matrices to avoid interpolation errors
-    identity_matrix = jnp.eye(3).flatten()  # [1, 0, 0, 0, 1, 0, 0, 0, 1]
-    site_xmat = jnp.tile(identity_matrix, (actual_n_samples, n_sites, 1))
-
     traj_data = TrajectoryData(
         qpos=mapped_qpos,
         qvel=mapped_qvel,
-        site_xpos=site_xpos,
-        site_xmat=site_xmat,
         split_points=traj.data.split_points,
     )
 

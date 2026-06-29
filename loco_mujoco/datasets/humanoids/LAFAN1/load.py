@@ -1,18 +1,17 @@
 import os
-from dataclasses import replace
 from typing import Union, List
 
 from omegaconf import DictConfig
 from huggingface_hub import hf_hub_download
 
 import loco_mujoco
-from loco_mujoco.datasets.data_generation import ExtendTrajData
 from loco_mujoco.smpl.retargeting import load_robot_conf_file
 from musclemimic.environments import LocoEnv
 from loco_mujoco.trajectory import (
     Trajectory,
-    TrajectoryData,
-    interpolate_trajectories)
+    TrajectoryCacheType,
+    TrajectoryHandler,
+)
 from loco_mujoco.utils import setup_logger
 
 
@@ -41,22 +40,14 @@ def extend_motion(
     env_cls = LocoEnv.registered_envs[env_name]
     env = env_cls(**robot_conf.env_params, th_params=dict(random_start=False, fixed_start_conf=(0, 0)))
 
-    traj_data, traj_info = interpolate_trajectories(traj.data, traj.info, 1.0 / env.dt)
-    traj = Trajectory(info=traj_info, data=traj_data)
-
-    env.load_trajectory(traj, warn=False)
-    traj_data, traj_info = env.th.traj.data, env.th.traj.info
-
-    callback = ExtendTrajData(env, model=env._model, n_samples=traj_data.n_samples)
-    env.play_trajectory(
-        n_episodes=env.th.n_trajectories,
-        render=False,
-        callback_class=callback
-    )
-    traj_data, traj_info = callback.extend_trajectory_data(traj_data, traj_info)
-    traj = replace(traj, data=traj_data, info=traj_info)
-
-    return traj
+    return TrajectoryHandler(
+        env._model,
+        traj=traj,
+        control_dt=env.dt,
+        random_start=False,
+        fixed_start_conf=(0, 0),
+        cache_type=TrajectoryCacheType.NONE,
+    ).traj
 
 
 def load_lafan1_trajectory(

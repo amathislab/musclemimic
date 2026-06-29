@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os.path
 from dataclasses import dataclass, fields, asdict, replace
+from enum import Enum
 import pickle
 
 import flax.serialization
@@ -18,6 +19,13 @@ from typing import Union
 from types import ModuleType
 
 from loco_mujoco.core.observations.base import ObservationContainer
+
+
+class TrajectoryCacheType(str, Enum):
+    NONE = "none"
+    FULL = "full"
+    SPARSE = "sparse"
+
 
 def _arrays_match_for_concat(lhs, rhs) -> bool:
     lhs_np = np.asarray(lhs)
@@ -95,15 +103,10 @@ class Trajectory:
     obs_container: ObservationContainer = None
 
     @staticmethod
-    def concatenate(trajs: list, backend: ModuleType = jnp,
-                    sparse_body_data: bool = False, skip_body_data: bool = False,
-                    parent_body_ids: Union[np.ndarray, None] = None, root_body_id: Union[int, None] = None):
+    def concatenate(trajs: list, backend: ModuleType = jnp):
         traj_data = [traj.data for traj in trajs]
         traj_info = [traj.info for traj in trajs]
-        traj_data, traj_info = TrajectoryData.concatenate(
-            traj_data, traj_info, backend, sparse_body_data=sparse_body_data,
-            skip_body_data=skip_body_data, parent_body_ids=parent_body_ids, root_body_id=root_body_id
-        )
+        traj_data, traj_info = TrajectoryData.concatenate(traj_data, traj_info, backend)
         return Trajectory(info=traj_info, data=traj_data)
 
     def to_dict(self):
@@ -701,17 +704,17 @@ class SingleData:
     site_xpos: Union[jax.Array, np.ndarray] = struct.field(default_factory=lambda: jnp.empty(0))
     site_xmat: Union[jax.Array, np.ndarray] = struct.field(default_factory=lambda: jnp.empty(0))
 
-    # sparse body data (used when sparse_body_data=True)
-    # For site velocity computation (always needed in sparse mode)
+    # sparse body data used for site velocity computation
     cvel_parent: Union[jax.Array, np.ndarray] = struct.field(default_factory=lambda: jnp.empty(0))  # (T, n_mimic, 6)
     subtree_com_root: Union[jax.Array, np.ndarray] = struct.field(default_factory=lambda: jnp.empty(0))  # (T, 3)
-    # For body metrics (only when not skip_body_data)
-    xpos_parent: Union[jax.Array, np.ndarray] = struct.field(default_factory=lambda: jnp.empty(0))  # (T, n_mimic, 3)
-    xquat_parent: Union[jax.Array, np.ndarray] = struct.field(default_factory=lambda: jnp.empty(0))  # (T, n_mimic, 4)
 
     @property
     def is_complete(self):
-        return all(getattr(self, field).size > 0 for field in self.__dataclass_fields__)
+        has_full_cache = all(
+            arr.size > 0 for arr in (self.xpos, self.xquat, self.cvel, self.subtree_com, self.site_xpos, self.site_xmat)
+        )
+        has_sparse_cache = all(arr.size > 0 for arr in (self.site_xpos, self.site_xmat, self.cvel_parent, self.subtree_com_root))
+        return self.qpos.size > 0 and self.qvel.size > 0 and (has_full_cache or has_sparse_cache)
 
 
 @struct.dataclass
@@ -746,8 +749,6 @@ class TrajectoryData(SingleData):
                 backend.array_equal(self.subtree_com, other.subtree_com) and
                 backend.array_equal(self.cvel_parent, other.cvel_parent) and
                 backend.array_equal(self.subtree_com_root, other.subtree_com_root) and
-                backend.array_equal(self.xpos_parent, other.xpos_parent) and
-                backend.array_equal(self.xquat_parent, other.xquat_parent) and
                 backend.array_equal(self.site_xpos, other.site_xpos) and
                 backend.array_equal(self.site_xmat, other.site_xmat) and
                 backend.array_equal(self.split_points, other.split_points)):
@@ -769,15 +770,14 @@ class TrajectoryData(SingleData):
             return arr[ind].copy() if arr.size > 0 else backend.zeros(batch_shape + (0, dim), dtype=dtype)
 
         def _vector(arr, dim):
-            """Vector array: (..., D) -> empty: (*batch, D)"""
-            return arr[ind].copy() if arr.size > 0 else backend.zeros(batch_shape + (dim,), dtype=dtype)
+            """Vector array: (..., D); keep absent caches empty."""
+            return arr[ind].copy() if arr.size > 0 else backend.empty(0, dtype=dtype)
 
         return SingleData(
             qpos=ref, qvel=self.qvel[ind].copy(),
             xpos=_entity(self.xpos, 3), xquat=_entity(self.xquat, 4),
             cvel=_entity(self.cvel, 6), subtree_com=_entity(self.subtree_com, 3),
             cvel_parent=_entity(self.cvel_parent, 6), subtree_com_root=_vector(self.subtree_com_root, 3),
-            xpos_parent=_entity(self.xpos_parent, 3), xquat_parent=_entity(self.xquat_parent, 4),
             site_xpos=_entity(self.site_xpos, 3), site_xmat=_entity(self.site_xmat, 9),
         )
 
@@ -795,15 +795,14 @@ class TrajectoryData(SingleData):
             return _slice(arr) if arr.size > 0 else backend.zeros((slice_length, 0, dim), dtype=dtype)
 
         def _vector(arr, dim):
-            """Vector array: (T, D) -> empty: (slice_length, D)"""
-            return _slice(arr) if arr.size > 0 else backend.zeros((slice_length, dim), dtype=dtype)
+            """Vector array: (T, D); keep absent caches empty."""
+            return _slice(arr) if arr.size > 0 else backend.empty(0, dtype=dtype)
 
         return data.replace(
             qpos=_slice(data.qpos), qvel=_slice(data.qvel),
             xpos=_entity(data.xpos, 3), xquat=_entity(data.xquat, 4),
             cvel=_entity(data.cvel, 6), subtree_com=_entity(data.subtree_com, 3),
             cvel_parent=_entity(data.cvel_parent, 6), subtree_com_root=_vector(data.subtree_com_root, 3),
-            xpos_parent=_entity(data.xpos_parent, 3), xquat_parent=_entity(data.xquat_parent, 4),
             site_xpos=_entity(data.site_xpos, 3), site_xmat=_entity(data.site_xmat, 9),
             split_points=backend.array([0, slice_length])
         )
@@ -1066,9 +1065,7 @@ class TrajectoryData(SingleData):
         )
 
     @staticmethod
-    def concatenate(traj_datas: list, traj_infos: list, backend: ModuleType = jnp,
-                    sparse_body_data: bool = False, skip_body_data: bool = False,
-                    parent_body_ids: Union[np.ndarray, None] = None, root_body_id: Union[int, None] = None):
+    def concatenate(traj_datas: list, traj_infos: list, backend: ModuleType = jnp):
         """
         Concatenate a list of TrajectoryData instances given that the TrajectoryInfos are equivalent.
 
@@ -1076,12 +1073,6 @@ class TrajectoryData(SingleData):
             traj_datas (list): List of TrajectoryData instances to concatenate.
             traj_infos (list): List of TrajectoryInfo instances to concatenate.
             backend: Backend to use for the computation.
-            sparse_body_data: If True, skip full body arrays and extract only sparse parent body data.
-                              Requires parent_body_ids and root_body_id.
-            skip_body_data: If True, skip xpos_parent/xquat_parent (only keep cvel_parent/subtree_com_root
-                           for site velocity). Auto-enabled when validation has no body metrics.
-            parent_body_ids: Array of parent body IDs for each mimic site (required if sparse_body_data=True).
-            root_body_id: The root body ID for subtree_com extraction (required if sparse_body_data=True).
 
         Returns:
             New instance of TrajectoryData and TrajectoryInfo containing the concatenated data.
@@ -1094,10 +1085,6 @@ class TrajectoryData(SingleData):
             _traj_infos_compatible_for_concat(info, traj_infos[0], backend=backend)
             for info in traj_infos
         ), "TrajectoryInfos must be compatible for concatenation!"
-
-        if sparse_body_data:
-            assert parent_body_ids is not None, "parent_body_ids required for sparse_body_data"
-            assert root_body_id is not None, "root_body_id required for sparse_body_data"
 
         # create new TrajectoryData
         new_split_points = []
@@ -1114,59 +1101,30 @@ class TrajectoryData(SingleData):
         new_split_points = backend.concatenate(new_split_points + [backend.array([curr_n_samples])], axis=0)
 
         dtype = traj_datas[0].qpos.dtype
-        ref = traj_datas[0]
 
-        # Helper to create empty array with correct shape
-        def empty_like(arr):
-            if arr.size > 0:
-                return backend.zeros((0,) + arr.shape[1:], dtype=dtype)
-            return backend.empty(0, dtype=dtype)
+        def concatenate_required(name):
+            return backend.concatenate([getattr(data, name) for data in traj_datas], axis=0)
 
-        # Always concatenate qpos/qvel
-        qpos = backend.concatenate([data.qpos for data in traj_datas], axis=0)
-        qvel = backend.concatenate([data.qvel for data in traj_datas], axis=0)
-
-        # Full body-level data (xpos/xquat/cvel/subtree_com): skip if sparse_body_data
-        if sparse_body_data:
-            xpos = empty_like(ref.xpos)
-            xquat = empty_like(ref.xquat)
-            cvel = empty_like(ref.cvel)
-            subtree_com = empty_like(ref.subtree_com)
-        else:
-            xpos = backend.concatenate([data.xpos for data in traj_datas], axis=0)
-            xquat = backend.concatenate([data.xquat for data in traj_datas], axis=0)
-            cvel = backend.concatenate([data.cvel for data in traj_datas], axis=0)
-            subtree_com = backend.concatenate([data.subtree_com for data in traj_datas], axis=0)
-
-        # Sparse body data extraction (when sparse_body_data=True)
-        if sparse_body_data:
-            # Always extract for site velocity computation
-            cvel_parent = backend.concatenate([data.cvel[:, parent_body_ids, :] for data in traj_datas], axis=0)
-            subtree_com_root = backend.concatenate([data.subtree_com[:, root_body_id, :] for data in traj_datas], axis=0)
-
-            # Extract for body metrics (unless skip_body_data)
-            if not skip_body_data:
-                xpos_parent = backend.concatenate([data.xpos[:, parent_body_ids, :] for data in traj_datas], axis=0)
-                xquat_parent = backend.concatenate([data.xquat[:, parent_body_ids, :] for data in traj_datas], axis=0)
-            else:
-                xpos_parent = backend.empty(0, dtype=dtype)
-                xquat_parent = backend.empty(0, dtype=dtype)
-        else:
-            cvel_parent = backend.empty(0, dtype=dtype)
-            subtree_com_root = backend.empty(0, dtype=dtype)
-            xpos_parent = backend.empty(0, dtype=dtype)
-            xquat_parent = backend.empty(0, dtype=dtype)
-
-        # Site-level data site_xpos/site_xmat, always needed
-        site_xpos = backend.concatenate([data.site_xpos for data in traj_datas], axis=0)
-        site_xmat = backend.concatenate([data.site_xmat for data in traj_datas], axis=0)
+        def concatenate_optional(name):
+            arrays = [getattr(data, name) for data in traj_datas]
+            non_empty = [arr.size > 0 for arr in arrays]
+            if not any(non_empty):
+                return backend.empty(0, dtype=dtype)
+            if not all(non_empty):
+                raise ValueError(f"Cannot concatenate mixed empty/non-empty trajectory field '{name}'")
+            return backend.concatenate(arrays, axis=0)
 
         new_traj_data = TrajectoryData(
-            qpos=qpos, qvel=qvel,
-            xpos=xpos, xquat=xquat, cvel=cvel, subtree_com=subtree_com,
-            cvel_parent=cvel_parent, subtree_com_root=subtree_com_root,
-            xpos_parent=xpos_parent, xquat_parent=xquat_parent,
-            site_xpos=site_xpos, site_xmat=site_xmat,
+            qpos=concatenate_required("qpos"),
+            qvel=concatenate_required("qvel"),
+            xpos=concatenate_optional("xpos"),
+            xquat=concatenate_optional("xquat"),
+            cvel=concatenate_optional("cvel"),
+            subtree_com=concatenate_optional("subtree_com"),
+            cvel_parent=concatenate_optional("cvel_parent"),
+            subtree_com_root=concatenate_optional("subtree_com_root"),
+            site_xpos=concatenate_optional("site_xpos"),
+            site_xmat=concatenate_optional("site_xmat"),
             split_points=new_split_points
         )
         return new_traj_data, traj_infos[0]
@@ -1214,46 +1172,31 @@ def interpolate_trajectories(traj_data: TrajectoryData, traj_info: TrajectoryInf
 
     """
 
-    def slerp_batch(quats, times, new_times):
+    def slerp_batch(quats, times, new_times, scalar_first: bool = False):
         """
         Perform SLERP interpolation for a batch of quaternions.
 
         Args:
-            quats: Array of shape (T, 4) containing quaternions. (quaternions is expected to be scalar last)
+            quats: Array of shape (T, 4) containing quaternions.
             times: Array of shape (T,) containing original time points.
             new_times: Array of new time points to interpolate at.
+            scalar_first: Whether quats use MuJoCo's wxyz order instead of SciPy's xyzw order.
 
         Returns:
-            Array of shape (len(new_times), 4) containing interpolated quaternions, where the quaternion is scalar last.
+            Array of shape (len(new_times), 4) containing interpolated quaternions in the input order.
 
         """
-        # Create the Slerp object for the single trajectory
-        slerp = Slerp(times, Rotation.from_quat(quats))
-        # Interpolate and return the results
-        return slerp(new_times).as_quat()
+        quats = np.asarray(quats)
+        new_times = np.asarray(new_times)
+        if quats.shape[0] == 1:
+            return np.repeat(quats, len(new_times), axis=0)
 
-    def interpolate_xmat(xmats, times, new_times):
-        """
-        Perform interpolation for a batch of trajectories of rotation matrices.
-
-        Args:
-            xmats: Array of shape (T, N, 9) containing rotation matrices.
-            times: Array of shape (T,) containing original time points.
-            new_times: Array of new time points to interpolate at.
-
-        Returns:
-            Array of shape (len(new_times), N, 9) containing interpolated rotation matrices.
-
-        """
-        xmats_interpolated = []
-        for i in range(traj_data_slice.site_xmat.shape[1]):
-            xmat = xmats[:, i, :].reshape(-1, 3, 3)
-            xquat = Rotation.from_matrix(xmat).as_quat()
-            xquat_interpolated = slerp_batch(xquat, times, new_times)
-            xmat_interpolated = Rotation.from_quat(xquat_interpolated).as_matrix().reshape(-1, 9)
-            xmats_interpolated.append(xmat_interpolated)
-
-        return backend.stack(xmats_interpolated, axis=1)
+        quats_xyzw = np.concatenate([quats[:, 1:], quats[:, :1]], axis=1) if scalar_first else quats
+        slerp = Slerp(np.asarray(times), Rotation.from_quat(quats_xyzw))
+        interpolated = slerp(new_times).as_quat()
+        if scalar_first:
+            interpolated = np.concatenate([interpolated[:, 3:], interpolated[:, :3]], axis=1)
+        return interpolated
 
     old_frequency = traj_info.frequency
     ratio = old_frequency / new_frequency
@@ -1282,19 +1225,18 @@ def interpolate_trajectories(traj_data: TrajectoryData, traj_info: TrajectoryInf
         keep_mask = (offsets % step) == 0
         all_indices = frame_indices[keep_mask]
 
-        # Single gather operation per field
-        def gather(arr):
-            return arr[all_indices] if arr.size > 0 else arr
-
+        empty = backend.empty(0, dtype=traj_data.qpos.dtype)
         new_traj_data = traj_data.replace(
-            qpos=gather(traj_data.qpos),
-            qvel=gather(traj_data.qvel),
-            xpos=gather(traj_data.xpos),
-            xquat=gather(traj_data.xquat),
-            cvel=gather(traj_data.cvel),
-            subtree_com=gather(traj_data.subtree_com),
-            site_xpos=gather(traj_data.site_xpos),
-            site_xmat=gather(traj_data.site_xmat),
+            qpos=traj_data.qpos[all_indices],
+            qvel=traj_data.qvel[all_indices],
+            xpos=empty,
+            xquat=empty,
+            cvel=empty,
+            subtree_com=empty,
+            cvel_parent=empty,
+            subtree_com_root=empty,
+            site_xpos=empty,
+            site_xmat=empty,
             split_points=new_split_points,
         )
         traj_info = replace(traj_info, frequency=new_frequency)
@@ -1308,53 +1250,63 @@ def interpolate_trajectories(traj_data: TrajectoryData, traj_info: TrajectoryInf
 
         new_traj_sampling_factor = new_frequency / old_frequency
         x = backend.arange(traj_len)
-        x_new = backend.linspace(0, traj_len - 1, round(traj_len * new_traj_sampling_factor), endpoint=True)
-        x_new_len = len(x_new)
+        x_new_len = max(1, int(round(traj_len * new_traj_sampling_factor)))
+        x_new = backend.linspace(0, traj_len - 1, x_new_len, endpoint=True)
+        interp_kind = "cubic" if traj_len >= 4 else "linear"
 
-        # quaternions need SLERP interpolation
-        if traj_data_slice.xquat.size > 0:
-            xquat_interpolated = backend.stack([slerp_batch(traj_data_slice.xquat[:, j, :], x, x_new)
-                                            for j in range(traj_data_slice.xquat.shape[1])], axis=1)
-        else:
-            xquat_interpolated = backend.empty(0)
+        def interpolate_array(
+            arr,
+            x=x,
+            x_new=x_new,
+            x_new_len=x_new_len,
+            interp_kind=interp_kind,
+            dtype=traj_data_slice.qpos.dtype,
+        ):
+            if arr.size == 0:
+                return backend.empty(0, dtype=dtype)
+            arr_np = np.asarray(arr)
+            if arr_np.shape[0] == 1:
+                return backend.array(np.repeat(arr_np, x_new_len, axis=0), dtype=dtype)
+            return backend.array(
+                interp1d(np.asarray(x), arr_np, kind=interp_kind, axis=0)(np.asarray(x_new)),
+                dtype=dtype,
+            )
 
-        # do slerp interpolation for rotation matrices as well
-        if traj_data_slice.site_xmat.size > 0:
-            xmat_interpolated = interpolate_xmat(traj_data_slice.site_xmat, x, x_new)
-        else:
-            xmat_interpolated = backend.empty(0)
+        def set_qpos_columns(qpos_arr, ids, values):
+            if backend == jnp:
+                return qpos_arr.at[:, ids].set(values)
+            qpos_arr[:, np.asarray(ids)] = np.asarray(values)
+            return qpos_arr
 
         # do slerp interpolation for free joint orientation
         qpos_free_joint_quat_ids = [k[3:] for k in traj_info.joint_name2ind_qpos.values() if len(k) > 1]
         qpos_free_joint_quat_ids_flat = [item for sublist in qpos_free_joint_quat_ids for item in sublist]
         qpos_other_ids = backend.array([k for k in range(traj_data.qpos.shape[-1])
                                     if k not in qpos_free_joint_quat_ids_flat])
-        qpos = jnp.zeros((x_new.shape[0], traj_data_slice.qpos.shape[-1]))
-        qpos = qpos.at[:, qpos_other_ids].set(interp1d(x, traj_data_slice.qpos[:, qpos_other_ids], kind="cubic", axis=0)(x_new))
+        qpos = backend.zeros((x_new.shape[0], traj_data_slice.qpos.shape[-1]), dtype=traj_data_slice.qpos.dtype)
+        qpos = set_qpos_columns(qpos, qpos_other_ids, interpolate_array(traj_data_slice.qpos[:, qpos_other_ids]))
         for quat_ids in qpos_free_joint_quat_ids:
             quat_ids = backend.array(quat_ids)
-            qpos = qpos.at[:, quat_ids].set(slerp_batch(traj_data_slice.qpos[:, quat_ids], x, x_new))
+            qpos = set_qpos_columns(
+                qpos,
+                quat_ids,
+                backend.array(slerp_batch(traj_data_slice.qpos[:, quat_ids], x, x_new, scalar_first=True)),
+            )
 
-        # interpolate the rest of the data
-        qvel_interpolated = interp1d(x, traj_data_slice.qvel, kind="cubic", axis=0)(x_new)
-        xpos_interpolated = interp1d(x, traj_data_slice.xpos, kind="cubic", axis=0)(x_new) \
-            if traj_data_slice.xpos.size > 0 else jnp.empty(0)
-        cvel_interpolated = interp1d(x, traj_data_slice.cvel, kind="cubic", axis=0)(x_new) \
-            if traj_data_slice.cvel.size > 0 else jnp.empty(0)
-        site_xpos_interpolated = interp1d(x, traj_data_slice.site_xpos, kind="cubic", axis=0)(x_new) \
-            if traj_data_slice.site_xpos.size > 0 else jnp.empty(0)
-        subtree_com_interpolated = interp1d(x, traj_data_slice.subtree_com, kind="cubic", axis=0)(x_new) \
-            if traj_data_slice.subtree_com.size > 0 else jnp.empty(0)
+        qvel_interpolated = interpolate_array(traj_data_slice.qvel)
+        empty = backend.empty(0, dtype=traj_data_slice.qpos.dtype)
 
         traj_data_slice = traj_data_slice.replace(
             qpos=qpos,
             qvel=qvel_interpolated,
-            xpos=xpos_interpolated,
-            xquat=xquat_interpolated,
-            cvel=cvel_interpolated,
-            site_xpos=site_xpos_interpolated,
-            site_xmat=xmat_interpolated,
-            subtree_com=subtree_com_interpolated,
+            xpos=empty,
+            xquat=empty,
+            cvel=empty,
+            subtree_com=empty,
+            cvel_parent=empty,
+            subtree_com_root=empty,
+            site_xpos=empty,
+            site_xmat=empty,
             split_points=backend.array([0, x_new_len]))
 
         new_traj_datas.append(traj_data_slice)
@@ -1371,16 +1323,16 @@ def recompute_trajectory_velocities(
     backend: ModuleType = jnp,
 ) -> TrajectoryData:
     """
-    Recompute qvel and cvel from qpos for physical consistency.
+    Recompute qvel from qpos for physical consistency.
 
-    Use this after downsampling trajectories to ensure velocities are consistent
-    with the new timestep. qvel is recomputed using mj_differentiatePos, and cvel
-    is recomputed by running mj_forward with the new qvel.
+    Use this after resampling trajectories to ensure velocities are consistent
+    with the final qpos and timestep. qvel is recomputed using MuJoCo's
+    mj_differentiatePos, which handles quaternion joints correctly.
 
     Respects trajectory boundaries (split_points) to avoid computing velocities
     across different motion clips:
     - First frame of each segment: forward difference (t -> t+1)
-    - Middle frames: forward difference (t -> t+1)
+    - Middle frames: centered average of adjacent MuJoCo differences
     - Last frame of each segment: backward difference (t-1 -> t)
     - Single-frame segments: velocity set to zero
 
@@ -1391,7 +1343,7 @@ def recompute_trajectory_velocities(
         backend: Backend for array operations.
 
     Returns:
-        TrajectoryData with recomputed qvel and cvel.
+        TrajectoryData with qvel recomputed.
     """
     dt = 1.0 / traj_info.frequency
     qpos = np.asarray(traj_data.qpos)
@@ -1399,44 +1351,193 @@ def recompute_trajectory_velocities(
     n_frames = len(qpos)
     n_segments = len(split_points) - 1
 
-    # Allocate output arrays
     qvel_new = np.zeros((n_frames, model.nv), dtype=np.float64)
-    cvel_new = np.zeros((n_frames, model.nbody, 6), dtype=np.float64)
-    subtree_com_new = np.zeros((n_frames, model.nbody, 3), dtype=np.float64)
-    mj_data = mujoco.MjData(model)
 
-    # Process each segment independently
     for seg_idx in tqdm(range(n_segments), desc="Recomputing velocities"):
         seg_start = split_points[seg_idx]
         seg_end = split_points[seg_idx + 1]
         seg_len = seg_end - seg_start
 
         if seg_len == 1:
-            # Single-frame segment: velocity is zero
             qvel_new[seg_start] = 0
-        else:
-            # First and middle frames: forward difference
-            for t in range(seg_start, seg_end - 1):
-                mujoco.mj_differentiatePos(model, qvel_new[t], dt, qpos[t], qpos[t + 1])
+            continue
 
-            # Last frame: backward difference (from t-1 to t)
-            last_t = seg_end - 1
-            mujoco.mj_differentiatePos(model, qvel_new[last_t], dt, qpos[last_t - 1], qpos[last_t])
+        qvel_fwd = np.zeros((seg_len - 1, model.nv), dtype=np.float64)
+        for offset, t in enumerate(range(seg_start, seg_end - 1)):
+            mujoco.mj_differentiatePos(model, qvel_fwd[offset], dt, qpos[t], qpos[t + 1])
 
-        # Compute cvel via forward kinematics for all frames in segment
-        for t in range(seg_start, seg_end):
-            mujoco.mj_resetData(model, mj_data)
-            mj_data.qpos[:] = qpos[t]
-            mj_data.qvel[:] = qvel_new[t]
-            mujoco.mj_forward(model, mj_data)
-            cvel_new[t] = mj_data.cvel
-            subtree_com_new[t] = mj_data.subtree_com
+        qvel_new[seg_start] = qvel_fwd[0]
+        if seg_len > 2:
+            qvel_new[seg_start + 1:seg_end - 1] = 0.5 * (qvel_fwd[:-1] + qvel_fwd[1:])
+        qvel_new[seg_end - 1] = qvel_fwd[-1]
 
-    return traj_data.replace(
-        qvel=backend.array(qvel_new.astype(np.float32)),
-        cvel=backend.array(cvel_new.astype(np.float32)),
-        subtree_com=backend.array(subtree_com_new.astype(np.float32)),
+    return traj_data.replace(qvel=backend.array(qvel_new.astype(np.float32)))
+
+
+def _model_names(model: "mujoco.MjModel", obj_type, count: int) -> list[str | None]:
+    return [mujoco.mj_id2name(model, obj_type, i) for i in range(count)]
+
+
+def _model_ids_from_names(model: "mujoco.MjModel", names: list[str], obj_type, label: str) -> np.ndarray:
+    ids = np.array([mujoco.mj_name2id(model, obj_type, name) for name in names], dtype=np.int64)
+    missing = [name for name, idx in zip(names, ids) if idx < 0]
+    if missing:
+        raise ValueError(f"Unknown {label} name(s): {missing}")
+    return ids
+
+
+def _trajectory_model_from_mujoco(
+    model: "mujoco.MjModel",
+    backend: ModuleType,
+    include_bodies: bool,
+    site_ids: np.ndarray | None,
+) -> TrajectoryModel:
+    kwargs = {
+        "njnt": model.njnt,
+        "jnt_type": backend.array(model.jnt_type),
+    }
+    if include_bodies:
+        kwargs |= {
+            "nbody": model.nbody,
+            "body_rootid": backend.array(model.body_rootid),
+            "body_weldid": backend.array(model.body_weldid),
+            "body_mocapid": backend.array(model.body_mocapid),
+            "body_pos": backend.array(model.body_pos),
+            "body_quat": backend.array(model.body_quat),
+            "body_ipos": backend.array(model.body_ipos),
+            "body_iquat": backend.array(model.body_iquat),
+        }
+    if site_ids is not None:
+        kwargs |= {
+            "nsite": len(site_ids),
+            "site_bodyid": backend.array(model.site_bodyid[site_ids]),
+            "site_pos": backend.array(model.site_pos[site_ids]),
+            "site_quat": backend.array(model.site_quat[site_ids]),
+        }
+    return TrajectoryModel(**kwargs)
+
+
+def trajectory_info_with_cache_metadata(
+    traj_info: TrajectoryInfo,
+    model: "mujoco.MjModel",
+    cache_type: TrajectoryCacheType | str,
+    site_names: list[str] | None = None,
+    backend: ModuleType = jnp,
+) -> TrajectoryInfo:
+    cache_type = TrajectoryCacheType(cache_type)
+
+    if cache_type == TrajectoryCacheType.NONE:
+        return replace(
+            traj_info,
+            body_names=None,
+            site_names=None,
+            model=TrajectoryModel(njnt=model.njnt, jnt_type=backend.array(model.jnt_type)),
+        )
+
+    if cache_type == TrajectoryCacheType.FULL:
+        site_ids = np.arange(model.nsite, dtype=np.int64)
+        return replace(
+            traj_info,
+            body_names=_model_names(model, mujoco.mjtObj.mjOBJ_BODY, model.nbody),
+            site_names=_model_names(model, mujoco.mjtObj.mjOBJ_SITE, model.nsite),
+            model=_trajectory_model_from_mujoco(model, backend, include_bodies=True, site_ids=site_ids),
+        )
+
+    if site_names is None:
+        raise ValueError("SPARSE trajectory cache requires site_names")
+    site_ids = _model_ids_from_names(model, site_names, mujoco.mjtObj.mjOBJ_SITE, "site")
+    return replace(
+        traj_info,
+        body_names=None,
+        site_names=list(site_names),
+        model=_trajectory_model_from_mujoco(model, backend, include_bodies=False, site_ids=site_ids),
     )
+
+
+def compute_trajectory_kinematic_caches(
+    traj_data: TrajectoryData,
+    model: "mujoco.MjModel",
+    cache_type: TrajectoryCacheType | str,
+    site_names: list[str] | None = None,
+    backend: ModuleType = jnp,
+) -> TrajectoryData:
+    """
+    Build runtime kinematic caches from qpos/qvel using one explicit cache layout.
+    """
+    cache_type = TrajectoryCacheType(cache_type)
+    dtype = np.asarray(traj_data.qpos).dtype
+    empty = backend.empty(0, dtype=dtype)
+
+    if cache_type == TrajectoryCacheType.NONE:
+        return traj_data.replace(
+            xpos=empty,
+            xquat=empty,
+            cvel=empty,
+            subtree_com=empty,
+            cvel_parent=empty,
+            subtree_com_root=empty,
+            site_xpos=empty,
+            site_xmat=empty,
+        )
+
+    qpos = np.asarray(traj_data.qpos)
+    qvel = np.asarray(traj_data.qvel)
+    n_frames = len(qpos)
+
+    if cache_type == TrajectoryCacheType.FULL:
+        buffers = {
+            "xpos": np.zeros((n_frames, model.nbody, 3), dtype=np.float64),
+            "xquat": np.zeros((n_frames, model.nbody, 4), dtype=np.float64),
+            "cvel": np.zeros((n_frames, model.nbody, 6), dtype=np.float64),
+            "subtree_com": np.zeros((n_frames, model.nbody, 3), dtype=np.float64),
+            "site_xpos": np.zeros((n_frames, model.nsite, 3), dtype=np.float64),
+            "site_xmat": np.zeros((n_frames, model.nsite, 9), dtype=np.float64),
+        }
+        site_ids = None
+        parent_body_ids = None
+        root_body_id = None
+    else:
+        if site_names is None:
+            raise ValueError("SPARSE trajectory cache requires site_names")
+        site_ids = _model_ids_from_names(model, site_names, mujoco.mjtObj.mjOBJ_SITE, "site")
+        parent_body_ids = np.asarray(model.site_bodyid[site_ids], dtype=np.int64)
+        root_body_ids = np.unique(model.body_rootid[parent_body_ids])
+        if root_body_ids.size != 1:
+            raise ValueError(f"SPARSE trajectory cache requires one root body, got {root_body_ids.tolist()}")
+        root_body_id = int(root_body_ids[0])
+        buffers = {
+            "site_xpos": np.zeros((n_frames, len(site_ids), 3), dtype=np.float64),
+            "site_xmat": np.zeros((n_frames, len(site_ids), 9), dtype=np.float64),
+            "cvel_parent": np.zeros((n_frames, len(site_ids), 6), dtype=np.float64),
+            "subtree_com_root": np.zeros((n_frames, 3), dtype=np.float64),
+        }
+
+    mj_data = mujoco.MjData(model)
+    for t in tqdm(range(n_frames), desc="Computing trajectory cache"):
+        mujoco.mj_resetData(model, mj_data)
+        mj_data.qpos[:] = qpos[t]
+        mj_data.qvel[:] = qvel[t]
+        mujoco.mj_forward(model, mj_data)
+
+        if cache_type == TrajectoryCacheType.FULL:
+            buffers["xpos"][t] = mj_data.xpos
+            buffers["xquat"][t] = mj_data.xquat
+            buffers["cvel"][t] = mj_data.cvel
+            buffers["subtree_com"][t] = mj_data.subtree_com
+            buffers["site_xpos"][t] = mj_data.site_xpos
+            buffers["site_xmat"][t] = mj_data.site_xmat
+        else:
+            buffers["site_xpos"][t] = mj_data.site_xpos[site_ids]
+            buffers["site_xmat"][t] = mj_data.site_xmat[site_ids]
+            buffers["cvel_parent"][t] = mj_data.cvel[parent_body_ids]
+            buffers["subtree_com_root"][t] = mj_data.subtree_com[root_body_id]
+
+    updates = {field_name: backend.array(values.astype(dtype, copy=False)) for field_name, values in buffers.items()}
+    if cache_type == TrajectoryCacheType.FULL:
+        updates |= {"cvel_parent": empty, "subtree_com_root": empty}
+    else:
+        updates |= {"xpos": empty, "xquat": empty, "cvel": empty, "subtree_com": empty}
+    return traj_data.replace(**updates)
 
 
 @struct.dataclass

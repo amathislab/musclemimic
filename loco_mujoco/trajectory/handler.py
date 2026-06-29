@@ -1,12 +1,21 @@
+import logging
 from dataclasses import replace
-import mujoco
-import numpy as np
+
 import jax
 import jax.numpy as jnp
+import mujoco
+import numpy as np
 from flax import struct
-import logging
+
 from loco_mujoco.core.stateful_object import StatefulObject
-from loco_mujoco.trajectory.dataclasses import Trajectory, interpolate_trajectories, recompute_trajectory_velocities
+from loco_mujoco.trajectory.dataclasses import (
+    Trajectory,
+    TrajectoryCacheType,
+    compute_trajectory_kinematic_caches,
+    interpolate_trajectories,
+    recompute_trajectory_velocities,
+    trajectory_info_with_cache_metadata,
+)
 
 
 @struct.dataclass
@@ -26,7 +35,8 @@ class TrajectoryHandler(StatefulObject):
 
     """
     def __init__(self, model, traj_path=None, traj: Trajectory = None, control_dt=0.01, random_start=True,
-                 fixed_start_conf=None, start_from_random_step=True, clip_trajectory_to_joint_ranges=False, warn=True):
+                 fixed_start_conf=None, start_from_random_step=True, clip_trajectory_to_joint_ranges=False, warn=True,
+                 cache_type: TrajectoryCacheType | str = TrajectoryCacheType.FULL, site_names: list[str] | None = None):
         """
         Constructor.
 
@@ -50,9 +60,6 @@ class TrajectoryHandler(StatefulObject):
         if traj_path is not None:
             traj = Trajectory.load(traj_path)
 
-        # filter/extend the trajectory based on the model/data
-        traj_data, traj_info = self.filter_and_extend(traj.data, traj.info, model)
-
         # todo: implement this in observation types in init_from_traj!
         #self.check_if_trajectory_is_in_range(low, high, keys, joint_pos_idx, warn, clip_trajectory_to_joint_ranges)
 
@@ -62,33 +69,15 @@ class TrajectoryHandler(StatefulObject):
         self.use_fixed_start = True if fixed_start_conf is not None else False
         self.start_from_random_step = start_from_random_step
 
-        self.traj_dt = 1 / traj_info.frequency
         self.control_dt = control_dt
-
-        print(f"[TrajectoryHandler] traj_dt={self.traj_dt:.6f} ({traj_info.frequency:.1f}Hz), control_dt={self.control_dt:.6f} ({1/self.control_dt:.1f}Hz)")
-
-        if self.traj_dt != self.control_dt:
-            # Apply standard interpolation for all environments
-            original_frequency = traj_info.frequency
-            target_frequency = 1.0 / self.control_dt
-            original_samples = traj_data.n_samples
-            is_downsampling = target_frequency < original_frequency
-
-            traj_data, traj_info = interpolate_trajectories(traj_data, traj_info, target_frequency)
-
-            # Recompute velocities for physical consistency when downsampling
-            if is_downsampling:
-                traj_data = recompute_trajectory_velocities(traj_data, traj_info, model)
-                print(f"[TrajectoryHandler] INFO: Recomputed qvel/cvel for {target_frequency:.1f} Hz")
-
-            # Log the interpolation
-            print(f"[TrajectoryHandler] INFO: Interpolated trajectory from {original_frequency:.1f} Hz to {target_frequency:.1f} Hz ({original_samples} → {traj_data.n_samples} samples)")
-            logger = logging.getLogger("trajectory")
-            if logger.handlers:  # Only log if logger is configured
-                logger.info(f"Interpolated trajectory from {original_frequency:.1f} Hz to {target_frequency:.1f} Hz ({original_samples} → {traj_data.n_samples} samples)")
-
-        self._is_numpy = True if isinstance(traj_data.qpos, np.ndarray) else False
-        self.traj = replace(traj, data=traj_data, info=traj_info)
+        self.traj = materialize_trajectory(
+            traj,
+            model=model,
+            control_dt=control_dt,
+            cache_type=cache_type,
+            site_names=site_names,
+        )
+        self._is_numpy = True if isinstance(self.traj.data.qpos, np.ndarray) else False
 
         # Update traj_dt from interpolated trajectory info
         self.traj_dt = 1.0 / self.traj.info.frequency
@@ -133,14 +122,14 @@ class TrajectoryHandler(StatefulObject):
             TrajectoryData, TrajectoryInfo: Filtered and extended trajectory data and trajectory info.
 
         """
-        
+
         # Special handling for MyoBimanualArm: detect if this is a MyoBimanualArm trajectory
         # by checking if the trajectory has exactly 7 sites matching MyoBimanualArm's sites_for_mimic
         is_bimanual_muscle_traj = False
-        bimanual_sites = ["right_shoulder_mimic", "right_elbow_mimic", "right_hand_mimic", 
+        bimanual_sites = ["right_shoulder_mimic", "right_elbow_mimic", "right_hand_mimic",
                            "left_shoulder_mimic", "left_elbow_mimic", "left_hand_mimic"]
-        
-        if (traj_info.site_names is not None and 
+
+        if (traj_info.site_names is not None and
             len(traj_info.site_names) == 6 and
             set(traj_info.site_names) == set(bimanual_sites)):
             is_bimanual_muscle_traj = True
@@ -240,7 +229,7 @@ class TrajectoryHandler(StatefulObject):
             # and skip adding sites from the model to maintain memory optimization
             has_many_model_sites = len(site_names) > len(traj_info.site_names) * 10  # Model has 10x more sites than trajectory
             is_muscle_model = is_bimanual_muscle_traj or has_many_model_sites
-            
+
             if not is_muscle_model:
                 # Only add sites for non-muscle models
                 for s_name in site_names:
@@ -270,7 +259,7 @@ class TrajectoryHandler(StatefulObject):
             new_site_order = []
             has_many_model_sites = len(site_names) > len(traj_info.site_names) * 10  # Model has 10x more sites than trajectory
             is_muscle_model = is_bimanual_muscle_traj or has_many_model_sites
-            
+
             if is_muscle_model:
                 # For muscle models, maintain the existing order of mimic sites
                 # without trying to reorder to match all model sites
@@ -410,3 +399,61 @@ class TrajectoryHandler(StatefulObject):
     @property
     def is_numpy(self):
         return self._is_numpy
+
+
+def materialize_trajectory(
+    traj: Trajectory,
+    model: "mujoco.MjModel",
+    control_dt: float,
+    cache_type: TrajectoryCacheType | str = TrajectoryCacheType.FULL,
+    site_names: list[str] | None = None,
+) -> Trajectory:
+    cache_type = TrajectoryCacheType(cache_type)
+    backend = np if isinstance(traj.data.qpos, np.ndarray) else jnp
+
+    traj_data, traj_info = TrajectoryHandler.filter_and_extend(traj.data, traj.info, model)
+
+    original_frequency = traj_info.frequency
+    target_frequency = 1.0 / control_dt
+    original_samples = int(np.asarray(traj_data.n_samples))
+    traj_dt = 1.0 / traj_info.frequency
+
+    print(
+        f"[TrajectoryHandler] traj_dt={traj_dt:.6f} ({traj_info.frequency:.1f}Hz), "
+        f"control_dt={control_dt:.6f} ({target_frequency:.1f}Hz), cache={cache_type.value}"
+    )
+
+    if not np.isclose(traj_dt, control_dt, atol=1e-9):
+        traj_data, traj_info = interpolate_trajectories(traj_data, traj_info, target_frequency, backend=backend)
+        print(
+            f"[TrajectoryHandler] INFO: Interpolated trajectory from {original_frequency:.1f} Hz "
+            f"to {target_frequency:.1f} Hz ({original_samples} -> {int(np.asarray(traj_data.n_samples))} samples)"
+        )
+        logger = logging.getLogger("trajectory")
+        if logger.handlers:
+            logger.info(
+                "Interpolated trajectory from %.1f Hz to %.1f Hz (%d -> %d samples)",
+                original_frequency,
+                target_frequency,
+                original_samples,
+                int(np.asarray(traj_data.n_samples)),
+            )
+
+    traj_data = recompute_trajectory_velocities(traj_data, traj_info, model, backend=backend)
+    traj_data = compute_trajectory_kinematic_caches(
+        traj_data,
+        model=model,
+        cache_type=cache_type,
+        site_names=site_names,
+        backend=backend,
+    )
+    traj_info = trajectory_info_with_cache_metadata(
+        traj_info,
+        model=model,
+        cache_type=cache_type,
+        site_names=site_names,
+        backend=backend,
+    )
+    print(f"[TrajectoryHandler] INFO: Materialized {cache_type.value} trajectory cache at {traj_info.frequency:.1f} Hz")
+
+    return replace(traj, data=traj_data, info=traj_info)

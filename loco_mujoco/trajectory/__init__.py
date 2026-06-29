@@ -4,20 +4,27 @@ from typing import TYPE_CHECKING, Dict
 
 from .dataclasses import (
     Trajectory,
+    TrajectoryCacheType,
     TrajectoryInfo,
     TrajectoryModel,
     TrajectoryData,
     TrajectoryTransitions,
     interpolate_trajectories,
+    recompute_trajectory_velocities,
+    compute_trajectory_kinematic_caches,
 )
 
 __all__ = [
     "Trajectory",
+    "TrajectoryCacheType",
     "TrajectoryInfo",
     "TrajectoryModel",
     "TrajectoryData",
     "TrajectoryTransitions",
     "interpolate_trajectories",
+    "recompute_trajectory_velocities",
+    "compute_trajectory_kinematic_caches",
+    "materialize_trajectory",
     "TrajectoryHandler",
     "TrajState",
 ]
@@ -25,6 +32,7 @@ __all__ = [
 _LAZY_ATTRS: Dict[str, str] = {
     "TrajectoryHandler": "TrajectoryHandler",
     "TrajState": "TrajState",
+    "materialize_trajectory": "materialize_trajectory",
 }
 
 
@@ -43,4 +51,4 @@ def __dir__():
 
 
 if TYPE_CHECKING:
-    from .handler import TrajectoryHandler, TrajState
+    from .handler import TrajectoryHandler, TrajState, materialize_trajectory

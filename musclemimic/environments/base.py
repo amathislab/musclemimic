@@ -117,7 +117,14 @@ class LocoEnv(Mjx):
 
         self._th_params = th_params
 
-    def load_trajectory(self, traj: Trajectory = None, traj_path: str = None, warn: bool = True) -> None:
+    def load_trajectory(
+        self,
+        traj: Trajectory = None,
+        traj_path: str = None,
+        warn: bool = True,
+        cache_type="full",
+        site_names=None,
+    ) -> None:
         """
         Loads trajectories. If there were trajectories loaded already, this function overrides the latter.
 
@@ -136,7 +143,14 @@ class LocoEnv(Mjx):
 
         th_params = self._th_params if self._th_params is not None else {}
         self.th = TrajectoryHandler(
-            model=self._model, warn=warn, traj_path=traj_path, traj=traj, control_dt=self.dt, **th_params
+            model=self._model,
+            warn=warn,
+            traj_path=traj_path,
+            traj=traj,
+            control_dt=self.dt,
+            cache_type=cache_type,
+            site_names=site_names,
+            **th_params,
         )
 
         if self.th.traj.obs_container is not None:
