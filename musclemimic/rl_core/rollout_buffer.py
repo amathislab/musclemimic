@@ -27,12 +27,13 @@ def compute_gae(
     gamma: float,
     gae_lambda: float,
     unroll: int = 16,
+    bootstrap_mask: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Compute Generalized Advantage Estimation (GAE).
 
-    Distinguishes between:
-    - absorbing: terminal state (no value bootstrap)
+    Uses shifted rollout values for V(s_{t+1}) and distinguishes between:
+    - bootstrap_mask: whether V(s_{t+1}) should be used in delta
     - done: episode boundary (no GAE propagation)
 
     Args:
@@ -44,17 +45,22 @@ def compute_gae(
         gamma: Discount factor
         gae_lambda: GAE decay parameter
         unroll: Scan unroll factor for performance (default 16, matching PPO)
+        bootstrap_mask: optional (num_steps, num_envs). Defaults to 1 - absorbing.
 
     Returns:
         advantages: (num_steps, num_envs)
         returns: (num_steps, num_envs)
     """
     num_steps = rewards.shape[0]
+    if bootstrap_mask is None:
+        bootstrap_mask = jnp.logical_not(absorbing.astype(bool))
 
     def _step(carry: tuple[jnp.ndarray, jnp.ndarray], t: int):
         gae, next_val = carry
-        delta = rewards[t] + gamma * next_val * (1 - absorbing[t]) - values[t]
-        gae = delta + gamma * gae_lambda * (1 - dones[t]) * gae
+        bootstrap = bootstrap_mask[t].astype(values.dtype)
+        nonterminal = 1.0 - dones[t].astype(values.dtype)
+        delta = rewards[t] + gamma * next_val * bootstrap - values[t]
+        gae = delta + gamma * gae_lambda * nonterminal * gae
         return (gae, values[t]), gae
 
     _, advs = jax.lax.scan(
@@ -164,6 +170,7 @@ class RolloutBuffer(Generic[T]):
         gamma: float,
         gae_lambda: float,
         unroll: int = 16,
+        bootstrap_mask: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Compute GAE advantages and return targets."""
         return compute_gae(
@@ -175,6 +182,7 @@ class RolloutBuffer(Generic[T]):
             gamma,
             gae_lambda,
             unroll=unroll,
+            bootstrap_mask=bootstrap_mask,
         )
 
     def get_minibatches(

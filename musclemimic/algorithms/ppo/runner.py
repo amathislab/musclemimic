@@ -11,6 +11,11 @@ from typing import TYPE_CHECKING, Any
 import jax
 import jax.numpy as jnp
 
+from musclemimic.algorithms.common.adaptive_sampling import (
+    compute_adaptive_weights,
+    compute_per_traj_termination_stats,
+    compute_topk_weights,
+)
 from musclemimic.algorithms.common.checkpoint_utils import (
     TrainingConfig,
     compute_resume_state,
@@ -33,11 +38,6 @@ from musclemimic.algorithms.common.dataclasses import (
     ValidationCarry,
     ValidationData,
     ValidationDataFields,
-)
-from musclemimic.algorithms.common.adaptive_sampling import (
-    compute_adaptive_weights,
-    compute_per_traj_termination_stats,
-    compute_topk_weights,
 )
 from musclemimic.algorithms.common.env_state_utils import (
     get_carry_normalized,
@@ -66,7 +66,13 @@ from musclemimic.algorithms.ppo.loss import (
 from musclemimic.algorithms.ppo.moe import aggregate_moe_metrics, zero_moe_metrics
 from musclemimic.core.wrappers import LogEnvState, SummaryMetrics
 from musclemimic.rl_core import compute_gae, create_minibatches
-from musclemimic.utils.debug_tools import DebugFlags, maybe_debug_callback, maybe_profile_traj_batch, maybe_profile_val_batch, maybe_track_nacon
+from musclemimic.utils.debug_tools import (
+    DebugFlags,
+    maybe_debug_callback,
+    maybe_profile_traj_batch,
+    maybe_profile_val_batch,
+    maybe_track_nacon,
+)
 from musclemimic.utils.metrics import (
     VALIDATION_STEP_METRIC_KEYS,
     ValidationSummary,
@@ -301,7 +307,7 @@ def train(
             curriculum_state,
         ) = runner_state
 
-        early_count, early_rate = compute_early_termination_stats(
+        _early_count, early_rate = compute_early_termination_stats(
             traj_batch.metrics.done,
             traj_batch.absorbing,
         )
@@ -392,6 +398,9 @@ def train(
             mutable=["run_stats"],
         )
         _, last_val = y
+        terminal_mask = jnp.logical_or(traj_batch.absorbing, traj_batch.traj_end)
+        horizon_timeout = jnp.logical_and(traj_batch.done, jnp.logical_not(terminal_mask))
+        bootstrap_mask = jnp.logical_not(jnp.logical_or(terminal_mask, horizon_timeout))
 
         advantages, targets = compute_gae(
             traj_batch.reward,
@@ -401,6 +410,7 @@ def train(
             last_val,
             config.gamma,
             config.gae_lambda,
+            bootstrap_mask=bootstrap_mask,
         )
 
         # update network
@@ -584,6 +594,8 @@ def train(
                         "ppo/value_mean": float(m["value_mean"]),
                         "ppo/early_termination_count": float(train_m.early_termination_count),
                         "ppo/early_termination_rate": float(train_m.early_termination_rate),
+                        "ppo/horizon_timeout_count": float(train_m.horizon_timeout_count),
+                        "ppo/horizon_timeout_rate": float(train_m.horizon_timeout_rate),
                         "ppo/utd": float(config.get("effective_utd", config.update_epochs)),
                         "ppo/sample_reuse": float(config.get("sample_reuse", config.update_epochs)),
                         "ppo/unrolls_per_1m": float(config.get("unrolls_per_1m", 0.0)),
@@ -874,6 +886,7 @@ def _collect_trajectories(
     train_state, env_state, last_obs, rng, lr, val_rng, curriculum_state, network, env, config, debug_flags
 ):
     """Collect trajectories via jax.lax.scan."""
+    traj_split_points = jnp.asarray(env.th.traj.data.split_points)
 
     def _env_step(runner_state, unused):
         train_state, env_state, last_obs, rng, lr, val_rng, curriculum_state = runner_state
@@ -889,8 +902,13 @@ def _collect_trajectories(
         action = pi.sample(seed=_rng)
         log_prob = pi.log_prob(action)
 
-        obsv, reward, absorbing, done, info, env_state, transition_state = env.step_with_transition(env_state, action)
+        obsv, reward, absorbing, done, info, env_state, transition_state, _transition_obsv = env.step_with_transition(
+            env_state, action
+        )
         log_env_state = transition_state.find(LogEnvState)
+        traj_state = transition_state.additional_carry.traj_state
+        traj_len = traj_split_points[traj_state.traj_no + 1] - traj_split_points[traj_state.traj_no]
+        traj_end = traj_state.subtraj_step_no >= (traj_len - 1)
 
         # Track max ncon for buffer sizing
         # (Warp uses data._impl.nacon for number of contacts)
@@ -901,13 +919,14 @@ def _collect_trajectories(
         transition = Transition(
             done,
             absorbing,
+            traj_end,
             action,
             value,
             reward,
             log_prob,
             last_obs,
             info,
-            transition_state.additional_carry.traj_state,
+            traj_state,
             log_env_state.metrics,
         )
         runner_state = (train_state, env_state, obsv, rng, lr, val_rng, curriculum_state)
@@ -1032,6 +1051,10 @@ def _compute_training_metrics(traj_batch, config):
         logged_metrics.done,
         traj_batch.absorbing,
     )
+    terminal_mask = jnp.logical_or(traj_batch.absorbing, traj_batch.traj_end)
+    horizon_timeout = jnp.logical_and(traj_batch.done, jnp.logical_not(terminal_mask))
+    horizon_timeout_count = jnp.sum(horizon_timeout.astype(jnp.float32))
+    horizon_timeout_rate = jnp.where(num_done > 0, horizon_timeout_count / num_done, 0.0)
 
     # Extract reward sub-terms from info dict (mean over all steps)
     info = traj_batch.info
@@ -1068,6 +1091,8 @@ def _compute_training_metrics(traj_batch, config):
         max_timestep=jnp.max(logged_metrics.timestep * config.num_envs),
         early_termination_count=early_termination_count,
         early_termination_rate=early_termination_rate,
+        horizon_timeout_count=horizon_timeout_count,
+        horizon_timeout_rate=horizon_timeout_rate,
         reward_total=reward_total,
         reward_qpos=reward_qpos,
         reward_qvel=reward_qvel,
@@ -1111,7 +1136,7 @@ def _run_validation(train_state, val_rng, val_env, config, mh, counter):
 
             # Validation metrics must read the pre-reset transition, but the scan
             # carry must advance with the post-reset rollout state.
-            obsv, _, _, _, _, env_state, transition_state = val_env.step_with_transition(env_state, action)
+            obsv, _, _, _, _, env_state, transition_state, _ = val_env.step_with_transition(env_state, action)
             log_env_state = transition_state.find(LogEnvState)
 
             # Extract only fields needed by MetricsHandler, with site arrays pre-sliced to K
@@ -1143,10 +1168,10 @@ def _run_validation(train_state, val_rng, val_env, config, mh, counter):
 
         _, traj_batch_eval = jax.lax.scan(_eval_env, runner_state_eval, None, config.validation.num_steps)
 
-        # Pass local site indices (0..K-1) since site arrays are pre-sliced
-        K = mh.rel_site_ids.shape[0]
-        maybe_profile_val_batch(traj_batch_eval, K, debug_flags)
-        sim_site_idx_local = jnp.arange(K, dtype=mh.rel_site_ids.dtype)
+        # Pass local site indices (0..num_sites-1) since site arrays are pre-sliced
+        num_sites = mh.rel_site_ids.shape[0]
+        maybe_profile_val_batch(traj_batch_eval, num_sites, debug_flags)
+        sim_site_idx_local = jnp.arange(num_sites, dtype=mh.rel_site_ids.dtype)
         validation_metrics = mh(traj_batch_eval.val_data, sim_site_idx=sim_site_idx_local)
         return validation_metrics, val_rng_out
 

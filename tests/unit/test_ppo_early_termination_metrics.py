@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import jax.numpy as jnp
+import pytest
 
 from musclemimic.algorithms.ppo import runner as ppo_runner
 from musclemimic.core.wrappers.mjx import Metrics
@@ -48,24 +49,44 @@ def _make_info(shape: tuple) -> dict:
 def test_compute_training_metrics_counts_early_termination():
     done = jnp.array([[True, False], [False, True]], dtype=bool)
     absorbing = jnp.array([[True, False], [False, False]], dtype=bool)
+    traj_end = jnp.array([[False, False], [False, True]], dtype=bool)
     info = _make_info(done.shape)
-    traj_batch = SimpleNamespace(metrics=_make_metrics(done), absorbing=absorbing, info=info)
+    traj_batch = SimpleNamespace(metrics=_make_metrics(done), done=done, absorbing=absorbing, traj_end=traj_end, info=info)
     config = SimpleNamespace(num_envs=2)
 
     summary = ppo_runner._compute_training_metrics(traj_batch, config)
 
     assert float(summary.early_termination_count) == 1.0
     assert float(summary.early_termination_rate) == 0.5
+    assert float(summary.horizon_timeout_count) == 0.0
+    assert float(summary.horizon_timeout_rate) == 0.0
 
 
 def test_compute_training_metrics_handles_no_done():
     done = jnp.zeros((2, 2), dtype=bool)
     absorbing = jnp.ones((2, 2), dtype=bool)
+    traj_end = jnp.zeros((2, 2), dtype=bool)
     info = _make_info(done.shape)
-    traj_batch = SimpleNamespace(metrics=_make_metrics(done), absorbing=absorbing, info=info)
+    traj_batch = SimpleNamespace(metrics=_make_metrics(done), done=done, absorbing=absorbing, traj_end=traj_end, info=info)
     config = SimpleNamespace(num_envs=2)
 
     summary = ppo_runner._compute_training_metrics(traj_batch, config)
 
     assert float(summary.early_termination_count) == 0.0
     assert float(summary.early_termination_rate) == 0.0
+    assert float(summary.horizon_timeout_count) == 0.0
+    assert float(summary.horizon_timeout_rate) == 0.0
+
+
+def test_compute_training_metrics_counts_horizon_timeout():
+    done = jnp.array([[True, True], [False, True]], dtype=bool)
+    absorbing = jnp.array([[True, False], [False, False]], dtype=bool)
+    traj_end = jnp.array([[False, False], [False, True]], dtype=bool)
+    info = _make_info(done.shape)
+    traj_batch = SimpleNamespace(metrics=_make_metrics(done), done=done, absorbing=absorbing, traj_end=traj_end, info=info)
+    config = SimpleNamespace(num_envs=2)
+
+    summary = ppo_runner._compute_training_metrics(traj_batch, config)
+
+    assert float(summary.horizon_timeout_count) == 1.0
+    assert float(summary.horizon_timeout_rate) == pytest.approx(1.0 / 3.0)

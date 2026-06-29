@@ -5,8 +5,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
-from musclemimic.core.mujoco_mjx import Mjx, MjxState
 from loco_mujoco.core.utils.env import Box
+from musclemimic.core.mujoco_mjx import Mjx, MjxState
 
 
 class LocoMjxWrapper:
@@ -120,6 +120,8 @@ class BaseWrapper:
             - ``transition_state`` is the state that semantically belongs to the
               transition that just happened and should be used for metrics,
               diagnostics, or logging that refer to "this step".
+            - ``transition_obs`` is the actual next observation for this
+              transition. With autoreset it differs from the next rollout obs.
 
         Most wrappers do not change episode-boundary semantics, so they return the
         same state for both roles. Wrappers that perform autoreset can diverge:
@@ -127,10 +129,11 @@ class BaseWrapper:
         while the transition state still refers to the terminal pre-reset state.
 
         Returns:
-            ``(obs, reward, absorbing, done, info, carry_state, transition_state)``.
+            ``(obs, reward, absorbing, done, info, carry_state,
+            transition_state, transition_obs)``.
         """
         res = self.step(state, action)
-        return (*res, res[-1])
+        return (*res, res[-1], res[0])
 
     def __getattr__(self, name):
         return getattr(self.env, name)
@@ -162,6 +165,8 @@ class SummaryMetrics:
     max_timestep: int = 0.0
     early_termination_count: float = 0.0
     early_termination_rate: float = 0.0
+    horizon_timeout_count: float = 0.0
+    horizon_timeout_rate: float = 0.0
     # Reward sub-terms (mean over trajectory batch)
     reward_total: float = 0.0
     reward_qpos: float = 0.0
@@ -738,7 +743,7 @@ class AutoResetWrapper(BaseWrapper):
         reset_obs, reset_inner, reset_state = self._compute_reset_candidates(reset_keys)
 
         # 3. Step inner env
-        obs, reward, absorbing, done, info, next_state, next_inner, _ = self._step_inner(state, action)
+        obs, reward, absorbing, done, _info, next_state, next_inner, _ = self._step_inner(state, action)
 
         # done_out: This is what we return to training (episode ended THIS step)
         done_out = done
@@ -749,7 +754,7 @@ class AutoResetWrapper(BaseWrapper):
             done_out, inner, next_inner, reset_obs, reset_inner, reset_state, obs, next_state, rng_next, where_done
         )
 
-        return new_obs, reward, absorbing, done_out, next_info, updated_state, next_state
+        return new_obs, reward, absorbing, done_out, next_info, updated_state, next_state, obs
 
     def step(self, state, action):
         """Execute step with automatic reset for done environments.
@@ -758,19 +763,21 @@ class AutoResetWrapper(BaseWrapper):
             - done_out: Returned to training, True when episode ended at this step
             - done_in: Written to inner state, always False for clean next step
         """
-        new_obs, reward, absorbing, done_out, next_info, updated_state, _ = self._step_with_autoreset(state, action)
+        new_obs, reward, absorbing, done_out, next_info, updated_state, _, _ = self._step_with_autoreset(state, action)
         return new_obs, reward, absorbing, done_out, next_info, updated_state
 
     def step_with_transition(self, state, action):
         """Execute step and expose both rollout-carry and pre-reset transition.
 
         Returned values intentionally have mixed semantics:
-            - ``obs`` / ``reward`` / ``absorbing`` / ``done`` / ``info`` describe
-              the transition that just happened.
-            - ``updated_state`` is the post-reset carry state for the next rollout
-              step.
+            - ``new_obs`` and ``updated_state`` are post-reset values for the next
+              rollout step.
+            - ``reward`` / ``absorbing`` / ``done`` / ``info`` describe the
+              transition that just happened.
             - ``transition_state`` is the pre-reset state for the transition that
               just happened.
+            - ``transition_obs`` is the pre-reset next observation for value
+              bootstrap on truncation.
 
         The split only matters on done steps. On non-terminal steps,
         ``updated_state`` and ``transition_state`` are equivalent.
@@ -783,8 +790,9 @@ class AutoResetWrapper(BaseWrapper):
             next_info,
             updated_state,
             transition_state,
+            transition_obs,
         ) = self._step_with_autoreset(state, action)
-        return new_obs, reward, absorbing, done_out, next_info, updated_state, transition_state
+        return new_obs, reward, absorbing, done_out, next_info, updated_state, transition_state, transition_obs
 
 
 @struct.dataclass
@@ -836,11 +844,12 @@ class NormalizeVecReward(BaseWrapper):
             info,
             env_state,
             transition_env_state,
+            transition_observation,
         ) = self.env.step_with_transition(state.env_state, action)
 
         next_state, normalized_reward = self._normalize_step_output(state, next_observation, reward, done, env_state)
         transition_state = next_state.replace(env_state=transition_env_state)
-        return next_observation, normalized_reward, absorbing, done, info, next_state, transition_state
+        return next_observation, normalized_reward, absorbing, done, info, next_state, transition_state, transition_observation
 
     def _normalize_step_output(self, state, next_observation, reward, done, env_state):
         """Update running reward stats once and reuse them for carry/transition states."""
@@ -857,8 +866,8 @@ class NormalizeVecReward(BaseWrapper):
         new_mean = state.mean + delta * batch_count / tot_count
         m_a = state.var * state.count
         m_b = batch_var * batch_count
-        M2 = m_a + m_b + jnp.square(delta) * state.count * batch_count / tot_count
-        new_var = M2 / tot_count
+        m2 = m_a + m_b + jnp.square(delta) * state.count * batch_count / tot_count
+        new_var = m2 / tot_count
         new_count = tot_count
 
         next_state = NormalizeVecRewEnvState(

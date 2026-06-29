@@ -1,18 +1,18 @@
-from typing import NamedTuple
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from flax import struct
 from flax.training import train_state
 
-from musclemimic.environments.base import TrajState
 from musclemimic.core.wrappers.mjx import Metrics
+from musclemimic.environments.base import TrajState
 
 
 class Transition(NamedTuple):
     done: jnp.ndarray
     absorbing: jnp.ndarray
+    traj_end: jnp.ndarray
     action: jnp.ndarray
     value: jnp.ndarray
     reward: jnp.ndarray

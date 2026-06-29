@@ -1599,7 +1599,7 @@ def test_autoreset_wrapper_step_with_transition_keeps_prereset_state():
     rng_keys = jax.random.split(jax.random.PRNGKey(0), batch)
     _, state = env.reset(rng_keys)
 
-    _, _, _, done_out, _, next_state, transition_state = env.step_with_transition(
+    next_obs, _, _, done_out, _, next_state, transition_state, transition_obs = env.step_with_transition(
         state, action=jnp.zeros((batch, 1), dtype=jnp.float32)
     )
 
@@ -1624,6 +1624,13 @@ def test_autoreset_wrapper_step_with_transition_keeps_prereset_state():
         atol=0.0,
         rtol=0.0,
     )
+    np.testing.assert_allclose(
+        np.asarray(transition_obs),
+        np.asarray(jnp.ones((batch, 1), dtype=jnp.float32)),
+        atol=0.0,
+        rtol=0.0,
+    )
+    assert not np.allclose(np.asarray(next_obs[0]), np.asarray(transition_obs[0]))
     np.testing.assert_array_equal(np.asarray(done_out), done_mask)
     np.testing.assert_array_equal(np.asarray(transition_state.done), done_mask)
     np.testing.assert_array_equal(np.asarray(next_state.done), np.zeros((batch,), dtype=bool))
@@ -1637,7 +1644,7 @@ def test_normalize_vec_reward_step_with_transition_preserves_inner_prereset_stat
     rng_keys = jax.random.split(jax.random.PRNGKey(0), batch)
     _, state = env.reset(rng_keys)
 
-    _, reward, _, done_out, _, next_state, transition_state = env.step_with_transition(
+    _, reward, _, done_out, _, next_state, transition_state, _ = env.step_with_transition(
         state, action=jnp.zeros((batch, 1), dtype=jnp.float32)
     )
 
@@ -1852,7 +1859,7 @@ def test_autoreset_wrapper_swaps_rich_carry_fields_and_keeps_unbatched_data():
     batch = 3
     rng_keys = jax.random.split(jax.random.PRNGKey(0), batch)
     _, state = env.reset(rng_keys)
-    _, _, _, cleared_done, _, next_state, transition_state = env.step_with_transition(
+    _, _, _, cleared_done, _, next_state, transition_state, _ = env.step_with_transition(
         state, action=jnp.zeros((batch, 1), dtype=jnp.float32)
     )
 

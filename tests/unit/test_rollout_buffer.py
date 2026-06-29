@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from musclemimic.rl_core.rollout_buffer import compute_gae, create_minibatches, RolloutBuffer
+from musclemimic.rl_core.rollout_buffer import RolloutBuffer, compute_gae, create_minibatches
 
 
 class SimpleTransition(NamedTuple):
@@ -68,6 +68,53 @@ class TestComputeGAE:
         # Step 1 (done=1, absorbing=0): delta = 1 + 0.99*0.5 - 0.5 = 0.995
         assert jnp.allclose(advantages[1, 0], 0.995, atol=1e-4)
 
+    def test_bootstrap_mask_stops_success_terminal_bootstrap(self):
+        """A successful terminal step can stop bootstrap without being absorbing."""
+        rewards = jnp.array([[1.0], [1.0], [1.0]])
+        values = jnp.array([[0.5], [0.5], [0.5]])
+        dones = jnp.array([[0.0], [1.0], [0.0]])
+        absorbing = jnp.array([[0.0], [0.0], [0.0]])
+        bootstrap_mask = jnp.array([[1.0], [0.0], [1.0]])
+        last_value = jnp.array([999.0])
+
+        advantages, _ = compute_gae(
+            rewards,
+            values,
+            dones,
+            absorbing,
+            last_value,
+            0.99,
+            0.95,
+            bootstrap_mask=bootstrap_mask,
+        )
+
+        # Step 1 is done but not absorbing; bootstrap_mask makes it terminal-success.
+        assert jnp.allclose(advantages[1, 0], 0.5, atol=1e-4)
+
+    def test_shifted_values_bootstrap_from_next_rollout_value(self):
+        """Bootstrap uses shifted rollout values and only last step uses last_value."""
+        rewards = jnp.array([[1.0], [1.0], [1.0]])
+        values = jnp.array([[0.5], [2.0], [4.0]])
+        dones = jnp.zeros((3, 1))
+        absorbing = jnp.zeros((3, 1))
+        last_value = jnp.array([8.0])
+
+        advantages, _ = compute_gae(
+            rewards,
+            values,
+            dones,
+            absorbing,
+            last_value,
+            0.99,
+            0.95,
+        )
+
+        # Step 1 delta uses values[2], while the final step uses last_value.
+        expected_step1_delta = 1.0 + 0.99 * 4.0 - 2.0
+        expected_step2_adv = 1.0 + 0.99 * 8.0 - 4.0
+        assert jnp.allclose(advantages[1, 0], expected_step1_delta + 0.99 * 0.95 * expected_step2_adv, atol=1e-4)
+        assert jnp.allclose(advantages[2, 0], expected_step2_adv, atol=1e-4)
+
     def test_jit_compatible(self):
         """Test that compute_gae works under JIT."""
 
@@ -120,7 +167,7 @@ class TestComputeGAE:
         absorbing = jnp.ones((4, 2))
         last_value = jnp.ones(2) * 999.0  # should be ignored
 
-        adv, ret = compute_gae(rewards, values, dones, absorbing, last_value, 0.99, 0.95)
+        _adv, ret = compute_gae(rewards, values, dones, absorbing, last_value, 0.99, 0.95)
 
         # returns should reduce to reward only
         assert jnp.allclose(ret, rewards, atol=1e-6)
@@ -301,7 +348,7 @@ class TestRolloutBuffer:
         advantages = jnp.zeros((num_steps, num_envs))
         targets = jnp.zeros((num_steps, num_envs))
 
-        batched_traj, batched_adv, batched_tgt = buffer.get_minibatches(
+        batched_traj, batched_adv, _batched_tgt = buffer.get_minibatches(
             advantages, targets, num_minibatches=8, rng=jax.random.PRNGKey(0)
         )
 
