@@ -18,7 +18,8 @@ LINT_PATHS := \
 	musclemimic/environments/humanoids/bimanual.py \
 	musclemimic/utils/metrics.py \
 	tests/unit/test_metrics.py \
-	loco_mujoco/smpl/retargeting.py
+	loco_mujoco/smpl/retargeting.py \
+	musclemimic/core/initial_state_handler.py
 
 help:  ## Show this help message
 	@echo "MuscleMimic - Development Commands"

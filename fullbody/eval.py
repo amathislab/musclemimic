@@ -98,6 +98,14 @@ from jax import config as jax_config
 jax_config.update("jax_default_matmul_precision", "high")
 
 
+def apply_eval_init_state_overrides(env_params: dict, config) -> None:
+    validation_cfg = config.experiment.get("validation", {})
+    val_init_state_type = validation_cfg.get("init_state_type", None)
+    if val_init_state_type is not None:
+        env_params["init_state_type"] = val_init_state_type
+        env_params["init_state_params"] = dict(validation_cfg.get("init_state_params", {}))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate, visualize, or record a fullbody PPO policy.")
     add_common_eval_args(parser, default_n_envs=10)
@@ -294,6 +302,7 @@ def main() -> int:
         print(f"Motion group override: {args.motion_group}")
 
     play_env_params = OmegaConf.to_container(config.experiment.env_params, resolve=True)
+    apply_eval_init_state_overrides(play_env_params, config)
     # Terminal state configuration priority: CLI > validation config > training config.
     apply_eval_terminal_defaults(play_env_params, config, args.strict_termination)
     try:

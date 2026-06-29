@@ -17,10 +17,11 @@ experiment:
     params:
       amass_dataset_conf:
         dataset_group: "KIT_KINESIS_TRAINING_MOTIONS"
+        trajectory_cache_type: "sparse"
   env_params:
     env_name: MjxMyoFullBody
     headless: True
-    horizon: 1000
+    horizon: 30000
     disable_fingers: true
     mjx_backend: warp
     num_envs: 8192
@@ -117,7 +118,7 @@ experiment:
   weight_decay: 0
   normalize_env: true
   debug:
-    enabled: false              
+    enabled: false
     profile_traj_batch: false   # Profile trajectory batch info
     profile_val_batch: false    # Profile validation batch info
     track_nacon: false          # Track max number of contacts per step
@@ -225,6 +226,7 @@ experiment:
     # Motions for validation
     amass_dataset_conf:
       dataset_group: "KIT_KINESIS_TESTING_MOTIONS"
+      trajectory_cache_type: "sparse"
     terminal_state_type: MeanRelativeSiteDeviationTerminalStateHandler
     terminal_state_params:
       mean_site_deviation_threshold: 0.5

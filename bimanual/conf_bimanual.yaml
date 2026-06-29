@@ -18,7 +18,7 @@ experiment:
   env_params:
     env_name: MjxMyoBimanualArm
     headless: True
-    horizon: 1000
+    horizon: 30000
     mjx_backend: warp
     num_envs: 8192
 
