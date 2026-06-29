@@ -17,10 +17,10 @@
 
 ## Key Features
 
-- **High-Performance Training**: JAX JIT compilation with MuJoCo Warp backend acceleration  
-- **Biomechanical Models**: MyoBimanualArm and MyoFullBody 
-- **Research-Ready**: DeepMimic-style rewards with comprehensive validation metrics 
-- **AMASS Integration**: Automated retargeting of SMPL format motion dataset. 
+- **High-Performance Training**: JAX JIT compilation with MuJoCo Warp backend acceleration
+- **Biomechanical Models**: MyoBimanualArm and MyoFullBody
+- **Research-Ready**: DeepMimic-style rewards with comprehensive validation metrics
+- **AMASS Integration**: Automated retargeting of SMPL format motion dataset.
 - **GMR-FIT Retargeting**: Improved of SOTA inverse kinematics for high quality imitation data.
 
 <div align="center">
@@ -34,7 +34,7 @@
 | MyoBimanualArm  | Fixed-base  | 76 (36*)    | 126 (64*)     | 54 (14*) | Upper-body manipulation      |
 | MyoFullBody     | Free-root   | 123 (83*)    | 416 (354*)    | 72 (32*) | Locomotion and manipulation    |
 
-##### $^*$ denotes configurations with finger muscles temporarily disabled. 
+##### $^*$ denotes configurations with finger muscles temporarily disabled.
 
 - **Muscle Actuation**: Hill-type muscle models with physiological activation dynamics
 - **Site Tracking**: Biomechanically relevant anatomical landmarks for reward computation
@@ -54,7 +54,7 @@ Depending on how you plan to use `musclemimic`, the requirements differ:
 # 1. Install UV (faster package manager)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2. Install dependencies
+# 2. Clone MuscleMimic and install dependencies
 git clone https://github.com/amathislab/musclemimic
 cd musclemimic
 uv sync
@@ -64,9 +64,7 @@ For CUDA (Linux x86_64), install the CUDA-enabled JAX extra:
 uv sync --extra cuda
 ```
 
-### Test with Demo Cache
-> [!TIP]
-> Recommended for first-time users. Start here for the fastest path to a working setup.
+### Test with Demo Cache (Recommended for first-time users!)
 
 No AMASS download needed! We provide pre-retargeted demo motions for both **MyoArmBimanual** and **MyoFullBody** via a gated Hugging Face dataset.
 
@@ -145,7 +143,7 @@ uv run mjpython fullbody/eval.py \
 ```
 
 ## Retargeting with GMR-Fit
-Musclemimic offers accurate retargeting to MyoFullBody and MyoBimanualArm based on [General Motion Retargeting (GMR)](https://github.com/YanjieZe/GMR), but incorporates SMPL fitting instead of manually defined joint configurations on AMASS dataset. We offer you the retargeted dataset using GMR-Fit, as well as the pretrained checkpoint upon these motions on huggingface. 
+Musclemimic offers accurate retargeting to MyoFullBody and MyoBimanualArm based on [General Motion Retargeting (GMR) Fit](https://github.com/amathislab/gmr_plus) which incorporates SMPL fitting instead of manually defined joint configurations on AMASS dataset. We offer you the retargeted dataset using GMR-Fit, as well as the pretrained checkpoint upon these motions on huggingface.
 
 ### Hugging Face Resources
 
@@ -214,7 +212,7 @@ uv sync --extra smpl --extra gmr
   Go to the [MANO website](https://mano.is.tue.mpg.de/download.php). Register and download the following:
    - **Extended SMPL+H model** (includes the SMPL-H model w/o hands).
    - **Models & Code** (includes the hand models).
-  
+
   Extract the folders and place them in a directory (e.g., `/path/to/smpl`), such that the folder has the following structure:
   ```
   /path/to/smpl/
@@ -242,7 +240,7 @@ cd loco_mujoco/smpl
 bash install_smplh.sh
 ```
 
-#### 5. Run the retargeting pipeline with your preferred dataset. We report the accuracy of retargeting with GMR on several dataset in our [preprint](https://arxiv.org/abs/2603.25544). 
+#### 5. Run the retargeting pipeline with your preferred dataset. We report the accuracy of retargeting with GMR on several dataset in our [preprint](https://arxiv.org/abs/2603.25544).
 
 ```bash
 uv run scripts/retarget_dataset.py --model MyoFullBody --retargeting-method gmr --dataset KIT_KINESIS_TRAINING_MOTIONS --workers 8
@@ -331,9 +329,9 @@ If you use this code in your research, please cite:
 This project is licensed under the [Apache License](LICENSE).
 See the [LICENSE](LICENSE) file for details.
 
-Note that model checkpoints and data are licensed separately as indicated on the HuggingFace download pages. 
+Note that model checkpoints and data are licensed separately as indicated on the HuggingFace download pages.
 
-This project will also require downloading additional third-party open-source software projects, please review each license terms accordingly before use. 
+This project will also require downloading additional third-party open-source software projects, please review each license terms accordingly before use.
 
 ## Acknowledgments
 

@@ -58,7 +58,11 @@ files: |
     musclemimic/utils/metrics\.py|
     tests/unit/test_metrics\.py|
     loco_mujoco/smpl/retargeting\.py|
-    musclemimic/runner/engine\.py
+    musclemimic/runner/engine\.py|
+    musclemimic/core/initial_state_handler\.py|
+    musclemimic/web_viewer/.*\.py|
+    tests/unit/test_c3d_to_smpl\.py|
+    tests/unit/test_c3d_pipeline\.py
   )$
 
 # Always exclude these directories

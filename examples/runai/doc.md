@@ -4,7 +4,7 @@ An example of submitting with Run:AI
 ```bash
 runai submit \
   --name mm-$(date +%m%d-%H%M%S) \
-  --image registry.rcp.epfl.ch/musclemimic/uv-musclemimic:latest \
+  --image <your-musclemimic-image> \
   --run-as-uid <your_epfl_uid> \
   --run-as-gid <your_epfl_gid> \
   --gpu 1 --node-pools h100 \
@@ -13,8 +13,7 @@ runai submit \
   --environment UV_CACHE_DIR=/users/<your_username>/.cache/uv \
   --environment UV_PYTHON_INSTALL_DIR=/users/<your_username>/.uv-pythons \
   --environment HOME=/users/<your_username> \
-  --environment WANDB_API_KEY=<your_wandb_key> \
-  --environment WANDB_ENTITY=<your_wandb_entity> \
+  --environment WANDB_MODE=disabled \
   --backoff-limit 0 \
-  --command -- /bin/bash -c "cd /users/<your_username>/musclemimic_dev; uv sync --extra smpl --extra gmr --extra cuda; uv run fullbody/experiment.py --config-name=<some_config>"
+  --command -- /bin/bash -c "cd /users/<your_username>/musclemimic; uv sync --extra smpl --extra gmr --extra cuda; uv run fullbody/experiment.py --config-name=<some_config>"
 ```
