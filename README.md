@@ -58,14 +58,9 @@ supported on Linux and macOS.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/amathislab/musclemimic
 cd musclemimic
-uv sync
-```
-
-For CUDA on Linux x86_64:
-
-```bash
 uv sync --extra cuda
 ```
+
 
 ### Run a Demo
 
