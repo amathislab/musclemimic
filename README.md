@@ -73,15 +73,6 @@ uv run hf auth login
 uv run python -c "from musclemimic.utils.demo_cache import setup_demo_for_bimanual; setup_demo_for_bimanual()"
 uv run python -c "from musclemimic.utils.demo_cache import setup_demo_for_myo_fullbody; setup_demo_for_myo_fullbody()"
 ```
-
-Start a short demo training run. These configs log to Weights & Biases with
-`wandb.mode=online` by default:
-
-```bash
-uv run bimanual/experiment.py --config-name=conf_bimanual_demo
-uv run fullbody/experiment.py --config-name=conf_fullbody_demo
-```
-
 Evaluate a released MyoFullBody checkpoint with the MuJoCo viewer:
 
 ```bash
@@ -93,6 +84,14 @@ uv run mjpython fullbody/eval.py \
   --eval_seed 0 \
   --n_steps 1000 \
   --mujoco_viewer
+```
+
+Start a short demo training run. These configs log to Weights & Biases with
+`wandb.mode=online` by default:
+
+```bash
+uv run bimanual/experiment.py --config-name=conf_bimanual_demo
+uv run fullbody/experiment.py --config-name=conf_fullbody_demo
 ```
 
 On Linux, a regular `python` entrypoint is sufficient for viewer-based MuJoCo
