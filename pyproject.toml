@@ -3,7 +3,7 @@ requires = ["setuptools", "wheel"]
 
 [project]
 name = "musclemimic"
-version = "0.1.0"
+version = "0.1.1"
 description = "Towards Embodied AI with MuscleMimic: Unlocking full-body musculoskeletal motor learning at scale"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -111,6 +111,7 @@ musclemimic-set-lafan1-path = "musclemimic.utils:set_lafan1_path"
 musclemimic-set-conv-lafan1-path = "musclemimic.utils:set_converted_lafan1_path"
 musclemimic-set-all-caches = "musclemimic.utils:set_all_caches"
 musclemimic-download-gmr-caches = "musclemimic.utils.gmr_cache:download_gmr_dataset_group_cli"
+musclemimic-retarget-visualize = "musclemimic.retargeting.visualize:main"
 
 [project.urls]
 Homepage = "https://github.com/amathislab/musclemimic"
@@ -138,6 +139,9 @@ torch = { index = "pytorch-cpu" }
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["musclemimic*", "loco_mujoco*", "bimanual*", "fullbody*"]
+
+[tool.setuptools.package-data]
+"loco_mujoco.smpl" = ["robot_confs/*.yaml"]
 
 [tool.ruff]
 line-length = 120
