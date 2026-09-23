@@ -3,6 +3,19 @@ import subprocess
 import datetime
 from pathlib import Path
 
+def _resolve_ffmpeg_binary():
+    """Return the imageio-ffmpeg bundled binary, falling back to PATH.
+
+    imageio-ffmpeg is a required dependency and its wheels bundle a static ffmpeg
+    built with libx264. Set IMAGEIO_FFMPEG_EXE to override the binary; sdist
+    installs (musl, uncommon architectures) ship no binary and fall back to PATH.
+    """
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
 
 class VideoRecorder(object):
     """
@@ -138,7 +151,7 @@ class VideoRecorder(object):
                 tmp_file = str(self._path / "tmp_") + self._video_name + ".mp4"
                 subprocess.run(
                     [
-                        "ffmpeg",
+                        _resolve_ffmpeg_binary(),
                         "-i", self._video_writer_path,  # Input video
                         "-c:v", "libx264",  # H.264 codec
                         "-profile:v", "baseline",  # Set to Baseline profile (can change to main if needed)

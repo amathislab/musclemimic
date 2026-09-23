@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from flax import struct
 
-from loco_mujoco.trajectory.handler import TrajState, TrajectoryHandler
+from loco_mujoco.trajectory.handler import TrajectoryHandler, TrajState
 
 
 @struct.dataclass
@@ -15,6 +15,24 @@ def _make_handler(lengths):
     handler = object.__new__(TrajectoryHandler)
     handler.len_trajectory = lambda traj_no: lengths[int(np.asarray(traj_no))]
     return handler
+
+
+def test_motion_names_are_indexed_with_trajectories():
+    handler = object.__new__(TrajectoryHandler)
+    handler.traj = type("FakeTrajectory", (), {"data": type("FakeData", (), {"split_points": [0, 2, 5]})()})()
+
+    handler.motion_names = handler._normalize_motion_names(["motion-a", "motion-b"])
+
+    assert handler.motion_names == ("motion-a", "motion-b")
+    assert handler.get_motion_name(1) == "motion-b"
+
+
+def test_motion_names_must_match_trajectory_count():
+    handler = object.__new__(TrajectoryHandler)
+    handler.traj = type("FakeTrajectory", (), {"data": type("FakeData", (), {"split_points": [0, 2, 5]})()})()
+
+    with pytest.raises(ValueError, match="Expected 2 motion names"):
+        handler._normalize_motion_names(["motion-a"])
 
 
 @pytest.mark.parametrize("backend", [np, jnp])

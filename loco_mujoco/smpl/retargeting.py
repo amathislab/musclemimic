@@ -97,6 +97,7 @@ from loco_mujoco.datasets.data_generation.utils import add_mocap_bodies
 from loco_mujoco.smpl import SMPLH_BONE_ORDER_NAMES
 from loco_mujoco.smpl.utils.smoothing import gaussian_filter_1d_batch
 from loco_mujoco.trajectory import (
+    LoadedTrajectorySet,
     Trajectory,
     TrajectoryCacheType,
     TrajectoryData,
@@ -1646,23 +1647,20 @@ def _load_trajectories_individually(
     retargeting_method: str | None = None,
     gmr_config: dict | None = None,
     clear_cache: bool = False,
-) -> Trajectory:
-    """
-    Process each dataset individually and concatenate only final trajectories.
-    This avoids dimensional incompatibilities during intermediate concatenation.
-    """
+) -> LoadedTrajectorySet:
+    """Load motions independently and keep source names aligned."""
     path_to_converted_amass_datasets = get_converted_amass_dataset_path()
-    # Normalize environment name for cache consistency (MJX and non-MJX share same cache)
+    # MJX and MuJoCo share retargeted motion caches.
     cache_env_name = env_name.replace("Mjx", "") if "Mjx" in env_name else env_name
 
-    # Use separate cache directories for different retargeting methods
+    # Retargeting methods use separate cache namespaces.
     if retargeting_method == "gmr":
         path_robot_smpl_data = os.path.join(path_to_converted_amass_datasets, cache_env_name, "gmr")
     else:
         path_robot_smpl_data = os.path.join(path_to_converted_amass_datasets, cache_env_name)
     os.makedirs(path_robot_smpl_data, exist_ok=True)
 
-    final_trajectories = []
+    loaded_sets = []
 
     for i, single_dataset in enumerate(dataset_list):
         cache_path = os.path.join(path_robot_smpl_data, f"{single_dataset}.npz")
@@ -1682,8 +1680,9 @@ def _load_trajectories_individually(
             logger.info(
                 f"Dataset {i + 1}/{len(dataset_list)}: Found existing retargeted motion file at {cache_path}. Loading ..."
             )
-            # Use NumPy to avoid GPU OOM; to_jax() called later in instantiate_env()
-            final_trajectories.append(Trajectory.load(cache_path, backend=np))
+            # Keep cached arrays on the host while combining motions.
+            trajectory = Trajectory.load(cache_path, backend=np)
+            loaded_sets.append(LoadedTrajectorySet(trajectory, (single_dataset,)))
             continue
 
         method_name = retargeting_method.upper() if retargeting_method else "SMPL"
@@ -1691,7 +1690,7 @@ def _load_trajectories_individually(
         logger.info(f"Dataset {i + 1}/{len(dataset_list)}: {action} AMASS motion file using {method_name} ...")
 
         try:
-            single_trajectory = load_retargeted_amass_trajectory(
+            loaded = load_retargeted_amass_trajectory_set(
                 env_name,
                 single_dataset,
                 robot_conf,
@@ -1699,45 +1698,50 @@ def _load_trajectories_individually(
                 gmr_config=gmr_config,
                 clear_cache=clear_cache,
             )
-            final_trajectories.append(single_trajectory)
+            loaded_sets.append(loaded)
         except Exception as e:
             logger.error(f"Skipping dataset '{single_dataset}' due to failure during retargeting: {e}")
             continue
 
-    # Concatenate final trajectories
-    if len(final_trajectories) == 1:
-        result_trajectory = final_trajectories[0]
-    else:
-        logger.info(f"Concatenating {len(final_trajectories)} final {env_name} trajectories ...")
-        result_trajectory = Trajectory.concatenate(final_trajectories, backend=np)
-        logger.info("Final concatenation successful!")
+    if not loaded_sets:
+        raise RuntimeError(f"Retargeting produced no valid {env_name} trajectories.")
+    if len(loaded_sets) == 1:
+        return loaded_sets[0]
 
-    return result_trajectory
+    logger.info(f"Concatenating {len(loaded_sets)} final {env_name} trajectories ...")
+    loaded = LoadedTrajectorySet.concatenate(loaded_sets, backend=np)
+    logger.info("Final concatenation successful!")
+    return loaded
 
 
 def load_retargeted_amass_trajectory(
     env_name: str,
-    dataset_name: str | list[str],
+    dataset_name: str | list[str] | tuple[str, ...],
     robot_conf: DictConfig = None,
     retargeting_method: str | None = None,
     gmr_config: dict | None = None,
     clear_cache: bool = False,
 ) -> Trajectory:
-    """
-    Load a retargeted AMASS trajectory for a specific environment.
+    """Load retargeted AMASS trajectory data."""
+    return load_retargeted_amass_trajectory_set(
+        env_name=env_name,
+        dataset_name=dataset_name,
+        robot_conf=robot_conf,
+        retargeting_method=retargeting_method,
+        gmr_config=gmr_config,
+        clear_cache=clear_cache,
+    ).trajectory
 
-    Args:
-        env_name: Name of the environment.
-        dataset_name: Dataset name(s) to process.
-        robot_conf: Robot configuration (optional).
-        retargeting_method: "smpl" or "gmr" (optional, overrides robot_conf).
-        gmr_config: GMR configuration dict (optional, overrides robot_conf).
-        clear_cache: If True, overwrite existing cached files instead of loading them.
 
-    Returns:
-        Trajectory: The retargeted trajectories.
-
-    """
+def load_retargeted_amass_trajectory_set(
+    env_name: str,
+    dataset_name: str | list[str] | tuple[str, ...],
+    robot_conf: DictConfig = None,
+    retargeting_method: str | None = None,
+    gmr_config: dict | None = None,
+    clear_cache: bool = False,
+) -> LoadedTrajectorySet:
+    """Load retargeted AMASS trajectories with their source names."""
     logger = setup_logger("amass", identifier="[MuscleMimic AMASS Retargeting Pipeline]")
 
     # if robot_conf is not provided, load default one it from the YAML file
@@ -1780,7 +1784,7 @@ def load_retargeted_amass_trajectory(
     if isinstance(dataset_name, str):
         dataset_name = [dataset_name]
 
-    all_trajectories = []
+    loaded_sets = []
     for i, d_name in enumerate(dataset_name):
         d_path = os.path.join(path_robot_smpl_data, f"{d_name}.npz")
         if retargeting_method == "gmr":
@@ -1885,26 +1889,23 @@ def load_retargeted_amass_trajectory(
             analysis_path = d_path.replace(".npz", "_analysis.npz")
             np.savez(analysis_path, **analysis)
             logger.info(f"Saved analysis to {analysis_path}")
-            all_trajectories.append(trajectory)
+            loaded_sets.append(LoadedTrajectorySet(trajectory, (d_name,)))
         else:
             logger.info(
                 f"Dataset {i + 1}/{len(dataset_name)}: Found existing retargeted motion file at {d_path}. Loading ..."
             )
-            trajectory = Trajectory.load(d_path)
-            all_trajectories.append(trajectory)
+            trajectory = Trajectory.load(d_path, backend=np)
+            loaded_sets.append(LoadedTrajectorySet(trajectory, (d_name,)))
 
-    if len(all_trajectories) == 1:
-        trajectory = all_trajectories[0]
+    if len(loaded_sets) == 1:
+        loaded = loaded_sets[0]
     else:
         logger.info("Concatenating trajectories ...")
-        traj_datas = [t.data for t in all_trajectories]
-        traj_infos = [t.info for t in all_trajectories]
-        traj_data, traj_info = TrajectoryData.concatenate(traj_datas, traj_infos, backend=np)
-        trajectory = Trajectory(traj_info, traj_data)
+        loaded = LoadedTrajectorySet.concatenate(loaded_sets, backend=np)
 
     logger.info("Trajectory data loaded!")
 
-    return trajectory
+    return loaded
 
 
 def retarget_traj_from_robot_to_robot(
@@ -2171,31 +2172,33 @@ def retarget_trajectory_for_bimanual(traj: Trajectory) -> Trajectory:
 
 
 def retarget_smpl_to_bimanual_via_intermediate(
-    dataset_name: str | list[str],
+    dataset_name: str | list[str] | tuple[str, ...],
     robot_conf_skeleton: DictConfig = None,
     robot_conf_bimanual: DictConfig = None,
     retargeting_method: str | None = None,
     gmr_config: dict | None = None,
     clear_cache: bool = False,
 ) -> Trajectory:
-    """
-    Perform explicit three-stage retargeting: SMPL → MyoFullBody → MyoBimanualArm → SiteData.
+    """Retarget AMASS trajectory data for MyoBimanualArm."""
+    return retarget_smpl_to_bimanual_via_intermediate_set(
+        dataset_name=dataset_name,
+        robot_conf_skeleton=robot_conf_skeleton,
+        robot_conf_bimanual=robot_conf_bimanual,
+        retargeting_method=retargeting_method,
+        gmr_config=gmr_config,
+        clear_cache=clear_cache,
+    ).trajectory
 
-    This function processes each motion individually through the complete pipeline,
-    then concatenates the final MyoBimanualArm trajectories. This avoids dimensional
-    incompatibilities that occur when trying to concatenate intermediate trajectories.
 
-    Args:
-        dataset_name: Name(s) of AMASS dataset(s) to retarget
-        robot_conf_skeleton: Configuration for the intermediate full-body skeleton retargeting stage
-        robot_conf_bimanual: Configuration for MyoBimanualArm (if None, loads default)
-        retargeting_method: "smpl" or "gmr" (if None, defaults to SMPL optimization-based)
-        gmr_config: GMR configuration dict (optional, only used if retargeting_method="gmr")
-        clear_cache: If True, overwrite existing cached files instead of loading them.
-
-    Returns:
-        Trajectory: Retargeted trajectory for MyoBimanualArm
-    """
+def retarget_smpl_to_bimanual_via_intermediate_set(
+    dataset_name: str | list[str] | tuple[str, ...],
+    robot_conf_skeleton: DictConfig = None,
+    robot_conf_bimanual: DictConfig = None,
+    retargeting_method: str | None = None,
+    gmr_config: dict | None = None,
+    clear_cache: bool = False,
+) -> LoadedTrajectorySet:
+    """Retarget AMASS motions for MyoBimanualArm with their source names."""
     logger = setup_logger("bimanual_retargeting", identifier="[Three-Stage Retargeting Pipeline]")
 
     # Check for headless environment and setup EGL if needed
@@ -2221,16 +2224,14 @@ def retarget_smpl_to_bimanual_via_intermediate(
     path_robot_smpl_data_bimanual = os.path.join(path_to_converted_amass_datasets, BIMANUAL_ENV_NAME)
     os.makedirs(path_robot_smpl_data_bimanual, exist_ok=True)
 
-    # Process each motion individually through the complete three-stage pipeline,
-    # caching a single file per dataset (consistent with other models)
-    final_trajectories = []
+    # One cache per motion keeps names aligned with trajectory indices.
+    loaded_sets = []
     skipped = 0
     if retargeting_method == "gmr":
         path_robot_smpl_data_bimanual = os.path.join(path_to_converted_amass_datasets, BIMANUAL_ENV_NAME, "gmr")
     else:
         path_robot_smpl_data_bimanual = os.path.join(path_to_converted_amass_datasets, BIMANUAL_ENV_NAME)
 
-    # Now use it inside the loop
     for i, single_dataset in enumerate(tqdm(dataset_list, desc="Bimanual retargeting", unit="traj")):
         cache_path = os.path.join(path_robot_smpl_data_bimanual, f"{single_dataset}.npz")
         if retargeting_method == "gmr":
@@ -2250,7 +2251,8 @@ def retarget_smpl_to_bimanual_via_intermediate(
             logger.info(
                 f"Dataset {i + 1}/{len(dataset_list)}: Found existing cached MyoBimanualArm trajectory at {cache_path}. Loading ..."
             )
-            final_trajectories.append(Trajectory.load(cache_path))
+            trajectory = Trajectory.load(cache_path, backend=np)
+            loaded_sets.append(LoadedTrajectorySet(trajectory, (single_dataset,)))
             continue
 
         action = "Re-retargeting (clear_cache)" if clear_cache and cache_exists else "Retargeting"
@@ -2270,26 +2272,22 @@ def retarget_smpl_to_bimanual_via_intermediate(
             logger.info("Stage 2: Extending and retargeting to MyoBimanualArm via environment forward kinematics")
             bimanual_traj = extend_motion(BIMANUAL_ENV_NAME, robot_conf_bimanual.env_params, skeleton_traj, logger)
 
-            # Save per-dataset cache and collect
             bimanual_traj.save(cache_path)
             logger.info(f"Saved MyoBimanualArm trajectory cache to {cache_path}")
-            final_trajectories.append(bimanual_traj)
+            loaded_sets.append(LoadedTrajectorySet(bimanual_traj, (single_dataset,)))
         except Exception as e:
             skipped += 1
             logger.error(f"Skipping dataset '{single_dataset}' due to failure in three-stage retargeting: {e}")
             continue
 
-    # Concatenate final trajectories in-memory for multi-dataset requests
-    if len(final_trajectories) == 1:
-        result_trajectory = final_trajectories[0]
+    if len(loaded_sets) == 1:
+        loaded = loaded_sets[0]
     else:
-        if len(final_trajectories) == 0:
+        if not loaded_sets:
             raise RuntimeError(f"Three-stage retargeting produced no valid trajectories. Skipped {skipped} dataset(s).")
-        logger.info(
-            f"Concatenating {len(final_trajectories)} final MyoBimanualArm trajectories (skipped {skipped}) ..."
-        )
-        result_trajectory = Trajectory.concatenate(final_trajectories, backend=np)
+        logger.info(f"Concatenating {len(loaded_sets)} final MyoBimanualArm trajectories (skipped {skipped}) ...")
+        loaded = LoadedTrajectorySet.concatenate(loaded_sets, backend=np)
         logger.info("Final concatenation successful!")
 
     logger.info("Three-stage retargeting completed successfully")
-    return result_trajectory
+    return loaded

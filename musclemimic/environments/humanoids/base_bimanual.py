@@ -1,4 +1,5 @@
 import warnings
+from collections.abc import Sequence
 from copy import deepcopy
 
 import mujoco
@@ -270,6 +271,7 @@ class BaseBimanualSkeleton(FixedRootEnv):
         warn: bool = True,
         cache_type="full",
         site_names=None,
+        motion_names: Sequence[str | None] | None = None,
     ) -> None:
         """
         Loads trajectories. If there were trajectories loaded already, this function overrides the latter.
@@ -281,6 +283,7 @@ class BaseBimanualSkeleton(FixedRootEnv):
                 with a 'traj_data' array and possibly a 'split_points' array inside. The 'traj_data'
                 should be in the shape (joints x observations). If traj_files is specified, this should be None.
             warn (bool): If True, a warning will be raised.
+            motion_names: Source name for each trajectory, in trajectory index order.
         """
 
         if self.th is not None and warn:
@@ -295,6 +298,7 @@ class BaseBimanualSkeleton(FixedRootEnv):
             control_dt=self.dt,
             cache_type=cache_type,
             site_names=site_names,
+            motion_names=motion_names,
             **th_params,
         )
 
@@ -331,7 +335,14 @@ class BaseBimanualSkeleton(FixedRootEnv):
             traj = extend_motion(self.__class__.__name__, {}, traj)
 
             # update trajectory handler
-            self.th = TrajectoryHandler(model=self._model, warn=warn, traj=traj, control_dt=self.dt, **th_params)
+            self.th = TrajectoryHandler(
+                model=self._model,
+                warn=warn,
+                traj=traj,
+                control_dt=self.dt,
+                motion_names=self.th.motion_names,
+                **th_params,
+            )
 
         # setup trajectory information in observation_dict, goal and reward if needed
         for obs_entry in self.obs_container.entries():

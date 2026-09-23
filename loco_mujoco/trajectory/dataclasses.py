@@ -66,7 +66,6 @@ def _traj_infos_compatible_for_concat(lhs, rhs, backend: ModuleType = jnp) -> bo
         and lhs.frequency == rhs.frequency
         and lhs.body_names == rhs.body_names
         and lhs.site_names == rhs.site_names
-        and lhs.metadata == rhs.metadata
         and lhs_model.njnt == rhs_model.njnt
         and _arrays_match_for_concat(lhs_model.jnt_type, rhs_model.jnt_type)
         and lhs_model.nbody == rhs_model.nbody
@@ -103,7 +102,12 @@ class Trajectory:
     obs_container: ObservationContainer = None
 
     @staticmethod
-    def concatenate(trajs: list, backend: ModuleType = jnp):
+    def concatenate(trajs: list[Trajectory], backend: ModuleType = jnp) -> Trajectory:
+        """Concatenate trajectories with the same structure.
+
+        Metadata is provenance, so it is ignored for compatibility and cleared
+        when multiple trajectories are combined.
+        """
         traj_data = [traj.data for traj in trajs]
         traj_info = [traj.info for traj in trajs]
         traj_data, traj_info = TrajectoryData.concatenate(traj_data, traj_info, backend)
@@ -195,6 +199,37 @@ class Trajectory:
         return cls(**_all)
 
 
+@dataclass(frozen=True)
+class LoadedTrajectorySet:
+    """A trajectory batch paired with one source name per trajectory."""
+
+    trajectory: Trajectory
+    motion_names: tuple[str | None, ...]
+
+    def __post_init__(self):
+        motion_names = tuple(None if name is None else str(name) for name in self.motion_names)
+        n_trajectories = int(self.trajectory.data.n_trajectories)
+        if len(motion_names) != n_trajectories:
+            raise ValueError(f"Expected {n_trajectories} motion names, got {len(motion_names)}.")
+        object.__setattr__(self, "motion_names", motion_names)
+
+    @classmethod
+    def concatenate(
+        cls,
+        loaded_sets: list[LoadedTrajectorySet],
+        backend: ModuleType = jnp,
+    ) -> LoadedTrajectorySet:
+        if not loaded_sets:
+            raise ValueError("At least one loaded trajectory set is required.")
+
+        trajectory = Trajectory.concatenate(
+            [loaded.trajectory for loaded in loaded_sets],
+            backend=backend,
+        )
+        motion_names = tuple(name for loaded in loaded_sets for name in loaded.motion_names)
+        return cls(trajectory, motion_names)
+
+
 @dataclass
 class TrajectoryInfo:
     """
@@ -205,6 +240,7 @@ class TrajectoryInfo:
     frequency: float
     body_names: list[str] = None
     site_names: list[str] = None
+    # Cache provenance; not part of the trajectory structure.
     metadata: dict = None
 
     def __post_init__(self):
@@ -1066,27 +1102,14 @@ class TrajectoryData(SingleData):
 
     @staticmethod
     def concatenate(traj_datas: list, traj_infos: list, backend: ModuleType = jnp):
-        """
-        Concatenate a list of TrajectoryData instances given that the TrajectoryInfos are equivalent.
-
-        Args:
-            traj_datas (list): List of TrajectoryData instances to concatenate.
-            traj_infos (list): List of TrajectoryInfo instances to concatenate.
-            backend: Backend to use for the computation.
-
-        Returns:
-            New instance of TrajectoryData and TrajectoryInfo containing the concatenated data.
-        """
+        """Concatenate data with the same trajectory structure."""
         assert len(traj_datas) == len(traj_infos), "TrajectoryData and TrajectoryInfo must have the same length!"
 
-        # Keep concatenation strict on semantic structure, but tolerate small
-        # cache-induced drift in static float-valued model fields.
         assert all(
             _traj_infos_compatible_for_concat(info, traj_infos[0], backend=backend)
             for info in traj_infos
         ), "TrajectoryInfos must be compatible for concatenation!"
 
-        # create new TrajectoryData
         new_split_points = []
         curr_n_samples = 0
         for i, data in enumerate(traj_datas):
@@ -1127,7 +1150,10 @@ class TrajectoryData(SingleData):
             site_xmat=concatenate_optional("site_xmat"),
             split_points=new_split_points
         )
-        return new_traj_data, traj_infos[0]
+        combined_info = traj_infos[0]
+        if len(traj_infos) > 1:
+            combined_info = replace(combined_info, metadata=None)
+        return new_traj_data, combined_info
 
     def len_trajectory(self, traj_ind):
         return self.split_points[traj_ind+1] - self.split_points[traj_ind]

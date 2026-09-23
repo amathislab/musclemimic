@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Sequence
 from dataclasses import replace
 
 import jax
@@ -34,9 +35,22 @@ class TrajectoryHandler(StatefulObject):
     interpolates the trajectory to the desired control frequency.
 
     """
-    def __init__(self, model, traj_path=None, traj: Trajectory = None, control_dt=0.01, random_start=True,
-                 fixed_start_conf=None, start_from_random_step=True, clip_trajectory_to_joint_ranges=False, warn=True,
-                 cache_type: TrajectoryCacheType | str = TrajectoryCacheType.FULL, site_names: list[str] | None = None):
+
+    def __init__(
+        self,
+        model,
+        traj_path=None,
+        traj: Trajectory = None,
+        control_dt=0.01,
+        random_start=True,
+        fixed_start_conf=None,
+        start_from_random_step=True,
+        clip_trajectory_to_joint_ranges=False,
+        warn=True,
+        cache_type: TrajectoryCacheType | str = TrajectoryCacheType.FULL,
+        site_names: list[str] | None = None,
+        motion_names: Sequence[str | None] | None = None,
+    ):
         """
         Constructor.
 
@@ -50,6 +64,7 @@ class TrajectoryHandler(StatefulObject):
             control_dt (float): Model control frequency used to interpolate the trajectory.
             start_from_random_step (bool): If True, start from a random step in the trajectory.
             warn (bool): If True, a warning will be raised, if some trajectory ranges are violated. todo
+            motion_names: Source name for each trajectory, in trajectory index order.
 
         """
 
@@ -78,6 +93,7 @@ class TrajectoryHandler(StatefulObject):
             site_names=site_names,
         )
         self._is_numpy = True if isinstance(self.traj.data.qpos, np.ndarray) else False
+        self.motion_names = self._normalize_motion_names(motion_names)
 
         # Update traj_dt from interpolated trajectory info
         self.traj_dt = 1.0 / self.traj.info.frequency
@@ -91,6 +107,24 @@ class TrajectoryHandler(StatefulObject):
     @property
     def n_trajectories(self):
         return len(self.traj.data.split_points) - 1
+
+    def _normalize_motion_names(
+        self,
+        motion_names: Sequence[str | None] | None,
+    ) -> tuple[str | None, ...] | None:
+        if motion_names is None:
+            return None
+
+        normalized = tuple(None if name is None else str(name) for name in motion_names)
+        if len(normalized) != self.n_trajectories:
+            raise ValueError(f"Expected {self.n_trajectories} motion names, got {len(normalized)}.")
+        return normalized
+
+    def get_motion_name(self, traj_index: int) -> str | None:
+        """Return the source name for a trajectory index."""
+        if self.motion_names is None:
+            return None
+        return self.motion_names[traj_index]
 
     def last_step_idx(self, traj_ind):
         """Return the last valid step index for a trajectory."""
