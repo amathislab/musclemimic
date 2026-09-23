@@ -1,35 +1,37 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING
 
 from .dataclasses import (
+    LoadedTrajectorySet,
     Trajectory,
     TrajectoryCacheType,
+    TrajectoryData,
     TrajectoryInfo,
     TrajectoryModel,
-    TrajectoryData,
     TrajectoryTransitions,
+    compute_trajectory_kinematic_caches,
     interpolate_trajectories,
     recompute_trajectory_velocities,
-    compute_trajectory_kinematic_caches,
 )
 
 __all__ = [
+    "LoadedTrajectorySet",
+    "TrajState",
     "Trajectory",
     "TrajectoryCacheType",
+    "TrajectoryData",
+    "TrajectoryHandler",
     "TrajectoryInfo",
     "TrajectoryModel",
-    "TrajectoryData",
     "TrajectoryTransitions",
-    "interpolate_trajectories",
-    "recompute_trajectory_velocities",
     "compute_trajectory_kinematic_caches",
+    "interpolate_trajectories",
     "materialize_trajectory",
-    "TrajectoryHandler",
-    "TrajState",
+    "recompute_trajectory_velocities",
 ]
 
-_LAZY_ATTRS: Dict[str, str] = {
+_LAZY_ATTRS: dict[str, str] = {
     "TrajectoryHandler": "TrajectoryHandler",
     "TrajState": "TrajState",
     "materialize_trajectory": "materialize_trajectory",

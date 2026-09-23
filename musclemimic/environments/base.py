@@ -1,4 +1,5 @@
 import warnings
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
 from types import ModuleType
@@ -124,6 +125,7 @@ class LocoEnv(Mjx):
         warn: bool = True,
         cache_type="full",
         site_names=None,
+        motion_names: Sequence[str | None] | None = None,
     ) -> None:
         """
         Loads trajectories. If there were trajectories loaded already, this function overrides the latter.
@@ -135,6 +137,7 @@ class LocoEnv(Mjx):
                 with a 'traj_data' array and possibly a 'split_points' array inside. The 'traj_data'
                 should be in the shape (joints x observations). If traj_files is specified, this should be None.
             warn (bool): If True, a warning will be raised.
+            motion_names: Source name for each trajectory, in trajectory index order.
 
         """
 
@@ -150,6 +153,7 @@ class LocoEnv(Mjx):
             control_dt=self.dt,
             cache_type=cache_type,
             site_names=site_names,
+            motion_names=motion_names,
             **th_params,
         )
 

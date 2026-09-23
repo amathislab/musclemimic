@@ -366,7 +366,7 @@ def test_c3d_dataset_conf_loads_from_converted_c3d_cache(
     trajectory_path.write_bytes(b"trajectory")
 
     calls: dict = {}
-    loaded_trajectory = object()
+    loaded_trajectory = types.SimpleNamespace(data=types.SimpleNamespace(n_trajectories=1))
 
     def fake_load(path, backend):
         calls["load_path"] = Path(path)
@@ -374,6 +374,11 @@ def test_c3d_dataset_conf_loads_from_converted_c3d_cache(
         return loaded_trajectory
 
     monkeypatch.setattr(imitation_factory_module.Trajectory, "load", staticmethod(fake_load))
+    monkeypatch.setattr(
+        imitation_factory_module.LoadedTrajectorySet,
+        "concatenate",
+        classmethod(lambda _cls, loaded_sets, backend: loaded_sets[0]),
+    )
 
     traj = ImitationFactory.get_c3d_traj(_FakeEnv(), C3DDatasetConf(rel_dataset_path="Study A/Subject 1/Trial 05"))
 

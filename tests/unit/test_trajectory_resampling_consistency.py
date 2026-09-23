@@ -1,4 +1,5 @@
 from itertools import pairwise
+from types import SimpleNamespace
 
 import mujoco
 import numpy as np
@@ -7,6 +8,7 @@ import pytest
 from loco_mujoco.smpl import retargeting as retargeting_module
 from loco_mujoco.smpl.retargeting import _fps_after_frame_skip
 from loco_mujoco.trajectory import (
+    LoadedTrajectorySet,
     Trajectory,
     TrajectoryCacheType,
     TrajectoryData,
@@ -360,3 +362,168 @@ def test_retarget_extend_motion_returns_source_cache_after_layout_filtering(monk
 
 def test_retargeting_helpers_preserve_fractional_fps():
     assert _fps_after_frame_skip(59.94, 2) == pytest.approx(29.97)
+
+
+def test_concatenation_accepts_distinct_cache_provenance(tmp_path):
+    model = _make_model()
+
+    def make_trajectory(fingerprint, offset):
+        info = _make_info(model, 50.0)
+        info.metadata = {
+            "source": f"motion-{fingerprint}",
+            "fingerprint": fingerprint,
+        }
+        qpos = _make_qpos(model, 2, x_offset=offset)
+        return Trajectory(
+            info=info,
+            data=TrajectoryData(
+                qpos=qpos,
+                qvel=np.zeros((2, model.nv), dtype=np.float32),
+                split_points=np.array([0, 2]),
+            ),
+        )
+
+    cache_a = tmp_path / "motion-a.npz"
+    cache_b = tmp_path / "motion-b.npz"
+    make_trajectory("fingerprint-a", 0.0).save(cache_a)
+    make_trajectory("fingerprint-b", 10.0).save(cache_b)
+
+    loaded = [
+        Trajectory.load(cache_a, backend=np),
+        Trajectory.load(cache_b, backend=np),
+    ]
+    combined = Trajectory.concatenate(loaded, backend=np)
+
+    assert combined.data.n_trajectories == 2
+    np.testing.assert_array_equal(combined.data.split_points, np.array([0, 2, 4]))
+    np.testing.assert_allclose(combined.data.qpos[:2], loaded[0].data.qpos)
+    np.testing.assert_allclose(combined.data.qpos[2:], loaded[1].data.qpos)
+    assert combined.info.metadata is None
+
+
+def test_single_trajectory_concatenation_preserves_cache_provenance():
+    model = _make_hinge_model()
+    info = _make_info(model, 50.0)
+    info.metadata = {"source": "motion-a", "fingerprint": "fingerprint-a"}
+    trajectory = Trajectory(
+        info=info,
+        data=TrajectoryData(
+            qpos=_make_qpos(model, 2),
+            qvel=np.zeros((2, model.nv), dtype=np.float32),
+            split_points=np.array([0, 2]),
+        ),
+    )
+
+    combined = Trajectory.concatenate([trajectory], backend=np)
+
+    assert combined.info.metadata == info.metadata
+
+
+def test_amass_loader_keeps_names_aligned_when_a_motion_fails(tmp_path, monkeypatch):
+    model = _make_model()
+    monkeypatch.setattr(
+        retargeting_module,
+        "get_converted_amass_dataset_path",
+        lambda: str(tmp_path),
+    )
+
+    def load_one(_env_name, dataset_name, *_args, **_kwargs):
+        if dataset_name == "motion-b":
+            raise RuntimeError("retargeting failed")
+        trajectory = Trajectory(
+            info=_make_info(model, 50.0),
+            data=TrajectoryData(
+                qpos=_make_qpos(model, 2),
+                qvel=np.zeros((2, model.nv), dtype=np.float32),
+                split_points=np.array([0, 2]),
+            ),
+        )
+        return LoadedTrajectorySet(trajectory, (dataset_name,))
+
+    monkeypatch.setattr(retargeting_module, "load_retargeted_amass_trajectory_set", load_one)
+    logger = SimpleNamespace(info=lambda *_args: None, error=lambda *_args: None)
+
+    loaded = retargeting_module._load_trajectories_individually(
+        "MyoFullBody",
+        ["motion-a", "motion-b", "motion-c"],
+        SimpleNamespace(),
+        logger,
+    )
+
+    assert loaded.motion_names == ("motion-a", "motion-c")
+    assert loaded.trajectory.data.n_trajectories == 2
+
+
+def test_amass_cache_load_keeps_motion_names_and_cache_provenance_separate(tmp_path, monkeypatch):
+    model = _make_model()
+    cache_dir = tmp_path / "MyoFullBody"
+    cache_dir.mkdir()
+    monkeypatch.setattr(retargeting_module, "get_converted_amass_dataset_path", lambda: str(tmp_path))
+
+    for index, motion_name in enumerate(("motion-a", "motion-b")):
+        info = _make_info(model, 50.0)
+        info.metadata = {"source": motion_name, "fingerprint": f"fingerprint-{index}"}
+        Trajectory(
+            info=info,
+            data=TrajectoryData(
+                qpos=_make_qpos(model, 2, x_offset=float(index)),
+                qvel=np.zeros((2, model.nv), dtype=np.float32),
+                split_points=np.array([0, 2]),
+            ),
+        ).save(cache_dir / f"{motion_name}.npz")
+
+    logger = SimpleNamespace(info=lambda *_args: None, error=lambda *_args: None)
+    loaded = retargeting_module._load_trajectories_individually(
+        "MyoFullBody",
+        ["motion-a", "motion-b"],
+        SimpleNamespace(),
+        logger,
+    )
+
+    assert loaded.motion_names == ("motion-a", "motion-b")
+    assert loaded.trajectory.data.n_trajectories == 2
+    assert loaded.trajectory.info.metadata is None
+
+    single = retargeting_module.load_retargeted_amass_trajectory_set(
+        "MyoFullBody",
+        "motion-a",
+        robot_conf={},
+        retargeting_method="smpl",
+    )
+
+    assert single.motion_names == ("motion-a",)
+    assert isinstance(single.trajectory.data.qpos, np.ndarray)
+
+
+def test_public_retargeting_loaders_keep_trajectory_return_type(monkeypatch):
+    trajectory = SimpleNamespace(data=SimpleNamespace(n_trajectories=1))
+    loaded = LoadedTrajectorySet(trajectory, ("motion-a",))
+    monkeypatch.setattr(retargeting_module, "load_retargeted_amass_trajectory_set", lambda **_kwargs: loaded)
+    monkeypatch.setattr(
+        retargeting_module,
+        "retarget_smpl_to_bimanual_via_intermediate_set",
+        lambda **_kwargs: loaded,
+    )
+
+    assert retargeting_module.load_retargeted_amass_trajectory("MyoFullBody", "motion-a") is trajectory
+    assert retargeting_module.retarget_smpl_to_bimanual_via_intermediate("motion-a") is trajectory
+
+
+def test_concatenation_keeps_structural_validation_strict():
+    model = _make_hinge_model()
+
+    def make_trajectory(frequency):
+        return Trajectory(
+            info=_make_info(model, frequency),
+            data=TrajectoryData(
+                qpos=_make_qpos(model, 2),
+                qvel=np.zeros((2, model.nv), dtype=np.float32),
+                split_points=np.array([0, 2]),
+            ),
+        )
+
+    with pytest.raises(AssertionError, match="TrajectoryInfos must be compatible"):
+        Trajectory.concatenate(
+            [make_trajectory(50.0), make_trajectory(100.0)],
+            backend=np,
+        )

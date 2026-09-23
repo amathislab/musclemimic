@@ -11,10 +11,10 @@ from loco_mujoco.datasets.humanoids.LAFAN1 import (
     load_lafan1_trajectory,
 )
 from loco_mujoco.smpl.retargeting import (
-    load_retargeted_amass_trajectory,
-    retarget_smpl_to_bimanual_via_intermediate,
+    load_retargeted_amass_trajectory_set,
+    retarget_smpl_to_bimanual_via_intermediate_set,
 )
-from loco_mujoco.trajectory import Trajectory, TrajectoryCacheType
+from loco_mujoco.trajectory import LoadedTrajectorySet, Trajectory, TrajectoryCacheType
 
 from .base import TaskFactory
 from .dataset_confs import (
@@ -108,7 +108,7 @@ class ImitationFactory(TaskFactory):
             **merged_kwargs,
         )
 
-        all_trajs = []
+        loaded_sets = []
 
         # Load the default trajectory if available
         # if default_dataset_conf is not None:
@@ -124,7 +124,7 @@ class ImitationFactory(TaskFactory):
                 filtered_conf = {k: v for k, v in amass_dataset_conf.items() if k in valid_keys}
                 amass_dataset_conf = AMASSDatasetConf(**filtered_conf)
             # Pass along visualization flag for optional logging
-            all_trajs.append(cls.get_amass_traj(env, amass_dataset_conf, visualize_goal=visualize_goal))
+            loaded_sets.append(cls.get_amass_trajectory_set(env, amass_dataset_conf, visualize_goal=visualize_goal))
 
         # Load converted C3D trajectories if available
         if c3d_dataset_conf is not None:
@@ -132,33 +132,34 @@ class ImitationFactory(TaskFactory):
                 valid_keys = {f.name for f in dataclasses.fields(C3DDatasetConf)}
                 filtered_conf = {k: v for k, v in c3d_dataset_conf.items() if k in valid_keys}
                 c3d_dataset_conf = C3DDatasetConf(**filtered_conf)
-            all_trajs.append(cls.get_c3d_traj(env, c3d_dataset_conf))
+            loaded_sets.append(cls.get_c3d_trajectory_set(env, c3d_dataset_conf))
 
         # Load the LAFAN1 trajectory if available
         if lafan1_dataset_conf is not None:
             if isinstance(lafan1_dataset_conf, (dict, DictConfig)):
                 lafan1_dataset_conf = LAFAN1DatasetConf(**lafan1_dataset_conf)
-            all_trajs.append(cls.get_lafan1_traj(env, lafan1_dataset_conf))
+            loaded_sets.append(cls.get_lafan1_trajectory_set(env, lafan1_dataset_conf))
 
         # Load the custom trajectory if available
         if custom_dataset_conf is not None:
             if isinstance(custom_dataset_conf, (dict, DictConfig)):
                 custom_dataset_conf = CustomDatasetConf(**custom_dataset_conf)
-            all_trajs.append(cls.get_custom_dataset(env, custom_dataset_conf))
+            loaded_sets.append(cls.get_custom_trajectory_set(env, custom_dataset_conf))
 
         # Only process trajectories if we have any to load
-        if all_trajs:
+        if loaded_sets:
             cache_type = cls._get_trajectory_cache_type(
                 amass_dataset_conf,
                 c3d_dataset_conf,
                 lafan1_dataset_conf,
                 custom_dataset_conf,
             )
-            all_trajs = Trajectory.concatenate(all_trajs, backend=np)
+            loaded = LoadedTrajectorySet.concatenate(loaded_sets, backend=np)
 
             # add to the environment
             env.load_trajectory(
-                traj=all_trajs,
+                traj=loaded.trajectory,
+                motion_names=loaded.motion_names,
                 warn=False,
                 cache_type=cache_type,
                 site_names=getattr(env, "sites_for_mimic", None) if cache_type == TrajectoryCacheType.SPARSE else None,
@@ -181,20 +182,17 @@ class ImitationFactory(TaskFactory):
 
     @classmethod
     def get_amass_traj(cls, env, amass_dataset_conf: AMASSDatasetConf, visualize_goal: bool = False) -> Trajectory:
-        """
-        Determines the path to the trajectory file based on the dataset type, task, and debug mode.
+        """Load AMASS trajectory data."""
+        return cls.get_amass_trajectory_set(env, amass_dataset_conf, visualize_goal).trajectory
 
-        Args:
-            env: The environment, which provides dataset paths.
-            amass_dataset_conf (AMASSDatasetConf): The configuration for the AMASS trajectory
-            visualize_goal (bool): If True we are constructing a visualization / evaluation environment.
-
-        Returns:
-            Trajectory: The AMASS trajectories.
-
-        Raises:
-            ValueError: If the `dataset_group` is unknown.
-        """
+    @classmethod
+    def get_amass_trajectory_set(
+        cls,
+        env,
+        amass_dataset_conf: AMASSDatasetConf,
+        visualize_goal: bool = False,
+    ) -> LoadedTrajectorySet:
+        """Load AMASS trajectories with their source names."""
         # Accept both dataclass instances and raw dict/DictConfig inputs
         if isinstance(amass_dataset_conf, (dict, DictConfig)):
             amass_dataset_conf = AMASSDatasetConf(**amass_dataset_conf)
@@ -241,14 +239,14 @@ class ImitationFactory(TaskFactory):
                 f"[MuscleMimic] Detected MyoBimanualArm environment. "
                 f"Using three-stage retargeting pipeline with {method_name} for Stage 1."
             )
-            traj = retarget_smpl_to_bimanual_via_intermediate(
+            loaded = retarget_smpl_to_bimanual_via_intermediate_set(
                 dataset_paths,
                 retargeting_method=retargeting_method,
                 gmr_config=gmr_config,
                 clear_cache=clear_cache,
             )
         else:
-            traj = load_retargeted_amass_trajectory(
+            loaded = load_retargeted_amass_trajectory_set(
                 env_name,
                 dataset_paths,
                 retargeting_method=retargeting_method,
@@ -256,21 +254,16 @@ class ImitationFactory(TaskFactory):
                 clear_cache=clear_cache,
             )
 
-        return traj
+        return loaded
 
     @staticmethod
     def get_c3d_traj(env, c3d_dataset_conf: C3DDatasetConf) -> Trajectory:
-        """
-        Load converted C3D-derived trajectories from the converted C3D cache.
+        """Load converted C3D trajectory data."""
+        return ImitationFactory.get_c3d_trajectory_set(env, c3d_dataset_conf).trajectory
 
-        Args:
-            env: The environment, used to select the saved model namespace.
-            c3d_dataset_conf (C3DDatasetConf): Converted C3D trajectory configuration.
-
-        Returns:
-            Trajectory: The converted C3D trajectories.
-
-        """
+    @staticmethod
+    def get_c3d_trajectory_set(env, c3d_dataset_conf: C3DDatasetConf) -> LoadedTrajectorySet:
+        """Load converted C3D trajectories with their source names."""
         from musclemimic.web_viewer.c3d_pipeline import (
             get_converted_c3d_dataset_path,
             normalize_c3d_dataset_name,
@@ -295,7 +288,7 @@ class ImitationFactory(TaskFactory):
         converted_root = get_converted_c3d_dataset_path()
         method = c3d_dataset_conf.retargeting_method
 
-        trajectories = []
+        loaded_sets = []
         for rel_dataset_path in dataset_paths:
             normalized = normalize_c3d_dataset_name(rel_dataset_path)
             trajectory_path = converted_root / cache_env_name / method / normalized.with_suffix(".npz")
@@ -305,30 +298,20 @@ class ImitationFactory(TaskFactory):
                     "Create it with `python -m musclemimic.web_viewer.run --c3d-file ... "
                     "--c3d-dataset-name <name>`."
                 )
-            trajectories.append(Trajectory.load(trajectory_path, backend=np))
+            trajectory = Trajectory.load(trajectory_path, backend=np)
+            motion_names = (rel_dataset_path,) * int(trajectory.data.n_trajectories)
+            loaded_sets.append(LoadedTrajectorySet(trajectory, motion_names))
 
-        if len(trajectories) == 1:
-            traj = trajectories[0]
-        else:
-            traj = Trajectory.concatenate(trajectories, backend=np)
-
-        return traj
+        return LoadedTrajectorySet.concatenate(loaded_sets, backend=np)
 
     @staticmethod
     def get_lafan1_traj(env, lafan1_dataset_conf: LAFAN1DatasetConf) -> Trajectory:
-        """
-        Determines the path to the trajectory file based on the dataset type, task, and debug mode.
+        """Load LAFAN1 trajectory data."""
+        return ImitationFactory.get_lafan1_trajectory_set(env, lafan1_dataset_conf).trajectory
 
-        Args:
-            env: The environment, which provides dataset paths.
-            lafan1_dataset_conf (LAFAN1DatasetConf): The configuration for the LAFAN1 trajectory.
-
-        Returns:
-            Trajectory: The LAFAN1 trajectories.
-
-        Raises:
-            ValueError: If the `dataset_group` is unknown.
-        """
+    @staticmethod
+    def get_lafan1_trajectory_set(env, lafan1_dataset_conf: LAFAN1DatasetConf) -> LoadedTrajectorySet:
+        """Load LAFAN1 trajectories with their source names."""
         # Determine dataset paths
         if lafan1_dataset_conf.dataset_group:
             if lafan1_dataset_conf.dataset_group == "LAFAN1_LOCOMOTION_DATASETS":
@@ -346,32 +329,30 @@ class ImitationFactory(TaskFactory):
                 else [lafan1_dataset_conf.dataset_name]
             )
 
-        # Load LAFAN1 Trajectory
-        traj = load_lafan1_trajectory(env.__class__.__name__, dataset_paths)
+        loaded_sets = []
+        for dataset_path in dataset_paths:
+            trajectory = load_lafan1_trajectory(env.__class__.__name__, dataset_path)
+            motion_names = (dataset_path,) * int(trajectory.data.n_trajectories)
+            loaded_sets.append(LoadedTrajectorySet(trajectory, motion_names))
 
-        return traj
+        return LoadedTrajectorySet.concatenate(loaded_sets, backend=np)
 
     @staticmethod
     def get_custom_dataset(env, custom_dataset_conf: CustomDatasetConf) -> Trajectory:
-        """
-        Loads the custom trajectory based on the dataset type, task, and debug mode.
+        """Load custom trajectory data."""
+        return ImitationFactory.get_custom_trajectory_set(env, custom_dataset_conf).trajectory
 
-        Args:
-            env: The environment, which provides dataset paths.
-            custom_dataset_conf (CustomDatasetConf): The configuration for the custom trajectory.
-
-        Returns:
-            Trajectory: The custom trajectories.
-
-        """
+    @staticmethod
+    def get_custom_trajectory_set(env, custom_dataset_conf: CustomDatasetConf) -> LoadedTrajectorySet:
+        """Load custom trajectories without inferred source names."""
         from loco_mujoco.smpl.retargeting import extend_motion
 
         traj = custom_dataset_conf.traj
-        # Retargeted custom motions often start with qpos/qvel plus partial site data.
-        # Extend them to full body/site kinematics before handing them to the trajectory handler.
+        # Custom trajectories must match the environment kinematic layout.
         if not traj.data.is_complete:
             env_name = env.__class__.__name__
             env_params = {}
             traj = extend_motion(env_name, env_params, traj)
 
-        return traj
+        motion_names = (None,) * int(traj.data.n_trajectories)
+        return LoadedTrajectorySet(traj, motion_names)
