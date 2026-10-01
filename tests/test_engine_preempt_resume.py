@@ -3,9 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import jax.numpy as jnp
+import pytest
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 
+from musclemimic.algorithms.common.base_algorithm import JaxTrainingInvocation
 from musclemimic.runner import engine
 
 
@@ -105,3 +108,43 @@ def test_run_experiment_explicit_resume_keeps_resume_resets(monkeypatch, tmp_pat
 
     assert captured["apply_resume_resets"] is True
     assert captured["resume_from"] == explicit
+
+
+def test_run_training_passes_restored_state_as_dynamic_jit_argument(monkeypatch):
+    restored_state = jnp.arange(4, dtype=jnp.float32)
+    rng = jnp.array([3, 7], dtype=jnp.uint32)
+    received = {}
+
+    def train_fn(runtime_rng, runtime_state):
+        received["args"] = (runtime_rng, runtime_state)
+        return runtime_state + runtime_rng[0]
+
+    def fake_jit(function, *, donate_argnums=()):
+        received["donate_argnums"] = donate_argnums
+        return function
+
+    monkeypatch.setattr(engine.jax, "jit", fake_jit)
+    invocation = JaxTrainingInvocation(
+        train_fn=train_fn,
+        dynamic_args=(restored_state,),
+        donate_argnums=(1,),
+    )
+
+    result = engine.run_training(invocation, rng)
+
+    assert received["args"][0] is rng
+    assert received["args"][1] is restored_state
+    assert received["donate_argnums"] == (1,)
+    assert jnp.array_equal(result, restored_state + 3)
+
+
+def test_run_training_synchronizes_and_propagates_device_failure(monkeypatch):
+    monkeypatch.setattr(engine.jax, "jit", lambda function, **_kwargs: function)
+
+    def fail_when_synchronized(_result):
+        raise RuntimeError("asynchronous device failure")
+
+    monkeypatch.setattr(engine.jax, "block_until_ready", fail_when_synchronized)
+
+    with pytest.raises(RuntimeError, match="asynchronous device failure"):
+        engine.run_training(lambda _rng: jnp.array(1), jnp.array([0, 1], dtype=jnp.uint32))

@@ -1,0 +1,59 @@
+defaults:
+  - conf_fullbody
+  - _self_
+
+wandb:
+  tags: ["fullbody", "gmr", "resnet", "resume-base-l"]
+
+experiment:
+  task_factory:
+    params:
+      amass_dataset_conf:
+        retargeting_method: "gmr"
+        gmr_config:
+          src_human: "smplh"
+          target_fps: 30
+          solver: "daqp"
+          damping: 0.5
+          offset_to_ground: false
+          use_velocity_limit: false
+          use_fitted_shape: true
+          shape_fitting_iterations: 500
+
+  env_params:
+    reward_params:
+      qpos_w_sum: 0.1
+      qvel_w_sum: 0.1
+      root_pos_w_sum: 0.1
+      root_vel_w_sum: 0.1
+      rpos_w_sum: 0.6
+      rquat_w_sum: 0.01
+      rvel_w_sum: 0.1
+    terminal_state_type: MeanRelativeSiteDeviationWithRootTerminalStateHandler
+    terminal_state_params:
+      mean_site_deviation_threshold: 0.5
+      root_deviation_threshold: 0.5
+      enable_site_check: true
+
+  # Network architecture (MUST match checkpoint)
+  actor_hidden_layers: [2048, 4096, 4096, 4096, 4096, 4096, 2048, 1024, 512]
+  critic_hidden_layers: [2048, 4096, 4096, 4096, 4096, 4096, 2048, 1024, 512]
+
+  # Residual connections (MUST match checkpoint)
+  use_residual: true
+  residual_type: "gated"
+  residual_gate_init: -2.0
+
+  # PPO rollout settings (matching checkpoint training)
+  ppo_config:
+    num_steps: 50
+    num_minibatches: 32
+
+  # Resume from HuggingFace checkpoint
+  resume_from: null
+  reset_logging_timestep: true  # Checkpoint is at 9.7B steps, already past total_timesteps
+
+  # Validation
+  validation:
+    num: 100
+    start_from_beginning: true

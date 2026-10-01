@@ -1,0 +1,72 @@
+defaults:
+  - conf_fullbody_gmr
+  - _self_
+
+wandb:
+  project: "musclemimic"
+  mode: "online"
+  tags: ["fullbody", "gmr", "flashsac", "a5000"]
+
+experiment:
+  algorithm: FlashSACJax
+  env_params:
+    # FlashSAC benefits more from replay coverage than from collecting a very
+    # large vector step. 512 envs leaves room for a 1M-transition replay on a
+    # 24 GiB A5000 and retains 2,048 interactions (20.48 s at 100 Hz).
+    num_envs: 512
+  num_envs: ${experiment.env_params.num_envs}
+  total_timesteps: 100000000
+  online_logging_interval: 10
+  # FlashSAC normalizes raw replay rewards at sample time.
+  normalize_env: false
+
+  validation:
+    active: true
+    num: 50
+    video_frequency: 10
+  save_checkpoints: true
+  # A complete checkpoint contains the replay buffer. Avoid synchronously
+  # writing a roughly 10 GiB checkpoint at every validation.
+  checkpoints_on_validation: false
+  checkpoint_interval: 8192
+  max_checkpoints_to_keep: 2
+  async_checkpointing: true
+  auto_resume: true
+
+  flashsac_config:
+    # 1M / 512 = 2,048 interactions of replay history. The previous
+    # 131K / 1,024 profile retained only 128 interactions.
+    buffer_capacity: 1048576
+    min_buffer_size: 131072
+    sample_batch_size: 2048
+    replay_storage_dtype: bfloat16
+    # One 2,048-sample update per 512 new transitions gives the same
+    # sample/update ratio as two updates per 1,024 transitions.
+    updates_per_interaction: 1
+    gamma: 0.99
+    normalize_reward: true
+    normalized_return_max: 5.0
+
+    # Full-body observations/actions are much larger than the MyoSuite tasks
+    # used for the small upstream defaults.
+    actor_hidden_dim: 256
+    actor_num_blocks: 4
+    actor_update_period: 2
+    critic_hidden_dim: 512
+    critic_num_blocks: 4
+    critic_num_bins: 101
+    critic_min_value: -5.0
+    critic_max_value: 5.0
+    target_update_tau: 0.01
+
+    initial_temperature: 0.01
+    # In 354 action dimensions, 0.15 drove alpha to its minimum. A modestly
+    # broader target keeps exploration pressure meaningful.
+    target_sigma: 0.20
+    learning_rate: 3e-4
+    end_learning_rate: 1.5e-4
+    warmup_updates: 2000
+    max_grad_norm: 1.0
+
+    noise_zeta_exponent: 2.0
+    noise_max_repeat: 16

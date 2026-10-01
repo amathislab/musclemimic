@@ -53,6 +53,12 @@ class GoalTrajMimic(Goal):
         self.enable_mimic_site_rpos_observations = bool(
             kwargs.pop("enable_mimic_site_rpos_observations", info_props.get("enable_mimic_site_rpos_observations", True))
         )
+        self.enable_global_root_tracking_observations = bool(
+            kwargs.pop(
+                "enable_global_root_tracking_observations",
+                info_props.get("enable_global_root_tracking_observations", False),
+            )
+        )
         visualize_goal = bool(kwargs.get("visualize_goal", False))
         n_visual_geoms = int(
             kwargs.pop(
@@ -68,6 +74,7 @@ class GoalTrajMimic(Goal):
         self._qpos_ind = None
         self._qvel_ind = None
         self._root_qpos_ind = None  # Full root qpos indices (xyz + quat)
+        self._root_qpos_full_ind = None
         self._root_qvel_ind = None  # Full root qvel indices (linear + angular vel)
         self._size_additional_observation = None
 
@@ -111,7 +118,8 @@ class GoalTrajMimic(Goal):
         self._qvel_ind = np.concatenate([mj_jntid2qvelid(i, model) for i in range(model.njnt)])
 
         # Store full root indices for simplified lookahead (root pos xyz + root vel 6D)
-        self._root_qpos_ind = mj_jntid2qposid(root_free_joint_id, model)[:3]  # xyz only
+        self._root_qpos_full_ind = mj_jntid2qposid(root_free_joint_id, model)
+        self._root_qpos_ind = self._root_qpos_full_ind[:3]  # xyz only
         self._root_qvel_ind = mj_jntid2qvelid(root_free_joint_id, model)  # 6D linear + angular vel
 
         n_relative_sites = len(self._info_props["sites_for_mimic"]) - 1
@@ -131,7 +139,8 @@ class GoalTrajMimic(Goal):
             self._dim = traj_step_dim * self.n_step_lookahead
 
         motion_phase_dim = 1 if self.enable_motion_phase else 0
-        self._dim += motion_phase_dim
+        global_root_dim = 13 if self.enable_global_root_tracking_observations else 0
+        self._dim += motion_phase_dim + global_root_dim
         if self.enable_mimic_site_rpos_observations:
             self._size_additional_observation = size_for_sites_full  # rpos + rvel + rangles
         else:
@@ -189,6 +198,24 @@ class GoalTrajMimic(Goal):
             traj_site_indices = self._site_mapper.model_ids_to_traj_indices(rel_site_ids)
 
         trajectory_length = env.th.len_trajectory(traj_state.traj_no)
+        global_root_goal = None
+        if self.enable_global_root_tracking_observations:
+            current_ref = env.th.get_traj_data_at(
+                traj_state.traj_no, traj_state.subtraj_step_no, carry, backend
+            )
+            root_qpos_full_ind = (
+                backend.asarray(self._root_qpos_full_ind)
+                if backend == jnp
+                else self._root_qpos_full_ind
+            )
+            root_qvel_ind = (
+                backend.asarray(self._root_qvel_ind)
+                if backend == jnp
+                else self._root_qvel_ind
+            )
+            global_root_goal = backend.concatenate(
+                [current_ref.qpos[root_qpos_full_ind], current_ref.qvel[root_qvel_ind]]
+            )
 
         if self.use_concise_lookahead:
             # Simplified lookahead: root_pos_delta + root_vel_delta + site_rpos only
@@ -316,8 +343,10 @@ class GoalTrajMimic(Goal):
             goal_components.extend([
                 backend.ravel(site_rangles),
                 backend.ravel(site_rvel),
-                backend.ravel(traj_goal_obs),
             ])
+            if global_root_goal is not None:
+                goal_components.append(global_root_goal)
+            goal_components.append(backend.ravel(traj_goal_obs))
 
             if self.enable_motion_phase:
                 # Motion phase: normalized progress through trajectory [0, 1]
@@ -327,7 +356,10 @@ class GoalTrajMimic(Goal):
             goal = backend.concatenate(goal_components)
             return goal, carry
         else:
-            goal_components = [traj_goal_obs]
+            goal_components = []
+            if global_root_goal is not None:
+                goal_components.append(global_root_goal)
+            goal_components.append(traj_goal_obs)
             if self.enable_motion_phase:
                 motion_phase = traj_state.subtraj_step_no / backend.maximum(trajectory_length, 1)
                 goal_components.append(backend.atleast_1d(motion_phase))

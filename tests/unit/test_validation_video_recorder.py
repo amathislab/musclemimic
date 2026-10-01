@@ -219,6 +219,39 @@ class TestValidationVideoRecorderConfig:
         assert env_params["recorder_params"]["path"] == video_recorder.video_dir
         assert env_params["recorder_params"]["fps"] == 50  # 1/(0.005*4)
 
+    def test_named_motion_validation_and_tag_sanitization(self, tmp_path):
+        recorder = ValidationVideoRecorder(
+            video_dir=str(tmp_path),
+            named_motions=[
+                {"name": "stairs up", "path": "Gait120/S001/StairAscent/Trial01/AllSteps_stageii"},
+            ],
+        )
+
+        assert recorder.named_motions == (
+            ("stairs up", "Gait120/S001/StairAscent/Trial01/AllSteps_stageii"),
+        )
+        assert recorder._safe_tag_component("stairs up / trial 1") == "stairs-up-trial-1"
+
+    def test_duplicate_named_motions_are_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="duplicate name"):
+            ValidationVideoRecorder(
+                video_dir=str(tmp_path),
+                named_motions=[
+                    {"name": "stairs_up", "path": "one"},
+                    {"name": "stairs_up", "path": "two"},
+                ],
+            )
+
+    def test_named_motion_string_form(self, tmp_path):
+        recorder = ValidationVideoRecorder(
+            video_dir=str(tmp_path),
+            named_motions=["stairs_up=Gait120/S001/StairAscent/Trial01/AllSteps_stageii"],
+        )
+
+        assert recorder.named_motions == (
+            ("stairs_up", "Gait120/S001/StairAscent/Trial01/AllSteps_stageii"),
+        )
+
 
 class TestHeadlessSetupHelpers:
     def test_headless_detection_sets_egl(self, monkeypatch):
@@ -416,6 +449,7 @@ class TestValidationVideoRecorderRecordingBehavior:
         assert kwargs["use_mujoco"] is True
         assert kwargs["wrap_env"] is True
         assert kwargs["train_state_seed"] == 0
+        assert kwargs["stop_after_first_episode"] is True
 
     def test_stateful_objects_restored_on_env_failure(self, video_recorder, simple_agent_conf, agent_state):
         class DummyFactory:
@@ -441,6 +475,99 @@ class TestValidationVideoRecorderRecordingBehavior:
                 StatefulObject._instances = original_instances
 
         assert restored_instances == sentinel_instances
+
+    def test_named_motions_are_individually_pinned_and_returned(self, simple_agent_conf, agent_state, tmp_path):
+        simple_agent_conf.config.experiment.task_factory.params.amass_dataset_conf = {
+            "rel_dataset_path": ["unused/training/motion"],
+        }
+        recorder = ValidationVideoRecorder(
+            video_dir=str(tmp_path / "videos"),
+            frequency=1,
+            length=20,
+            named_motions=[
+                {"name": "stairs_up", "path": "Gait120/S001/StairAscent/Trial01/AllSteps_stageii"},
+                {"name": "ramp_down", "path": "Gait120/S002/SlopeDescent/Trial01/AllSteps_stageii"},
+            ],
+        )
+        created_envs = []
+        created_params = []
+
+        class DummyFactory:
+            @staticmethod
+            def make(*_args, **kwargs):
+                env = MagicMock()
+                motion = kwargs["amass_dataset_conf"]["rel_dataset_path"][0]
+                env.video_file_path = str(tmp_path / f"{motion.split('/')[-3]}.mp4")
+                created_envs.append(env)
+                created_params.append(kwargs)
+                return env
+
+        with patch.object(recorder_module.TaskFactory, "get_factory_cls", return_value=DummyFactory), \
+            patch.object(recorder_module.PPOJax, "play_policy") as mock_play:
+            result = recorder.record_episode(
+                agent_conf=simple_agent_conf,
+                agent_state=agent_state,
+                validation_number=1,
+                timestep=42,
+            )
+
+        assert result == {
+            "stairs_up": str(tmp_path / "StairAscent.mp4"),
+            "ramp_down": str(tmp_path / "SlopeDescent.mp4"),
+        }
+        assert [
+            params["amass_dataset_conf"]["rel_dataset_path"] for params in created_params
+        ] == [
+            ["Gait120/S001/StairAscent/Trial01/AllSteps_stageii"],
+            ["Gait120/S002/SlopeDescent/Trial01/AllSteps_stageii"],
+        ]
+        assert all(params["amass_dataset_conf"]["max_motions"] == 1 for params in created_params)
+        assert all(params["amass_dataset_conf"]["dataset_group"] is None for params in created_params)
+        assert all(env.stop.called for env in created_envs)
+        assert mock_play.call_count == 2
+
+    def test_reset_hook_receives_pinned_motion(self, simple_agent_conf, agent_state, tmp_path):
+        simple_agent_conf.config.experiment.task_factory.params.amass_dataset_conf = {
+            "rel_dataset_path": ["unused/training/motion"],
+        }
+
+        class InspectingRecorder(ValidationVideoRecorder):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.inspected = []
+
+            def _on_environment_reset(self, env, motion_path):
+                self.inspected.append((env, motion_path))
+
+        recorder = InspectingRecorder(
+            video_dir=str(tmp_path / "videos"),
+            frequency=1,
+            length=20,
+            named_motions=[
+                "stairs_up=Gait120/S001/StairAscent/Trial01/AllSteps_stageii",
+            ],
+        )
+        dummy_env = MagicMock()
+        dummy_env.video_file_path = str(tmp_path / "stairs_up.mp4")
+
+        class DummyFactory:
+            @staticmethod
+            def make(*_args, **_kwargs):
+                return dummy_env
+
+        with patch.object(recorder_module.TaskFactory, "get_factory_cls", return_value=DummyFactory), \
+            patch.object(recorder_module.PPOJax, "play_policy"):
+            recorder.record_episode(
+                agent_conf=simple_agent_conf,
+                agent_state=agent_state,
+                validation_number=1,
+                timestep=42,
+            )
+
+        assert recorder.inspected == [
+            (dummy_env, "Gait120/S001/StairAscent/Trial01/AllSteps_stageii")
+        ]
+        dummy_env.reset.assert_called_once_with()
 
 
 class TestValidationVideoRecorderIntegration:

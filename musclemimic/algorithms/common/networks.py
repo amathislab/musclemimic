@@ -1,27 +1,29 @@
+from collections.abc import Sequence
+
+import distrax
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 import numpy as np
 from flax.linen.initializers import constant, orthogonal
-from typing import Sequence
-import distrax
+
+from musclemimic.utils.running_stats import global_batch_moments, merge_running_moments
 
 
 def get_activation_fn(name: str):
-    """ Get activation function by name from the flax.linen module."""
+    """Get activation function by name from the flax.linen module."""
     try:
         # Use getattr to dynamically retrieve the activation function from jax.nn
         return getattr(nn, name)
-    except AttributeError:
-        raise ValueError(f"Activation function '{name}' not found. Name must be the same as in flax.linen!")
+    except AttributeError as error:
+        raise ValueError(f"Activation function '{name}' not found. Name must be the same as in flax.linen!") from error
 
 
 class FullyConnectedNet(nn.Module):
-
     hidden_layer_dims: Sequence[int]
     output_dim: int
     activation: str = "tanh"
-    output_activation: str = None    # none means linear activation
+    output_activation: str = None  # none means linear activation
     use_running_mean_stand: bool = True
     squeeze_output: bool = True
     use_layernorm: bool = False
@@ -29,8 +31,9 @@ class FullyConnectedNet(nn.Module):
 
     def setup(self):
         self.activation_fn = get_activation_fn(self.activation)
-        self.output_activation_fn = get_activation_fn(self.output_activation) \
-            if self.output_activation is not None else lambda x: x
+        self.output_activation_fn = (
+            get_activation_fn(self.output_activation) if self.output_activation is not None else lambda x: x
+        )
 
     @nn.compact
     def __call__(self, x):
@@ -39,7 +42,7 @@ class FullyConnectedNet(nn.Module):
             x = RunningMeanStd()(x)
 
         # build network
-        for i, dim_layer in enumerate(self.hidden_layer_dims):
+        for dim_layer in self.hidden_layer_dims:
             x = nn.Dense(dim_layer, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
             if self.use_layernorm:
                 x = nn.LayerNorm(epsilon=self.layernorm_eps)(x)
@@ -74,6 +77,7 @@ class ResidualFCNet(nn.Module):
         residual_second_gain: Orthogonal init gain for 2nd Dense in block (default 0.01)
         proj_gain: Orthogonal init gain for projection shortcuts (default 1.0)
     """
+
     hidden_layer_dims: Sequence[int]
     output_dim: int
     activation: str = "silu"
@@ -183,11 +187,13 @@ class ActorCritic(nn.Module):
 
     def setup(self):
         self.activation_fn = get_activation_fn(self.activation)
+        # Preserve the variable path used by existing checkpoints.
+        self.observation_normalizer = RunningMeanStd(name="RunningMeanStd_0")
 
     @nn.compact
-    def __call__(self, x):
-
-        x = RunningMeanStd()(x)
+    def __call__(self, x, actor_only: bool = False, axis_name: str | None = None):
+        del axis_name  # Kept for the shared ActorCritic/SoftMoE call interface.
+        x = self.observation_normalizer(x)
 
         # build actor
         actor_x = x if self.actor_obs_ind is None else x[..., self.actor_obs_ind]
@@ -214,16 +220,19 @@ class ActorCritic(nn.Module):
                 layernorm_eps=self.layernorm_eps,
                 name="actor",
             )(actor_x)
-        actor_logtstd = self.param("log_std", nn.initializers.constant(jnp.log(self.init_std)),
-                                   (self.action_dim,))
+        actor_logtstd = self.param("log_std", nn.initializers.constant(jnp.log(self.init_std)), (self.action_dim,))
         if not self.learnable_std:
             actor_logtstd = jax.lax.stop_gradient(actor_logtstd)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+        if actor_only:
+            return pi
 
         # build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
-        critic_dims = self.critic_hidden_layer_dims if self.critic_hidden_layer_dims is not None else self.hidden_layer_dims
+        critic_dims = (
+            self.critic_hidden_layer_dims if self.critic_hidden_layer_dims is not None else self.hidden_layer_dims
+        )
         if self.use_residual:
             critic = ResidualFCNet(
                 hidden_layer_dims=critic_dims,
@@ -250,44 +259,40 @@ class ActorCritic(nn.Module):
 
         return pi, jnp.squeeze(critic, axis=-1)
 
+    def update_observation_stats(self, x, axis_name: str | None = None):
+        """Update only the observation normalizer, without running the policy."""
+        return self.observation_normalizer(x, update_stats=True, axis_name=axis_name)
+
 
 class RunningMeanStd(nn.Module):
     """Layer that maintains running mean and variance for input normalization."""
 
     @nn.compact
-    def __call__(self, x):
-
+    def __call__(self, x, *, update_stats: bool = False, axis_name: str | None = None):
+        vector_input = x.ndim == 1
         x = jnp.atleast_2d(x)
 
-        # Initialize running mean, variance, and count
-        mean = self.variable('run_stats', 'mean', lambda: jnp.zeros(x.shape[-1]))
-        var = self.variable('run_stats', 'var', lambda: jnp.ones(x.shape[-1]))
-        count = self.variable('run_stats', 'count', lambda: jnp.array(1e-6))
+        # The variables are read-only during policy evaluation. Training updates
+        # them explicitly once per rollout via ``update_observation_stats``.
+        mean = self.variable("run_stats", "mean", lambda: jnp.zeros(x.shape[-1]))
+        var = self.variable("run_stats", "var", lambda: jnp.ones(x.shape[-1]))
+        count = self.variable("run_stats", "count", lambda: jnp.array(1e-6))
 
-        # Compute batch mean and variance
-        batch_mean = jnp.mean(x, axis=0)
-        batch_var = jnp.var(x, axis=0) + 1e-6  # Add epsilon for numerical stability
-        batch_count = x.shape[0]
+        normalization_mean = mean.value
+        normalization_var = var.value
+        if update_stats:
+            batch_mean, batch_var, batch_count = global_batch_moments(x, axis_name)
+            normalization_mean, normalization_var, updated_count = merge_running_moments(
+                mean.value,
+                var.value,
+                count.value,
+                batch_mean,
+                batch_var,
+                batch_count,
+            )
+            mean.value = normalization_mean
+            var.value = normalization_var
+            count.value = updated_count
 
-        # Update counts
-        updated_count = count.value + batch_count
-
-        # Numerically stable mean and variance update
-        delta = batch_mean - mean.value
-        new_mean = mean.value + delta * batch_count / updated_count
-
-        # Compute the new variance using Welford's method
-        m_a = var.value * count.value
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + jnp.square(delta) * count.value * batch_count / updated_count
-        new_var = M2 / updated_count
-
-        # Normalize input
-        normalized_x = (x - new_mean) / jnp.sqrt(new_var + 1e-8)
-
-        # Update state variables
-        mean.value = new_mean
-        var.value = new_var
-        count.value = updated_count
-
-        return jnp.squeeze(normalized_x)
+        normalized = (x - normalization_mean) / jnp.sqrt(normalization_var + 1e-8)
+        return normalized[0] if vector_input else normalized

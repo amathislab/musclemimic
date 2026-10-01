@@ -6,15 +6,22 @@ Covers loss functions, optimizer schedules, MoE helpers, and env wrapper order.
 
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
-import pytest
 import types
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+import pytest
 from omegaconf import OmegaConf
 
+from loco_mujoco.core.utils.env import Box
 from musclemimic.algorithms.common.env_utils import wrap_env
+from musclemimic.algorithms.common.optimizer import (
+    build_optimizer,
+    linear_lr_schedule,
+    warmup_cosine_lr_schedule,
+    warmup_hold_cosine_lr_schedule,
+)
 from musclemimic.algorithms.ppo.loss import (
     PPOLossOutput,
     approx_kl,
@@ -24,15 +31,8 @@ from musclemimic.algorithms.ppo.loss import (
     ppo_value_loss,
 )
 from musclemimic.algorithms.ppo.moe import aggregate_moe_metrics, zero_moe_metrics
-from musclemimic.algorithms.common.optimizer import (
-    build_optimizer,
-    get_optimizer,
-    linear_lr_schedule,
-    warmup_cosine_lr_schedule,
-)
 from musclemimic.algorithms.ppo.ppo import PPOJax
 from musclemimic.core.wrappers.mjx import AutoResetWrapper, LogWrapper, NStepWrapper, VecEnv
-from loco_mujoco.core.utils.env import Box
 
 
 class _DummyEnv:
@@ -71,6 +71,7 @@ def _make_optimizer_config(
     schedule: str = "fixed",
     lr_schedule_type: str = "linear",
     warmup_steps: int | None = None,
+    hold_fraction: float = 0.5,
     min_lr_ratio: float = 0.0,
 ):
     return OmegaConf.create(
@@ -83,6 +84,7 @@ def _make_optimizer_config(
                 "anneal_lr": anneal_lr,
                 "lr_schedule_type": lr_schedule_type,
                 "warmup_steps": warmup_steps,
+                "hold_fraction": hold_fraction,
                 "min_lr_ratio": min_lr_ratio,
                 "weight_decay": 0.0,
                 "max_grad_norm": 1.0,
@@ -540,6 +542,51 @@ class TestLRSchedules:
         assert jnp.allclose(lr10, lr, atol=1e-6)
         assert jnp.allclose(lr11, lr * min_ratio, atol=1e-6)
 
+    def test_warmup_hold_cosine_has_distinct_warmup_hold_and_decay_phases(self):
+        lr = 1e-3
+        values = [
+            warmup_hold_cosine_lr_schedule(
+                update,
+                1,
+                1,
+                lr,
+                10,
+                warmup_steps=2,
+                hold_fraction=0.6,
+                min_lr_ratio=0.1,
+            )
+            for update in (0, 1, 2, 5, 6, 8, 10)
+        ]
+
+        assert jnp.allclose(values[0], 0.0)
+        assert jnp.allclose(values[1], 0.5 * lr)
+        assert jnp.allclose(values[2], lr)
+        assert jnp.allclose(values[3], lr)
+        assert jnp.allclose(values[4], lr)
+        assert values[5] < lr
+        assert jnp.allclose(values[6], 0.1 * lr)
+
+    @pytest.mark.parametrize(
+        ("hold_fraction", "min_lr_ratio", "message"),
+        ((-0.1, 0.1, "hold_fraction"), (1.1, 0.1, "hold_fraction"), (0.5, 1.1, "min_lr_ratio")),
+    )
+    def test_warmup_hold_cosine_validates_ratios(
+        self,
+        hold_fraction,
+        min_lr_ratio,
+        message,
+    ):
+        with pytest.raises(ValueError, match=message):
+            warmup_hold_cosine_lr_schedule(
+                0,
+                1,
+                1,
+                1e-3,
+                10,
+                hold_fraction=hold_fraction,
+                min_lr_ratio=min_lr_ratio,
+            )
+
     def test_linear_lr_monotonic(self):
         """
         Linear schedule must be non-increasing.
@@ -588,6 +635,18 @@ class TestOptimizer:
         assert jnp.isfinite(schedule_fn(0))
         assert jnp.isfinite(schedule_fn(12 * 8))
         assert jnp.isfinite(schedule_fn(13 * 8))
+
+        config_hold = _make_optimizer_config(
+            anneal_lr=True,
+            schedule="fixed",
+            lr_schedule_type="warmup_hold_cosine",
+            warmup_steps=2,
+            hold_fraction=0.6,
+            min_lr_ratio=0.1,
+        )
+        optimizer.get_optimizer(config_hold.experiment)
+        hold_schedule = captured[-1]
+        assert jnp.allclose(hold_schedule(2 * 8), config_hold.experiment.lr)
 
     def test_build_optimizer_rejects_unknown(self):
         with pytest.raises(ValueError):

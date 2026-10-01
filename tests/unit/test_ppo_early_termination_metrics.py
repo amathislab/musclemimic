@@ -30,6 +30,7 @@ def _make_info(shape: tuple) -> dict:
         "reward_qpos": zeros_f,
         "reward_qvel": zeros_f,
         "reward_root_pos": zeros_f,
+        "reward_root_quat": zeros_f,
         "reward_rpos": zeros_f,
         "reward_rquat": zeros_f,
         "reward_rvel_rot": zeros_f,
@@ -51,7 +52,9 @@ def test_compute_training_metrics_counts_early_termination():
     absorbing = jnp.array([[True, False], [False, False]], dtype=bool)
     traj_end = jnp.array([[False, False], [False, True]], dtype=bool)
     info = _make_info(done.shape)
-    traj_batch = SimpleNamespace(metrics=_make_metrics(done), done=done, absorbing=absorbing, traj_end=traj_end, info=info)
+    traj_batch = SimpleNamespace(
+        metrics=_make_metrics(done), done=done, absorbing=absorbing, traj_end=traj_end, info=info
+    )
     config = SimpleNamespace(num_envs=2)
 
     summary = ppo_runner._compute_training_metrics(traj_batch, config)
@@ -67,7 +70,9 @@ def test_compute_training_metrics_handles_no_done():
     absorbing = jnp.ones((2, 2), dtype=bool)
     traj_end = jnp.zeros((2, 2), dtype=bool)
     info = _make_info(done.shape)
-    traj_batch = SimpleNamespace(metrics=_make_metrics(done), done=done, absorbing=absorbing, traj_end=traj_end, info=info)
+    traj_batch = SimpleNamespace(
+        metrics=_make_metrics(done), done=done, absorbing=absorbing, traj_end=traj_end, info=info
+    )
     config = SimpleNamespace(num_envs=2)
 
     summary = ppo_runner._compute_training_metrics(traj_batch, config)
@@ -83,7 +88,9 @@ def test_compute_training_metrics_counts_horizon_timeout():
     absorbing = jnp.array([[True, False], [False, False]], dtype=bool)
     traj_end = jnp.array([[False, False], [False, True]], dtype=bool)
     info = _make_info(done.shape)
-    traj_batch = SimpleNamespace(metrics=_make_metrics(done), done=done, absorbing=absorbing, traj_end=traj_end, info=info)
+    traj_batch = SimpleNamespace(
+        metrics=_make_metrics(done), done=done, absorbing=absorbing, traj_end=traj_end, info=info
+    )
     config = SimpleNamespace(num_envs=2)
 
     summary = ppo_runner._compute_training_metrics(traj_batch, config)

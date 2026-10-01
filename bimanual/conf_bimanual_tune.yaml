@@ -1,0 +1,16 @@
+# Bimanual tuning configuration
+# Inherits from conf_bimanual.yaml with longer rollouts
+defaults:
+  - conf_bimanual
+  - _self_
+
+wandb:
+  tags: ["bimanual", "tune"]
+
+experiment:
+  # Network architecture (for reference)
+  actor_hidden_layers: [1024, 1024, 1024, 1024]
+  critic_hidden_layers: [1024, 1024, 1024, 1024]
+
+  # Longer rollouts for tuning
+  num_steps: 20

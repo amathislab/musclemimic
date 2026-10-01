@@ -13,6 +13,7 @@ from omegaconf import OmegaConf
 from musclemimic.runner.checkpointing import (
     config_hash,
     find_latest_checkpoint,
+    require_ppo_local_resume_compatibility,
     resolve_checkpoint_dir,
     validate_checkpoint_compatibility,
     write_manifest,
@@ -48,18 +49,22 @@ class TestConfigHash:
 
     def test_excludes_auto_resume_fields(self):
         """auto_resume, run_id, checkpoint_root shouldn't affect hash."""
-        cfg1 = OmegaConf.create({
-            "lr": 0.001,
-            "auto_resume": True,
-            "run_id": None,
-            "checkpoint_root": None,
-        })
-        cfg2 = OmegaConf.create({
-            "lr": 0.001,
-            "auto_resume": False,
-            "run_id": "my-run",
-            "checkpoint_root": "/stable/root",
-        })
+        cfg1 = OmegaConf.create(
+            {
+                "lr": 0.001,
+                "auto_resume": True,
+                "run_id": None,
+                "checkpoint_root": None,
+            }
+        )
+        cfg2 = OmegaConf.create(
+            {
+                "lr": 0.001,
+                "auto_resume": False,
+                "run_id": "my-run",
+                "checkpoint_root": "/stable/root",
+            }
+        )
         assert config_hash(cfg1) == config_hash(cfg2)
 
     def test_hash_is_12_chars(self):
@@ -74,6 +79,21 @@ class TestConfigHash:
         cfg1 = OmegaConf.create({"a": 1, "b": 2, "c": 3})
         cfg2 = OmegaConf.create({"c": 3, "b": 2, "a": 1})
         assert config_hash(cfg1) == config_hash(cfg2)
+
+    def test_hardware_gate_checkpoint_boundary_is_identity_bearing(self):
+        """Checkpoint-gate phases must use the same configured boundary."""
+        initial = OmegaConf.create(
+            {"debug": {"hardware_gate": {"stop_after_checkpoint_update": 5}}}
+        )
+        resume = OmegaConf.create(
+            {"debug": {"hardware_gate": {"stop_after_checkpoint_update": 5}}}
+        )
+        different_boundary = OmegaConf.create(
+            {"debug": {"hardware_gate": {"stop_after_checkpoint_update": 10}}}
+        )
+
+        assert config_hash(initial) == config_hash(resume)
+        assert config_hash(initial) != config_hash(different_boundary)
 
 
 def _create_complete_checkpoint(checkpoint_dir: Path) -> None:
@@ -158,6 +178,40 @@ class TestWriteManifest:
             assert "experiment_config" in manifest
             assert manifest["experiment_config"]["lr"] == 0.001
 
+    def test_writes_hardware_gate_checkpoint_boundary(self, tmp_path):
+        cfg = OmegaConf.create(
+            {"debug": {"hardware_gate": {"stop_after_checkpoint_update": 5}}}
+        )
+
+        write_manifest(tmp_path, cfg, config_hash(cfg))
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["experiment_config"]["debug"]["hardware_gate"][
+            "stop_after_checkpoint_update"
+        ] == 5
+
+    def test_writes_full_terra_expected_commit(self, tmp_path, monkeypatch):
+        expected_commit = "a" * 40
+        monkeypatch.setenv("TERRA_EXPECTED_COMMIT", expected_commit)
+
+        write_manifest(tmp_path, OmegaConf.create({"lr": 0.001}), "abc123def456")
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["git_sha"] == expected_commit
+
+    def test_strict_manifest_refuses_invalid_terra_expected_commit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TERRA_EXPECTED_COMMIT", "not-a-full-sha")
+
+        with pytest.raises(ValueError, match="full 40-character SHA"):
+            write_manifest(
+                tmp_path,
+                OmegaConf.create({"lr": 0.001}),
+                "abc123def456",
+                require_full_git_sha=True,
+            )
+
+        assert not (tmp_path / "manifest.json").exists()
+
     def test_idempotent(self):
         """Should not overwrite existing manifest."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -206,6 +260,98 @@ class TestValidateCheckpointCompatibility:
             assert "WARNING: Config hash mismatch" in captured.out
             assert "original_hash" in captured.out
             assert "different_hash" in captured.out
+
+    def test_unreadable_manifest_remains_permissive_for_legacy_resume(self, tmp_path):
+        (tmp_path / "manifest.json").write_text("not-json", encoding="utf-8")
+
+        assert validate_checkpoint_compatibility(tmp_path, "any_hash") is True
+
+
+class TestRequirePpoLocalResumeCompatibility:
+    """PPO's implicit local-resume gate is deliberately fail closed."""
+
+    git_sha = "a" * 40
+
+    @staticmethod
+    def _write_manifest(path: Path, **overrides) -> None:
+        manifest = {"config_hash": "config-hash", "git_sha": "a" * 40}
+        manifest.update(overrides)
+        (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_accepts_exact_config_and_full_git_sha(self, tmp_path):
+        self._write_manifest(tmp_path)
+
+        require_ppo_local_resume_compatibility(
+            tmp_path,
+            "config-hash",
+            current_git_sha=self.git_sha,
+        )
+
+    def test_prefers_validated_terra_expected_commit(self, tmp_path, monkeypatch):
+        self._write_manifest(tmp_path)
+        monkeypatch.setenv("TERRA_EXPECTED_COMMIT", self.git_sha.upper())
+
+        require_ppo_local_resume_compatibility(tmp_path, "config-hash")
+
+    @pytest.mark.parametrize(
+        ("contents", "message"),
+        [
+            (None, "manifest is missing"),
+            ("not-json", "manifest is unreadable"),
+            (json.dumps({"git_sha": "a" * 40}), "config_hash is missing"),
+            (json.dumps({"config_hash": "config-hash"}), "git_sha is missing"),
+            (
+                json.dumps({"config_hash": "config-hash", "git_sha": "short"}),
+                "full 40-character SHA",
+            ),
+        ],
+    )
+    def test_rejects_missing_unreadable_or_incomplete_manifest(
+        self,
+        tmp_path,
+        contents,
+        message,
+    ):
+        if contents is not None:
+            (tmp_path / "manifest.json").write_text(contents, encoding="utf-8")
+
+        with pytest.raises(ValueError, match=message):
+            require_ppo_local_resume_compatibility(
+                tmp_path,
+                "config-hash",
+                current_git_sha=self.git_sha,
+            )
+
+    @pytest.mark.parametrize(
+        ("config_hash_value", "git_sha", "message"),
+        [
+            ("different-config", "a" * 40, "experiment config hash changed"),
+            ("config-hash", "b" * 40, "git SHA changed"),
+            ("config-hash", "not-a-full-sha", "current git SHA is unavailable or invalid"),
+        ],
+    )
+    def test_rejects_config_or_source_identity_change(
+        self,
+        tmp_path,
+        config_hash_value,
+        git_sha,
+        message,
+    ):
+        self._write_manifest(tmp_path)
+
+        with pytest.raises(ValueError, match=message):
+            require_ppo_local_resume_compatibility(
+                tmp_path,
+                config_hash_value,
+                current_git_sha=git_sha,
+            )
+
+    def test_invalid_terra_expected_commit_fails_closed(self, tmp_path, monkeypatch):
+        self._write_manifest(tmp_path)
+        monkeypatch.setenv("TERRA_EXPECTED_COMMIT", "not-a-full-sha")
+
+        with pytest.raises(ValueError, match="TERRA_EXPECTED_COMMIT"):
+            require_ppo_local_resume_compatibility(tmp_path, "config-hash")
 
 
 class TestResolveCheckpointDir:

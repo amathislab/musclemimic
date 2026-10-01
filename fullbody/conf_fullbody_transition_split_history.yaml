@@ -1,0 +1,31 @@
+# MyoFullBody with split-history: state history + current goal (no goal stacking)
+# Inherits from conf_fullbody_transition.yaml
+#
+# Key features:
+# - len_obs_history=5: Stack 5 frames of state observations
+# - split_goal=true: Only stack state, keep goal at current timestep
+# - n_step_lookahead=5: Include 5 future trajectory frames in goal
+#
+# Output obs shape: [state_hist (5 * state_dim), goal (goal_dim)]
+# This prevents redundant stacking of future trajectory information.
+#
+# Usage: python fullbody/experiment.py --config-name=conf_fullbody_transition_split_history
+defaults:
+  - conf_fullbody_transition
+  - _self_
+
+wandb:
+  tags: ["fullbody", "transition", "split-history"]
+
+experiment:
+  # Enable split-history: only stack state, not goal
+  len_obs_history: 2
+  split_goal: true
+
+  # Future trajectory lookahead in goal observation
+  env_params:
+    goal_params:
+      n_step_lookahead: 5
+      n_step_stride: 20
+      enable_motion_phase: true
+      use_concise_lookahead: true 

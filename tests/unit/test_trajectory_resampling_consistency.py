@@ -1,5 +1,4 @@
 from itertools import pairwise
-from types import SimpleNamespace
 
 import mujoco
 import numpy as np
@@ -8,7 +7,6 @@ import pytest
 from loco_mujoco.smpl import retargeting as retargeting_module
 from loco_mujoco.smpl.retargeting import _fps_after_frame_skip
 from loco_mujoco.trajectory import (
-    LoadedTrajectorySet,
     Trajectory,
     TrajectoryCacheType,
     TrajectoryData,
@@ -20,6 +18,7 @@ from loco_mujoco.trajectory import (
     materialize_trajectory,
     recompute_trajectory_velocities,
 )
+from loco_mujoco.trajectory.materialized_cache import MaterializedTrajectoryCache
 
 
 def _make_model():
@@ -49,6 +48,20 @@ def _make_hinge_model():
         <body name="root" pos="0 0 0">
           <joint name="joint_a" type="hinge" axis="0 0 1"/>
           <joint name="joint_b" type="hinge" axis="0 1 0"/>
+          <geom name="root_geom" type="sphere" size="0.05" mass="1"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+    return mujoco.MjModel.from_xml_string(xml)
+
+
+def _make_limited_hinge_model():
+    xml = """
+    <mujoco>
+      <worldbody>
+        <body name="root" pos="0 0 0">
+          <joint name="limited" type="hinge" axis="0 0 1" range="-30 30"/>
           <geom name="root_geom" type="sphere" size="0.05" mass="1"/>
         </body>
       </worldbody>
@@ -259,6 +272,193 @@ def test_materialize_full_cache_after_upsampling():
     assert handler.traj.data.cvel_parent.size == 0
 
 
+def test_materialized_trajectory_cache_round_trip_skips_recomputation(tmp_path, monkeypatch):
+    model = _make_model()
+    info = _make_info(model, 100.0)
+    qpos = _make_qpos(model, 5)
+    trajectory = Trajectory(
+        info=info,
+        data=TrajectoryData(
+            qpos=qpos,
+            qvel=np.zeros((len(qpos), model.nv), dtype=np.float32),
+            split_points=np.array([0, len(qpos)]),
+        ),
+    )
+    handler = TrajectoryHandler(
+        model,
+        traj=trajectory,
+        control_dt=0.01,
+        random_start=False,
+        fixed_start_conf=(0, 0),
+        cache_type=TrajectoryCacheType.SPARSE,
+        site_names=["root_site", "link_site"],
+    )
+    cache = MaterializedTrajectoryCache(
+        tmp_path,
+        "a" * 64,
+        model=model,
+        control_dt=0.01,
+        cache_type=TrajectoryCacheType.SPARSE,
+        site_names=["root_site", "link_site"],
+        clip_joint_ranges=False,
+    )
+
+    with cache.writer_lock():
+        cache.publish(handler.traj)
+    loaded = cache.load()
+    assert loaded is not None
+    np.testing.assert_array_equal(loaded.data.site_xpos, handler.traj.data.site_xpos)
+
+    monkeypatch.setattr(
+        "loco_mujoco.trajectory.handler.materialize_trajectory",
+        lambda *_args, **_kwargs: pytest.fail("warm cache must not be materialized again"),
+    )
+    warm_handler = TrajectoryHandler(
+        model,
+        materialized_traj=loaded,
+        control_dt=0.01,
+        random_start=False,
+        fixed_start_conf=(0, 0),
+        cache_type=TrajectoryCacheType.SPARSE,
+        site_names=["root_site", "link_site"],
+    )
+    assert warm_handler.n_trajectories == 1
+
+
+def test_materialized_trajectory_cache_variants_include_the_model(tmp_path):
+    model = _make_model()
+    changed_model = _make_model()
+    changed_model.body_pos[2, 0] += 0.01
+    kwargs = {
+        "control_dt": 0.01,
+        "cache_type": TrajectoryCacheType.SPARSE,
+        "site_names": ["root_site", "link_site"],
+        "clip_joint_ranges": False,
+    }
+
+    first = MaterializedTrajectoryCache(tmp_path, "b" * 64, model=model, **kwargs)
+    changed = MaterializedTrajectoryCache(tmp_path, "b" * 64, model=changed_model, **kwargs)
+
+    assert first.path != changed.path
+
+
+def test_materialized_trajectory_cache_removes_interrupted_staging_directory(tmp_path):
+    model = _make_model()
+    cache = MaterializedTrajectoryCache(
+        tmp_path,
+        "d" * 64,
+        model=model,
+        control_dt=0.01,
+        cache_type=TrajectoryCacheType.SPARSE,
+        site_names=["root_site", "link_site"],
+        clip_joint_ranges=False,
+    )
+    cache.cohort_dir.mkdir(parents=True)
+    interrupted = cache.cohort_dir / f".{cache.variant_key}.stage-interrupted"
+    interrupted.mkdir()
+    (interrupted / "partial").write_text("partial")
+
+    with cache.writer_lock():
+        assert not interrupted.exists()
+
+def test_shape_preserving_upsampling_does_not_overshoot_joint_extrema():
+    model = _make_limited_hinge_model()
+    info = _make_info(model, 50.0)
+    limit = float(model.jnt_range[0, 1])
+    qpos = np.array([[0.0], [0.9 * limit], [limit], [0.9 * limit]], dtype=np.float32)
+    data = TrajectoryData(
+        qpos=qpos,
+        qvel=np.zeros((len(qpos), model.nv), dtype=np.float32),
+        split_points=np.array([0, len(qpos)]),
+    )
+
+    upsampled, upsampled_info = interpolate_trajectories(
+        data,
+        info,
+        100.0,
+        backend=np,
+        bounded_qpos_ranges={0: (-limit, limit)},
+    )
+
+    assert np.max(upsampled.qpos[:, 0]) <= limit + 1e-7
+    assert np.min(upsampled.qpos[:, 0]) >= 0.0
+    assert upsampled_info.metadata["joint_range_interpolation_rescue_frame_count"] > 0
+    assert upsampled_info.metadata["joint_range_interpolation_rescue_value_count"] > 0
+
+
+def test_materialize_rescues_cubic_limit_overshoot_before_projection():
+    model = _make_limited_hinge_model()
+    info = _make_info(model, 50.0)
+    limit = float(model.jnt_range[0, 1])
+    qpos = np.array([[0.0], [0.9 * limit], [limit], [0.9 * limit]], dtype=np.float32)
+    trajectory = Trajectory(
+        info=info,
+        data=TrajectoryData(
+            qpos=qpos,
+            qvel=np.zeros((len(qpos), model.nv), dtype=np.float32),
+            split_points=np.array([0, len(qpos)]),
+        ),
+    )
+
+    materialized = materialize_trajectory(
+        trajectory,
+        model=model,
+        control_dt=0.01,
+        clip_joint_ranges=True,
+    )
+
+    metadata = materialized.info.metadata
+    assert metadata["joint_range_interpolation_rescue_frame_count"] > 0
+    assert metadata["joint_range_projection_frame_count"] == 0
+    assert np.max(materialized.data.qpos[:, 0]) <= limit
+
+
+def test_materialize_joint_range_projection_recomputes_velocity():
+    model = _make_limited_hinge_model()
+    info = _make_info(model, 50.0)
+    limit = float(model.jnt_range[0, 1])
+    qpos = np.array([[0.0], [0.9 * limit], [1.01 * limit], [0.9 * limit]], dtype=np.float32)
+    trajectory = Trajectory(
+        info=info,
+        data=TrajectoryData(
+            qpos=qpos,
+            qvel=np.zeros((len(qpos), model.nv), dtype=np.float32),
+            split_points=np.array([0, len(qpos)]),
+        ),
+    )
+
+    projected = materialize_trajectory(
+        trajectory,
+        model=model,
+        control_dt=0.02,
+        clip_joint_ranges=True,
+    )
+
+    assert np.max(projected.data.qpos[:, 0]) <= limit
+    assert np.min(projected.data.qpos[:, 0]) >= -limit
+    projection = projected.info.metadata
+    assert projection["joint_range_projection_frame_count"] > 0
+    assert projection["joint_range_projection_value_count"] >= projection["joint_range_projection_frame_count"]
+    assert projection["joint_range_projection_max_abs"] > 0
+    assert len(projection["joint_range_projection_frames"]) == projection["joint_range_projection_frame_count"]
+    assert projection["joint_range_projection_angular_frame_count"] > 0
+    assert projection["joint_range_projection_angular_value_count"] > 0
+    assert projection["joint_range_projection_angular_max_abs"] > 0
+    assert projection["joint_range_projection_material_angular_frame_count"] > 0
+    assert projection["joint_range_projection_material_angular_value_count"] > 0
+    assert projection["joint_range_projection_material_angular_threshold"] == pytest.approx(
+        np.deg2rad(0.05)
+    )
+    assert '"limited"' in projection["joint_range_projection_by_joint_json"]
+    _assert_qvel_matches_qpos(
+        model,
+        np.asarray(projected.data.qpos),
+        np.asarray(projected.data.qvel),
+        np.asarray(projected.data.split_points),
+        projected.info.frequency,
+    )
+
+
 def test_materialize_sparse_cache_uses_explicit_site_names():
     model = _make_model()
     info = _make_info(model, 50.0)
@@ -362,168 +562,3 @@ def test_retarget_extend_motion_returns_source_cache_after_layout_filtering(monk
 
 def test_retargeting_helpers_preserve_fractional_fps():
     assert _fps_after_frame_skip(59.94, 2) == pytest.approx(29.97)
-
-
-def test_concatenation_accepts_distinct_cache_provenance(tmp_path):
-    model = _make_model()
-
-    def make_trajectory(fingerprint, offset):
-        info = _make_info(model, 50.0)
-        info.metadata = {
-            "source": f"motion-{fingerprint}",
-            "fingerprint": fingerprint,
-        }
-        qpos = _make_qpos(model, 2, x_offset=offset)
-        return Trajectory(
-            info=info,
-            data=TrajectoryData(
-                qpos=qpos,
-                qvel=np.zeros((2, model.nv), dtype=np.float32),
-                split_points=np.array([0, 2]),
-            ),
-        )
-
-    cache_a = tmp_path / "motion-a.npz"
-    cache_b = tmp_path / "motion-b.npz"
-    make_trajectory("fingerprint-a", 0.0).save(cache_a)
-    make_trajectory("fingerprint-b", 10.0).save(cache_b)
-
-    loaded = [
-        Trajectory.load(cache_a, backend=np),
-        Trajectory.load(cache_b, backend=np),
-    ]
-    combined = Trajectory.concatenate(loaded, backend=np)
-
-    assert combined.data.n_trajectories == 2
-    np.testing.assert_array_equal(combined.data.split_points, np.array([0, 2, 4]))
-    np.testing.assert_allclose(combined.data.qpos[:2], loaded[0].data.qpos)
-    np.testing.assert_allclose(combined.data.qpos[2:], loaded[1].data.qpos)
-    assert combined.info.metadata is None
-
-
-def test_single_trajectory_concatenation_preserves_cache_provenance():
-    model = _make_hinge_model()
-    info = _make_info(model, 50.0)
-    info.metadata = {"source": "motion-a", "fingerprint": "fingerprint-a"}
-    trajectory = Trajectory(
-        info=info,
-        data=TrajectoryData(
-            qpos=_make_qpos(model, 2),
-            qvel=np.zeros((2, model.nv), dtype=np.float32),
-            split_points=np.array([0, 2]),
-        ),
-    )
-
-    combined = Trajectory.concatenate([trajectory], backend=np)
-
-    assert combined.info.metadata == info.metadata
-
-
-def test_amass_loader_keeps_names_aligned_when_a_motion_fails(tmp_path, monkeypatch):
-    model = _make_model()
-    monkeypatch.setattr(
-        retargeting_module,
-        "get_converted_amass_dataset_path",
-        lambda: str(tmp_path),
-    )
-
-    def load_one(_env_name, dataset_name, *_args, **_kwargs):
-        if dataset_name == "motion-b":
-            raise RuntimeError("retargeting failed")
-        trajectory = Trajectory(
-            info=_make_info(model, 50.0),
-            data=TrajectoryData(
-                qpos=_make_qpos(model, 2),
-                qvel=np.zeros((2, model.nv), dtype=np.float32),
-                split_points=np.array([0, 2]),
-            ),
-        )
-        return LoadedTrajectorySet(trajectory, (dataset_name,))
-
-    monkeypatch.setattr(retargeting_module, "load_retargeted_amass_trajectory_set", load_one)
-    logger = SimpleNamespace(info=lambda *_args: None, error=lambda *_args: None)
-
-    loaded = retargeting_module._load_trajectories_individually(
-        "MyoFullBody",
-        ["motion-a", "motion-b", "motion-c"],
-        SimpleNamespace(),
-        logger,
-    )
-
-    assert loaded.motion_names == ("motion-a", "motion-c")
-    assert loaded.trajectory.data.n_trajectories == 2
-
-
-def test_amass_cache_load_keeps_motion_names_and_cache_provenance_separate(tmp_path, monkeypatch):
-    model = _make_model()
-    cache_dir = tmp_path / "MyoFullBody"
-    cache_dir.mkdir()
-    monkeypatch.setattr(retargeting_module, "get_converted_amass_dataset_path", lambda: str(tmp_path))
-
-    for index, motion_name in enumerate(("motion-a", "motion-b")):
-        info = _make_info(model, 50.0)
-        info.metadata = {"source": motion_name, "fingerprint": f"fingerprint-{index}"}
-        Trajectory(
-            info=info,
-            data=TrajectoryData(
-                qpos=_make_qpos(model, 2, x_offset=float(index)),
-                qvel=np.zeros((2, model.nv), dtype=np.float32),
-                split_points=np.array([0, 2]),
-            ),
-        ).save(cache_dir / f"{motion_name}.npz")
-
-    logger = SimpleNamespace(info=lambda *_args: None, error=lambda *_args: None)
-    loaded = retargeting_module._load_trajectories_individually(
-        "MyoFullBody",
-        ["motion-a", "motion-b"],
-        SimpleNamespace(),
-        logger,
-    )
-
-    assert loaded.motion_names == ("motion-a", "motion-b")
-    assert loaded.trajectory.data.n_trajectories == 2
-    assert loaded.trajectory.info.metadata is None
-
-    single = retargeting_module.load_retargeted_amass_trajectory_set(
-        "MyoFullBody",
-        "motion-a",
-        robot_conf={},
-        retargeting_method="smpl",
-    )
-
-    assert single.motion_names == ("motion-a",)
-    assert isinstance(single.trajectory.data.qpos, np.ndarray)
-
-
-def test_public_retargeting_loaders_keep_trajectory_return_type(monkeypatch):
-    trajectory = SimpleNamespace(data=SimpleNamespace(n_trajectories=1))
-    loaded = LoadedTrajectorySet(trajectory, ("motion-a",))
-    monkeypatch.setattr(retargeting_module, "load_retargeted_amass_trajectory_set", lambda **_kwargs: loaded)
-    monkeypatch.setattr(
-        retargeting_module,
-        "retarget_smpl_to_bimanual_via_intermediate_set",
-        lambda **_kwargs: loaded,
-    )
-
-    assert retargeting_module.load_retargeted_amass_trajectory("MyoFullBody", "motion-a") is trajectory
-    assert retargeting_module.retarget_smpl_to_bimanual_via_intermediate("motion-a") is trajectory
-
-
-def test_concatenation_keeps_structural_validation_strict():
-    model = _make_hinge_model()
-
-    def make_trajectory(frequency):
-        return Trajectory(
-            info=_make_info(model, frequency),
-            data=TrajectoryData(
-                qpos=_make_qpos(model, 2),
-                qvel=np.zeros((2, model.nv), dtype=np.float32),
-                split_points=np.array([0, 2]),
-            ),
-        )
-
-    with pytest.raises(AssertionError, match="TrajectoryInfos must be compatible"):
-        Trajectory.concatenate(
-            [make_trajectory(50.0), make_trajectory(100.0)],
-            backend=np,
-        )

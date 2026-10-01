@@ -45,6 +45,7 @@ from .env_state_utils import (
 # Imports from adaptive_sampling
 from .adaptive_sampling import (
     compute_adaptive_weights,
+    compute_per_traj_difficulty_stats,
     compute_per_traj_termination_stats,
     compute_topk_weights,
 )
@@ -93,6 +94,7 @@ __all__ = [
     "update_carry_weights_unnormalized",
     # From adaptive_sampling
     "compute_adaptive_weights",
+    "compute_per_traj_difficulty_stats",
     "compute_per_traj_termination_stats",
     "compute_topk_weights",
     # From curriculum

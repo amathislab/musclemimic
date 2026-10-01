@@ -3,7 +3,7 @@ requires = ["setuptools", "wheel"]
 
 [project]
 name = "musclemimic"
-version = "0.1.1"
+version = "0.1.0"
 description = "Towards Embodied AI with MuscleMimic: Unlocking full-body musculoskeletal motor learning at scale"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,13 +30,14 @@ dependencies = [
     # Core dependencies
     "numpy==2.2.6",
     "scipy>=1.14.0",
+    "scikit-learn>=1.5.0",
 
     # MuJoCo/JAX stack
-    "mujoco-mjx==3.4.0",
-    "mujoco==3.4.0",
-    "warp-lang==1.10.0",
-    "jax==0.7.2",
-    "jaxlib==0.7.2",
+    "mujoco-mjx==3.11.0",
+    "mujoco==3.11.0",
+    "warp-lang==1.14.0",
+    "jax==0.10.2",
+    "jaxlib==0.10.2",
     "flax==0.12.0",
     "optax>=0.2.4",
     "orbax-checkpoint==0.11.37",
@@ -44,6 +45,7 @@ dependencies = [
 
     # Configuration & utilities
     "hydra-core",
+    "packaging>=24.0",
     "pyyaml",
     "ml-collections>=1.1.0",
 
@@ -78,7 +80,10 @@ dev = [
 ]
 
 cuda = [
-    "jax[cuda12]==0.7.2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "jax[cuda12]==0.10.2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # 9.25.0.15 is yanked; keep the CUDA environment on the version used by
+    # the MJX-Warp ellipsoid collision regression test.
+    "nvidia-cudnn-cu12==9.24.0.43 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 # SMPL dependencies
@@ -111,7 +116,6 @@ musclemimic-set-lafan1-path = "musclemimic.utils:set_lafan1_path"
 musclemimic-set-conv-lafan1-path = "musclemimic.utils:set_converted_lafan1_path"
 musclemimic-set-all-caches = "musclemimic.utils:set_all_caches"
 musclemimic-download-gmr-caches = "musclemimic.utils.gmr_cache:download_gmr_dataset_group_cli"
-musclemimic-retarget-visualize = "musclemimic.retargeting.visualize:main"
 
 [project.urls]
 Homepage = "https://github.com/amathislab/musclemimic"
@@ -141,7 +145,13 @@ where = ["."]
 include = ["musclemimic*", "loco_mujoco*", "bimanual*", "fullbody*"]
 
 [tool.setuptools.package-data]
-"loco_mujoco.smpl" = ["robot_confs/*.yaml"]
+# Hydra resolves these configs beside the installed experiment modules. The
+# SMPL retargeter likewise resolves robot and IK definitions relative to its
+# installed package, so they must be present in wheels as well as source trees.
+bimanual = ["*.yaml"]
+fullbody = ["*.yaml"]
+"loco_mujoco.smpl" = ["*.sh", "gmr_configs/*.json", "robot_confs/*.yaml"]
+"musclemimic.algorithms.flashsac" = ["README.md"]
 
 [tool.ruff]
 line-length = 120

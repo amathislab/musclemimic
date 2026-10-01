@@ -1,7 +1,9 @@
 """Adaptive trajectory sampling utilities for PPO training.
 
-Provides utilities for computing trajectory sampling weights based on
-early termination rates, enabling more training focus on harder trajectories.
+The sampler uses completed-episode evidence to focus training on difficult
+trajectories while retaining an explicit uniform exploration floor. A failed
+episode is weighted by how early it failed, so falling immediately is stronger
+evidence than falling one frame before the end of a motion.
 """
 
 from __future__ import annotations
@@ -20,6 +22,10 @@ def compute_adaptive_weights(
     floor_mix: float = 0.1,
     eps_div: float = 1e-6,
     eps_pow: float = 1e-6,
+    group_ids: jnp.ndarray | None = None,
+    num_groups: int | None = None,
+    difficulty_mix: float | None = None,
+    max_weight_ratio: float | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Compute trajectory sampling weights from early termination rates using count-EMA.
 
@@ -64,8 +70,77 @@ def compute_adaptive_weights(
     use_priorities = jnp.isfinite(sum_p) & (sum_p > 0)
     normalized = jnp.where(use_priorities, priorities / sum_p, uniform)
 
-    # Uniform floor mix (ensures all trajectories get at least floor_mix probability)
-    weights_1d = (1 - floor_mix) * normalized + floor_mix * uniform
+    if difficulty_mix is None:
+        difficulty_mix = 1.0 - floor_mix
+    if not 0.0 <= difficulty_mix <= 1.0:
+        raise ValueError("difficulty_mix must be between 0 and 1")
+    if max_weight_ratio is not None and max_weight_ratio < 1.0:
+        raise ValueError("max_weight_ratio must be at least 1")
+
+    if group_ids is None:
+        # Backwards-compatible single-pool behavior.
+        weights_1d = difficulty_mix * normalized + (1.0 - difficulty_mix) * uniform
+        if max_weight_ratio is not None:
+            cap = jnp.asarray(max_weight_ratio / n_traj, dtype=weights_1d.dtype)
+            capped = jnp.minimum(weights_1d, cap)
+            capacity = jnp.maximum(cap - capped, 0.0)
+            deficit = 1.0 - jnp.sum(capped)
+            weights_1d = capped + capacity * deficit / jnp.maximum(jnp.sum(capacity), eps_div)
+    else:
+        group_ids = jnp.asarray(group_ids, dtype=jnp.int32)
+        if group_ids.shape != (n_traj,):
+            raise ValueError(
+                f"group_ids must have shape {(n_traj,)}, got {group_ids.shape}"
+            )
+        if num_groups is None:
+            raise ValueError("num_groups is required when group_ids are provided")
+        if num_groups < 1:
+            raise ValueError("num_groups must be positive")
+
+        group_counts = jax.ops.segment_sum(
+            jnp.ones((n_traj,), dtype=priorities.dtype),
+            group_ids,
+            num_segments=num_groups,
+        )
+        group_priority = jax.ops.segment_sum(
+            priorities,
+            group_ids,
+            num_segments=num_groups,
+        )
+        group_count_per_motion = group_counts[group_ids]
+        group_priority_per_motion = group_priority[group_ids]
+        uniform_within_group = 1.0 / jnp.maximum(group_count_per_motion, 1.0)
+        difficulty_within_group = jnp.where(
+            group_priority_per_motion > 0.0,
+            priorities / jnp.maximum(group_priority_per_motion, eps_div),
+            uniform_within_group,
+        )
+        group_mass = jnp.asarray(1.0 / num_groups, dtype=priorities.dtype)
+        weights_1d = group_mass * (
+            (1.0 - difficulty_mix) * uniform_within_group
+            + difficulty_mix * difficulty_within_group
+        )
+
+        if max_weight_ratio is not None:
+            balanced_uniform = group_mass * uniform_within_group
+            cap = max_weight_ratio * balanced_uniform
+            capped = jnp.minimum(weights_1d, cap)
+            capped_group_mass = jax.ops.segment_sum(
+                capped,
+                group_ids,
+                num_segments=num_groups,
+            )
+            capacity = jnp.maximum(cap - capped, 0.0)
+            group_capacity = jax.ops.segment_sum(
+                capacity,
+                group_ids,
+                num_segments=num_groups,
+            )
+            deficit = group_mass - capped_group_mass
+            weights_1d = capped + capacity * (
+                deficit[group_ids]
+                / jnp.maximum(group_capacity[group_ids], eps_div)
+            )
 
     return weights_1d, new_ema_done, new_ema_early, rate_hat
 
@@ -113,3 +188,63 @@ def compute_per_traj_termination_stats(
     early_counts = jax.ops.segment_sum(early_flat, traj_ids, num_segments=n_trajectories)
     term_rate = early_counts / jnp.maximum(done_counts, 1.0)
     return term_rate, done_counts, early_counts
+
+
+def compute_per_traj_difficulty_stats(
+    traj_state,
+    done: jnp.ndarray,
+    absorbing: jnp.ndarray,
+    trajectory_end: jnp.ndarray,
+    trajectory_split_points: jnp.ndarray,
+    n_trajectories: int,
+    late_failure_floor: float = 0.25,
+    excluded_transitions: jnp.ndarray | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Compute progress-aware difficulty evidence for each trajectory.
+
+    Only genuine motion outcomes contribute evidence: an absorbing transition
+    is a failure and reaching the end of a trajectory is a success. PPO horizon
+    timeouts are deliberately ignored rather than treated as motion successes.
+    Failure evidence ranges from 1.0 at the sampled start frame to
+    ``late_failure_floor`` at the final frame. Simulator-fault transitions can
+    be excluded explicitly so numerical resets are not mistaken for policy
+    failures and upweighted by the sampler.
+
+    Returns:
+        A tuple of per-trajectory difficulty rate, completed-outcome count, and
+        summed progress-aware failure evidence.
+    """
+    if not 0.0 <= late_failure_floor <= 1.0:
+        raise ValueError("late_failure_floor must be between 0 and 1")
+
+    traj_ids = traj_state.traj_no.flatten().astype(jnp.int32)
+    current_steps = traj_state.subtraj_step_no.flatten().astype(jnp.float32)
+    initial_steps = traj_state.subtraj_step_no_init.flatten().astype(jnp.float32)
+
+    split_points = jnp.asarray(trajectory_split_points)
+    trajectory_lengths = split_points[1:] - split_points[:-1]
+    final_steps = jnp.maximum(trajectory_lengths[traj_ids] - 1, 0).astype(jnp.float32)
+    available_steps = jnp.maximum(final_steps - initial_steps, 1.0)
+    progress = jnp.clip((current_steps - initial_steps) / available_steps, 0.0, 1.0)
+
+    done_flat = done.flatten()
+    absorbing_flat = absorbing.flatten()
+    trajectory_end_flat = trajectory_end.flatten()
+    if excluded_transitions is None:
+        valid_evidence = jnp.ones_like(done_flat, dtype=bool)
+    else:
+        valid_evidence = jnp.logical_not(excluded_transitions.flatten())
+    failures = done_flat & absorbing_flat & valid_evidence
+    outcomes = done_flat & (absorbing_flat | trajectory_end_flat) & valid_evidence
+    failure_scores = failures.astype(jnp.float32) * (
+        1.0 - (1.0 - late_failure_floor) * progress
+    )
+
+    outcome_counts = jax.ops.segment_sum(
+        outcomes.astype(jnp.float32), traj_ids, num_segments=n_trajectories
+    )
+    difficulty_sums = jax.ops.segment_sum(
+        failure_scores, traj_ids, num_segments=n_trajectories
+    )
+    difficulty_rate = difficulty_sums / jnp.maximum(outcome_counts, 1.0)
+    return difficulty_rate, outcome_counts, difficulty_sums

@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 
+from musclemimic.algorithms.common.inference import initialize_policy_state, make_policy_action_fn
 from .viser_tendons import ViserTendonLineRenderer
 
 
@@ -31,9 +32,9 @@ class ViserViewer:
 
         Args:
             env: MuJoCo environment instance (CPU, not MJX)
-            agent_conf: PPOJax agent configuration (network + config)
-            agent_state: PPOJax agent state with trained params
-            deterministic: If True, set log_std to -inf for deterministic actions
+            agent_conf: configured policy and experiment settings
+            agent_state: trained algorithm state
+            deterministic: If True, use the distribution mode
             frame_rate: Target FPS for visualization
             include_collision: If True, display collision geoms instead of visual geoms
         """
@@ -50,27 +51,11 @@ class ViserViewer:
         self._tendon_renderer = None
         self._paused = False
         self._time_multiplier = 1.0
+        self._reset_requested = False
 
     def _prepare_policy(self):
         """Create a jitted policy call matching MuscleMimic eval semantics."""
-
-        def sample_actions(ts, obs, _rng):
-            if hasattr(obs, "ndim") and obs.ndim == 1:
-                obs_b = jnp.atleast_2d(obs)
-            else:
-                obs_b = obs
-            vars_in = {"params": ts.params, "run_stats": ts.run_stats}
-            y, updates = self.agent_conf.network.apply(vars_in, obs_b, mutable=["run_stats"])
-            pi, _ = y
-            ts_out = ts.replace(run_stats=updates["run_stats"])
-            a = pi.sample(seed=_rng)
-            if hasattr(a, "ndim") and a.ndim > 1 and a.shape[0] == 1:
-                a = a[0]
-            return a, ts_out
-
         train_state = self.agent_state.train_state
-        if self.deterministic:
-            train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
 
         # Handle multi-seed agent state if present
         config = self.agent_conf.config.experiment
@@ -79,7 +64,7 @@ class ViserViewer:
             train_state = jax.tree.map(lambda x: x[0], train_state)
 
         rng = jax.random.key(0)
-        plcy_call = jax.jit(sample_actions)
+        plcy_call = make_policy_action_fn(self.agent_conf, deterministic=self.deterministic)
         return plcy_call, train_state, rng
 
     def _setup_viser(self, model: mujoco.MjModel):
@@ -114,10 +99,7 @@ class ViserViewer:
 
                 @reset_button.on_click
                 def _(_ev) -> None:
-                    self.env.reset()
-                    mujoco.mj_forward(model, self._get_data())
-                    self._sync_meshes(model, self._get_data())
-                    self._update_status()
+                    self._reset_requested = True
 
                 speed_buttons = self._server.gui.add_button_group("Speed", options=["Slower", "Faster"])
 
@@ -223,6 +205,7 @@ class ViserViewer:
         plcy_call, train_state, rng = self._prepare_policy()
 
         obs = self.env.reset()
+        policy_state, policy_reset = initialize_policy_state(self.agent_conf, obs)
         mujoco.mj_forward(model, data)
 
         self._setup_viser(model)
@@ -238,17 +221,28 @@ class ViserViewer:
             while step_count < n_steps:
                 t0 = time.time()
 
+                if self._reset_requested:
+                    obs = self.env.reset()
+                    policy_state, policy_reset = initialize_policy_state(self.agent_conf, obs)
+                    self._reset_requested = False
+                    mujoco.mj_forward(model, data)
+                    self._sync_meshes(model, data)
+
                 if not self._paused:
                     rng, _rng = jax.random.split(rng)
-                    action, train_state = plcy_call(train_state, obs, _rng)
+                    action, train_state, policy_state = plcy_call(
+                        train_state, obs, _rng, policy_state, policy_reset
+                    )
                     action = jnp.atleast_2d(action)
                     obs, _r, _abs, done, _info = self.env.step(action)
+                    policy_reset = jnp.asarray([bool(done)], dtype=bool)
 
                     mujoco.mj_forward(model, data)
                     self._sync_meshes(model, data)
 
                     if done:
                         obs = self.env.reset()
+                        policy_state, policy_reset = initialize_policy_state(self.agent_conf, obs)
                         mujoco.mj_forward(model, data)
                         self._sync_meshes(model, data)
 

@@ -56,6 +56,7 @@ from musclemimic.algorithms.common.env_utils import wrap_env
 from musclemimic.algorithms.common.optimizer import (
     linear_lr_schedule,
     warmup_cosine_lr_schedule,
+    warmup_hold_cosine_lr_schedule,
 )
 from musclemimic.algorithms.ppo.loss import (
     approx_kl,
@@ -505,6 +506,17 @@ def train(
                         base_lr, config.num_updates, config.get("warmup_steps", None),
                         config.get("min_lr_ratio", 0.0),
                     )
+                elif lr_type == "warmup_hold_cosine":
+                    current_lr = warmup_hold_cosine_lr_schedule(
+                        train_state.step,
+                        config.num_minibatches,
+                        config.update_epochs,
+                        base_lr,
+                        config.num_updates,
+                        config.get("warmup_steps", None),
+                        config.get("hold_fraction", 0.5),
+                        config.get("min_lr_ratio", 0.0),
+                    )
                 else:
                     current_lr = linear_lr_schedule(
                         train_state.step, config.num_minibatches, config.update_epochs,
@@ -604,6 +616,7 @@ def train(
                         "reward/qpos": float(train_m.reward_qpos),
                         "reward/qvel": float(train_m.reward_qvel),
                         "reward/root_pos": float(train_m.reward_root_pos),
+                        "reward/root_quat": float(train_m.reward_root_quat),
                         "reward/rpos": float(train_m.reward_rpos),
                         "reward/rquat": float(train_m.reward_rquat),
                         "reward/rvel_rot": float(train_m.reward_rvel_rot),
@@ -1062,6 +1075,7 @@ def _compute_training_metrics(traj_batch, config):
     reward_qpos = jnp.mean(info["reward_qpos"])
     reward_qvel = jnp.mean(info["reward_qvel"])
     reward_root_pos = jnp.mean(info["reward_root_pos"])
+    reward_root_quat = jnp.mean(info["reward_root_quat"])
     reward_rpos = jnp.mean(info["reward_rpos"])
     reward_rquat = jnp.mean(info["reward_rquat"])
     reward_rvel_rot = jnp.mean(info["reward_rvel_rot"])
@@ -1097,6 +1111,7 @@ def _compute_training_metrics(traj_batch, config):
         reward_qpos=reward_qpos,
         reward_qvel=reward_qvel,
         reward_root_pos=reward_root_pos,
+        reward_root_quat=reward_root_quat,
         reward_rpos=reward_rpos,
         reward_rquat=reward_rquat,
         reward_rvel_rot=reward_rvel_rot,

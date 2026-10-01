@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import time
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import mujoco
@@ -10,11 +14,16 @@ import mujoco.viewer
 import numpy as np
 from omegaconf import OmegaConf, open_dict
 
-from musclemimic.algorithms import PPOAgentState
 from musclemimic.algorithms.common.checkpoint_manager import UnifiedCheckpointManager
-from musclemimic.algorithms.ppo.checkpoint import create_agent_state_from_orbax
 from musclemimic.algorithms.common.env_utils import wrap_env
-from musclemimic.algorithms.ppo.inference import ObservationHistoryBuffer
+from musclemimic.algorithms.common.inference import (
+    initialize_policy_state,
+    make_policy_action_fn,
+)
+from musclemimic.algorithms.ppo.checkpoint import create_agent_state_from_orbax
+from musclemimic.algorithms.ppo.inference import (
+    ObservationHistoryBuffer,
+)
 from musclemimic.algorithms.ppo.runner import _run_validation
 from musclemimic.runner.engine import build_metrics_handler, instantiate_validation_env
 from musclemimic.utils import detect_headless_environment, setup_headless_rendering_if_needed
@@ -149,6 +158,19 @@ def normalize_eval_args(args: argparse.Namespace) -> None:
         raise ValueError("--traj_start_step requires --traj_index")
 
 
+def apply_configured_evaluation_backend(args: argparse.Namespace, config) -> bool:
+    """Apply a checkpoint's evaluation backend, returning whether it changed the CLI."""
+    backend = config.experiment.get("evaluation_backend", None)
+    if backend is None:
+        return False
+    if backend != "mujoco":
+        raise ValueError(f"Unsupported evaluation_backend: {backend!r}")
+
+    changed = not args.use_mujoco
+    args.use_mujoco = True
+    return changed
+
+
 def validate_viewer_args(args: argparse.Namespace) -> str | None:
     if args.mujoco_viewer and not args.use_mujoco:
         return "Error: --mujoco_viewer requires --use_mujoco"
@@ -187,9 +209,12 @@ def load_checkpoint(path: str):
 
     checkpoint_dir = os.path.dirname(resolved_path) if os.path.isdir(resolved_path) else os.path.dirname(os.path.abspath(resolved_path))
     manager = UnifiedCheckpointManager(checkpoint_dir, max_to_keep=5)
-    (loaded_conf, loaded_state), metadata = manager.load_checkpoint(resolved_path)
+    try:
+        (loaded_conf, loaded_state), metadata = manager.load_checkpoint(resolved_path)
+    finally:
+        manager.close()
     config = OmegaConf.create(loaded_conf)
-    agent_state = create_agent_state_from_orbax(loaded_state)
+    agent_state = SimpleNamespace(train_state=loaded_state)
     return config, agent_state, metadata
 
 
@@ -261,12 +286,27 @@ def configure_recording(
     return tag
 
 
-def align_agent_state(agent_state, agent_conf) -> PPOAgentState:
-    train_state = agent_state.train_state.replace(
-        apply_fn=agent_conf.network.apply,
-        tx=agent_conf.tx,
-    )
-    return PPOAgentState(train_state=train_state)
+def align_agent_state(agent_state, agent_conf):
+    """Restore the checkpoint state using the selected algorithm's typed state."""
+    from musclemimic.algorithms.flashsac.checkpoint import restore_train_state
+    from musclemimic.algorithms.flashsac.config import FlashSACAgentConf
+    from musclemimic.algorithms.flashsac.state import FlashSACAgentState
+    from musclemimic.algorithms.ppo.config import PPOAgentConf, PPOAgentState
+
+    state_data = agent_state.train_state
+    if isinstance(agent_conf, FlashSACAgentConf):
+        return FlashSACAgentState(
+            train_state=restore_train_state(state_data, agent_conf)
+        )
+    if isinstance(agent_conf, PPOAgentConf):
+        restored = create_agent_state_from_orbax(state_data)
+        return PPOAgentState(
+            train_state=restored.train_state.replace(
+                apply_fn=agent_conf.network.apply,
+                tx=agent_conf.tx,
+            )
+        )
+    raise TypeError(f"Unsupported agent configuration: {type(agent_conf).__name__}")
 
 
 def verify_env_dt(env, expected_dt: float) -> None:
@@ -328,6 +368,7 @@ def format_trajectory_listing(env, limit: int | None) -> list[str]:
 def run_validation_metrics(
     config,
     agent_state,
+    agent_conf,
     train_state_seed: int | None,
     num_steps: int | None = None,
     num_envs: int | None = None,
@@ -365,14 +406,30 @@ def run_validation_metrics(
 
     rng = jax.random.key(eval_seed)
 
-    validation_metrics, _ = _run_validation(
-        train_state=train_state,
-        val_rng=rng,
-        val_env=val_env,
-        config=config.experiment,
-        mh=mh,
-        counter=jnp.asarray(0),
-    )
+    from musclemimic.algorithms.flashsac.config import FlashSACAgentConf
+
+    if isinstance(agent_conf, FlashSACAgentConf):
+        from musclemimic.algorithms.flashsac.validation import run_validation
+
+        validation_metrics, _ = run_validation(
+            agent_conf,
+            train_state,
+            rng,
+            val_env,
+            config.experiment,
+            mh,
+            jnp.asarray(config.experiment.validation_interval),
+        )
+    else:
+        validation_metrics, _ = _run_validation(
+            train_state=train_state,
+            val_rng=rng,
+            val_env=val_env,
+            config=config.experiment,
+            mh=mh,
+            counter=jnp.asarray(0),
+            network=agent_conf.network,
+        )
     if deterministic_override is not None:
         with open_dict(config.experiment.validation):
             config.experiment.validation.deterministic = original_deterministic
@@ -391,7 +448,6 @@ def run_validation_metrics_mjx_all(
     eval_seed: int = 0,
 ) -> dict[str, float]:
     """Evaluate every trajectory with the MJX GPU path."""
-    from musclemimic.algorithms.ppo.runner import _run_validation_all
     from musclemimic.core.wrappers import LogWrapper, NStepWrapper, VecEnv
 
     config = agent_conf.config.experiment
@@ -429,16 +485,33 @@ def run_validation_metrics_mjx_all(
     print(f"MJX evaluate_all: {env.th.n_trajectories} trajectories, "
           f"batch_size={num_envs}, max_traj_len={max_traj_len}")
 
-    metrics = _run_validation_all(
-        network=agent_conf.network,
-        params=train_state.params,
-        run_stats=train_state.run_stats,
-        traj_env=inner_env,
-        val_env=val_env,
-        num_envs=num_envs,
-        deterministic=deterministic,
-        eval_seed=eval_seed,
-    )
+    from musclemimic.algorithms.flashsac.config import FlashSACAgentConf
+
+    if isinstance(agent_conf, FlashSACAgentConf):
+        from musclemimic.algorithms.flashsac.validation import run_validation_all
+
+        metrics = run_validation_all(
+            agent_conf=agent_conf,
+            train_state=train_state,
+            trajectory_env=inner_env,
+            env=val_env,
+            num_envs=num_envs,
+            deterministic=deterministic,
+            eval_seed=eval_seed,
+        )
+    else:
+        from musclemimic.algorithms.ppo.runner import _run_validation_all
+
+        metrics = _run_validation_all(
+            network=agent_conf.network,
+            params=train_state.params,
+            run_stats=train_state.run_stats,
+            traj_env=inner_env,
+            val_env=val_env,
+            num_envs=num_envs,
+            deterministic=deterministic,
+            eval_seed=eval_seed,
+        )
     return metrics
 
 
@@ -488,18 +561,7 @@ def run_validation_metrics_mujoco(
             raise ValueError("Loaded train state has multiple seeds; specify train_state_seed.")
         train_state = jax.tree.map(lambda x: x[train_state_seed], train_state)
 
-    def sample_actions(ts, obs, _rng):
-        obs_b = jnp.atleast_2d(obs) if hasattr(obs, "ndim") and obs.ndim == 1 else obs
-        vars_in = {"params": ts.params, "run_stats": ts.run_stats}
-        y, updates = agent_conf.network.apply(vars_in, obs_b, mutable=["run_stats"])
-        pi, _ = y
-        ts_out = ts.replace(run_stats=updates["run_stats"])
-        a = pi.mode() if deterministic else pi.sample(seed=_rng)
-        if hasattr(a, "ndim") and a.ndim > 1 and a.shape[0] == 1:
-            a = a[0]
-        return a, ts_out
-
-    policy_fn = jax.jit(sample_actions)
+    policy_fn = make_policy_action_fn(agent_conf, deterministic=deterministic)
     rng = jax.random.key(eval_seed)
 
     step_metric_sums = {key: 0.0 for key in VALIDATION_STEP_METRIC_KEYS}
@@ -523,13 +585,16 @@ def run_validation_metrics_mujoco(
 
     for traj_idx in episode_traj_indices:
         obs = _reset_cpu_validation_episode(env, traj_idx)
+        policy_state, policy_reset = initialize_policy_state(agent_conf, obs)
 
         episode_return = 0.0
         episode_length = 0
 
         while True:
             rng, _rng = jax.random.split(rng)
-            action, train_state = policy_fn(train_state, obs, _rng)
+            action, train_state, policy_state = policy_fn(
+                train_state, obs, _rng, policy_state, policy_reset
+            )
             action = jnp.atleast_2d(action)
 
             obs, reward, absorbing, done, info = env.step(action)
@@ -591,20 +656,8 @@ def run_with_mujoco_viewer(env, agent_conf, agent_state, n_steps=None, determini
     """
     print("Using default MuJoCo viewer with control signal overlays...")
 
-    def sample_actions(ts, obs, _rng):
-        y, updates = agent_conf.network.apply(
-            {"params": ts.params, "run_stats": ts.run_stats}, obs, mutable=["run_stats"]
-        )
-        ts = ts.replace(run_stats=updates["run_stats"])
-        pi, _ = y
-        a = pi.sample(seed=_rng)
-        return a, ts
-
     config = agent_conf.config.experiment
     train_state = agent_state.train_state
-
-    if deterministic:
-        train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
 
     if config.n_seeds > 1:
         assert train_state_seed is not None, (
@@ -641,11 +694,12 @@ def run_with_mujoco_viewer(env, agent_conf, agent_state, n_steps=None, determini
     )
 
     rng = jax.random.key(0)
-    plcy_call = jax.jit(sample_actions)
+    plcy_call = make_policy_action_fn(agent_conf, deterministic=deterministic)
 
     obs = env.reset()
     if obs_buffer is not None:
         obs = obs_buffer.reset(obs)
+    policy_state, policy_reset = initialize_policy_state(agent_conf, obs)
 
     if n_steps is None:
         n_steps = np.iinfo(np.int32).max
@@ -690,10 +744,13 @@ def run_with_mujoco_viewer(env, agent_conf, agent_state, n_steps=None, determini
 
         while viewer.is_running() and step_count < n_steps:
             rng, _rng = jax.random.split(rng)
-            action, train_state = plcy_call(train_state, obs, _rng)
+            action, train_state, policy_state = plcy_call(
+                train_state, obs, _rng, policy_state, policy_reset
+            )
             action = jnp.atleast_2d(action)
 
             obs, reward, absorbing, done, info = env.step(action)
+            policy_reset = jnp.asarray([bool(done)], dtype=bool)
             if obs_buffer is not None:
                 obs = obs_buffer.step(obs)
 
@@ -706,6 +763,7 @@ def run_with_mujoco_viewer(env, agent_conf, agent_state, n_steps=None, determini
                 obs = env.reset()
                 if obs_buffer is not None:
                     obs = obs_buffer.reset(obs)
+                policy_state, policy_reset = initialize_policy_state(agent_conf, obs)
 
             time.sleep(0.001)
 
@@ -722,28 +780,32 @@ def run_with_trajectory_export(
     train_state_seed=None,
     trajectory_dir="./trajectory_data",
     file_prefix="episodes",
+    evaluate_all=False,
+    evaluate_all_passes=1,
+    motion_group=None,
 ):
     """
     Run evaluation and export trajectory data for individual episodes in a single NPZ file.
+
+    When ``evaluate_all`` is True, the exporter walks the entire dataset in order,
+    running one episode per trajectory (traj 0, 1, ..., n_trajectories-1) starting
+    from the beginning of each. ``evaluate_all_passes`` repeats that full sweep that
+    many times (default 1); with stochastic action sampling each pass yields a
+    different rollout, which is useful for measuring variability. Otherwise trajectory
+    selection follows the environment's trajectory-handler settings (e.g. random start).
+
+    ``motion_group`` (the dataset split the rollouts were run over, e.g.
+    ``GAIT120_TESTING_SUBJECTS_TRIALS0104``) is only used to name the output: when set, a
+    second copy of the NPZ is written with the motion-group name concatenated into the
+    filename, so rollouts of the same policy over different motion sets don't overwrite each
+    other and can be told apart. The un-tagged file is always written too.
     """
     print("Running evaluation with multi-episode trajectory export...")
 
     os.makedirs(trajectory_dir, exist_ok=True)
 
-    def sample_actions(ts, obs, _rng):
-        y, updates = agent_conf.network.apply(
-            {"params": ts.params, "run_stats": ts.run_stats}, obs, mutable=["run_stats"]
-        )
-        ts = ts.replace(run_stats=updates["run_stats"])
-        pi, _ = y
-        a = pi.sample(seed=_rng)
-        return a, ts
-
     config = agent_conf.config.experiment
     train_state = agent_state.train_state
-
-    if deterministic:
-        train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
 
     if config.n_seeds > 1:
         assert train_state_seed is not None, (
@@ -780,7 +842,7 @@ def run_with_trajectory_export(
     )
 
     rng = jax.random.key(0)
-    plcy_call = jax.jit(sample_actions)
+    plcy_call = make_policy_action_fn(agent_conf, deterministic=deterministic)
 
     env_data = None
     if hasattr(env, "data"):
@@ -820,6 +882,21 @@ def run_with_trajectory_export(
     if n_steps is None:
         n_steps = np.iinfo(np.int32).max
 
+    # When evaluating the whole dataset, iterate trajectories sequentially
+    # (traj 0..n-1) starting from the beginning of each, one episode per traj,
+    # repeating the full sweep `evaluate_all_passes` times.
+    num_trajectories = None
+    num_evaluate_all_episodes = None
+    if evaluate_all:
+        num_trajectories = _prepare_cpu_evaluate_all(env)
+        n_passes = max(1, int(evaluate_all_passes))
+        num_evaluate_all_episodes = num_trajectories * n_passes
+        # Ignore the global step budget in evaluate-all mode: each trajectory runs
+        # to completion and the sweep ends once every trajectory has been covered.
+        n_steps = np.iinfo(np.int32).max
+        print(f"Evaluate-all: iterating {num_trajectories} trajectories sequentially from the beginning, "
+              f"{n_passes} pass(es) ({num_evaluate_all_episodes} episodes total)")
+
     print(f"Collecting episodes for {len(joint_names)} joints over {n_steps} total steps")
     print(f"Environment dt: {env.dt:.6f}")
 
@@ -836,12 +913,21 @@ def run_with_trajectory_export(
             touch_indexes.append(obs.obs_ind)
 
     while total_step_count < n_steps:
+        # Stop once every trajectory has been evaluated the requested number of passes.
+        if num_evaluate_all_episodes is not None and episode_id >= num_evaluate_all_episodes:
+            break
+
         print(f"\n--- Starting Episode {episode_id} ---")
 
-        obs = env.reset()
+        if num_trajectories is not None:
+            # Wrap the trajectory index so each pass replays traj 0..n-1 in order.
+            obs = _reset_cpu_validation_episode(env, episode_id % num_trajectories)
+        else:
+            obs = env.reset()
         if obs_buffer is not None:
             obs = obs_buffer.reset(obs)
-        
+        policy_state, policy_reset = initialize_policy_state(agent_conf, obs)
+
         print(f"Trajectory {env.th.new_traj_no}")
         print(f"Starting from {env.th.new_subtraj_step_no_init}/ {env.th.len_trajectory(env.th.new_traj_no) - 1}")
         episode_traj_qpos = []
@@ -868,7 +954,9 @@ def run_with_trajectory_export(
 
         while total_step_count < n_steps:
             rng, _rng = jax.random.split(rng)
-            action, train_state = plcy_call(train_state, obs, _rng)
+            action, train_state, policy_state = plcy_call(
+                train_state, obs, _rng, policy_state, policy_reset
+            )
             action = jnp.atleast_2d(action)
 
             # episode_observations.append(np.array(obs))
@@ -880,6 +968,7 @@ def run_with_trajectory_export(
             episode_timesteps.append(episode_step_count * env.dt)
 
             obs, reward, absorbing, done, info = env.step(action)
+            policy_reset = jnp.asarray([bool(done)], dtype=bool)
             if obs_buffer is not None:
                 obs = obs_buffer.step(obs)
 
@@ -953,9 +1042,8 @@ def run_with_trajectory_export(
         }
     )
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
     backend_name = "mujoco" if use_mujoco else "mjx"
-    filename = f"{file_prefix}_{backend_name}_{timestamp}.npz"
+    filename = f"{file_prefix}_{backend_name}_{motion_group}.npz"
     filepath = os.path.join(trajectory_dir, filename)
 
     np.savez_compressed(filepath, **all_episodes)

@@ -1,14 +1,33 @@
 import pickle
-from pathlib import Path
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from flax import struct
 
 from musclemimic.algorithms.common.optimizer import (
     linear_lr_schedule,
     warmup_cosine_lr_schedule,
+    warmup_hold_cosine_lr_schedule,
 )
 from musclemimic.utils.metrics import MetricsHandler
+
+
+@dataclass(frozen=True)
+class JaxTrainingInvocation:
+    """A JIT-compiled training call with explicit dynamic runtime arguments.
+
+    Large restored states must be passed to ``jax.jit`` as arguments. Closing
+    over them turns every array in the checkpoint into a compiler constant,
+    which can make resume compilation consume tens of gigabytes. Dynamic
+    arguments that are replaced by the result may also be donated so JAX can
+    reuse their device storage instead of retaining a second full copy.
+    """
+
+    train_fn: Callable[..., Any]
+    dynamic_args: tuple[Any, ...] = ()
+    donate_argnums: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,6 +102,31 @@ class JaxRLAlgorithmBase:
             logging_interval=logging_interval,
             val_env=val_env,
         )
+
+    @classmethod
+    def build_training(
+        cls,
+        env,
+        agent_conf: AgentConfBase,
+        *,
+        metrics_handler: MetricsHandler | None = None,
+        val_env=None,
+        **_kwargs,
+    ):
+        """Prepare a pure training object for host-coordinated runtimes."""
+        raise NotImplementedError
+
+    @classmethod
+    def build_runtime_state_restore_target(
+        cls,
+        rng,
+        env,
+        agent_conf,
+        *,
+        local_num_envs=None,
+    ):
+        """Build an algorithm-specific exact-resume runtime target."""
+        raise NotImplementedError
 
     @classmethod
     def build_resume_train_fn(cls, env, agent_conf: AgentConfBase, mh: MetricsHandler = None):
@@ -174,5 +218,28 @@ class JaxRLAlgorithmBase:
             lr,
             num_updates,
             warmup_steps,
+            min_lr_ratio,
+        )
+
+    @classmethod
+    def _warmup_hold_cosine_lr_schedule(
+        cls,
+        count,
+        num_minibatches,
+        update_epochs,
+        lr,
+        num_updates,
+        warmup_steps=None,
+        hold_fraction=0.5,
+        min_lr_ratio=0.0,
+    ):
+        return warmup_hold_cosine_lr_schedule(
+            count,
+            num_minibatches,
+            update_epochs,
+            lr,
+            num_updates,
+            warmup_steps,
+            hold_fraction,
             min_lr_ratio,
         )

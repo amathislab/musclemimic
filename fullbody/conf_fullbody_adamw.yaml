@@ -1,0 +1,15 @@
+# MyoFullBody with AdamW optimizer
+# Inherits from conf_fullbody.yaml and switches to AdamW
+defaults:
+  - conf_fullbody
+  - _self_
+
+wandb:
+  tags: ["fullbody", "adamw"]
+
+experiment:
+  # AdamW uses lower learning rate
+  lr: 4e-5
+
+  # Switch to AdamW optimizer
+  optimizer_type: "adamw"

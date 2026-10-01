@@ -12,7 +12,7 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import mujoco
-from scipy.interpolate import interp1d
+from scipy.interpolate import PchipInterpolator, interp1d
 from scipy.spatial.transform import Slerp, Rotation
 from tqdm import tqdm
 from typing import Union
@@ -102,12 +102,7 @@ class Trajectory:
     obs_container: ObservationContainer = None
 
     @staticmethod
-    def concatenate(trajs: list[Trajectory], backend: ModuleType = jnp) -> Trajectory:
-        """Concatenate trajectories with the same structure.
-
-        Metadata is provenance, so it is ignored for compatibility and cleared
-        when multiple trajectories are combined.
-        """
+    def concatenate(trajs: list, backend: ModuleType = jnp):
         traj_data = [traj.data for traj in trajs]
         traj_info = [traj.info for traj in trajs]
         traj_data, traj_info = TrajectoryData.concatenate(traj_data, traj_info, backend)
@@ -199,37 +194,6 @@ class Trajectory:
         return cls(**_all)
 
 
-@dataclass(frozen=True)
-class LoadedTrajectorySet:
-    """A trajectory batch paired with one source name per trajectory."""
-
-    trajectory: Trajectory
-    motion_names: tuple[str | None, ...]
-
-    def __post_init__(self):
-        motion_names = tuple(None if name is None else str(name) for name in self.motion_names)
-        n_trajectories = int(self.trajectory.data.n_trajectories)
-        if len(motion_names) != n_trajectories:
-            raise ValueError(f"Expected {n_trajectories} motion names, got {len(motion_names)}.")
-        object.__setattr__(self, "motion_names", motion_names)
-
-    @classmethod
-    def concatenate(
-        cls,
-        loaded_sets: list[LoadedTrajectorySet],
-        backend: ModuleType = jnp,
-    ) -> LoadedTrajectorySet:
-        if not loaded_sets:
-            raise ValueError("At least one loaded trajectory set is required.")
-
-        trajectory = Trajectory.concatenate(
-            [loaded.trajectory for loaded in loaded_sets],
-            backend=backend,
-        )
-        motion_names = tuple(name for loaded in loaded_sets for name in loaded.motion_names)
-        return cls(trajectory, motion_names)
-
-
 @dataclass
 class TrajectoryInfo:
     """
@@ -240,7 +204,6 @@ class TrajectoryInfo:
     frequency: float
     body_names: list[str] = None
     site_names: list[str] = None
-    # Cache provenance; not part of the trajectory structure.
     metadata: dict = None
 
     def __post_init__(self):
@@ -806,8 +769,8 @@ class TrajectoryData(SingleData):
             return arr[ind].copy() if arr.size > 0 else backend.zeros(batch_shape + (0, dim), dtype=dtype)
 
         def _vector(arr, dim):
-            """Vector array: (..., D); keep absent caches empty."""
-            return arr[ind].copy() if arr.size > 0 else backend.empty(0, dtype=dtype)
+            """Vector array: (..., D) -> empty: (*batch, 0, D)."""
+            return arr[ind].copy() if arr.size > 0 else backend.zeros((*batch_shape, 0, dim), dtype=dtype)
 
         return SingleData(
             qpos=ref, qvel=self.qvel[ind].copy(),
@@ -831,8 +794,8 @@ class TrajectoryData(SingleData):
             return _slice(arr) if arr.size > 0 else backend.zeros((slice_length, 0, dim), dtype=dtype)
 
         def _vector(arr, dim):
-            """Vector array: (T, D); keep absent caches empty."""
-            return _slice(arr) if arr.size > 0 else backend.empty(0, dtype=dtype)
+            """Vector array: (T, D) -> empty: (slice_length, 0, D)."""
+            return _slice(arr) if arr.size > 0 else backend.zeros((slice_length, 0, dim), dtype=dtype)
 
         return data.replace(
             qpos=_slice(data.qpos), qvel=_slice(data.qvel),
@@ -1102,14 +1065,27 @@ class TrajectoryData(SingleData):
 
     @staticmethod
     def concatenate(traj_datas: list, traj_infos: list, backend: ModuleType = jnp):
-        """Concatenate data with the same trajectory structure."""
+        """
+        Concatenate a list of TrajectoryData instances given that the TrajectoryInfos are equivalent.
+
+        Args:
+            traj_datas (list): List of TrajectoryData instances to concatenate.
+            traj_infos (list): List of TrajectoryInfo instances to concatenate.
+            backend: Backend to use for the computation.
+
+        Returns:
+            New instance of TrajectoryData and TrajectoryInfo containing the concatenated data.
+        """
         assert len(traj_datas) == len(traj_infos), "TrajectoryData and TrajectoryInfo must have the same length!"
 
+        # Keep concatenation strict on semantic structure, but tolerate small
+        # cache-induced drift in static float-valued model fields.
         assert all(
             _traj_infos_compatible_for_concat(info, traj_infos[0], backend=backend)
             for info in traj_infos
         ), "TrajectoryInfos must be compatible for concatenation!"
 
+        # create new TrajectoryData
         new_split_points = []
         curr_n_samples = 0
         for i, data in enumerate(traj_datas):
@@ -1150,10 +1126,15 @@ class TrajectoryData(SingleData):
             site_xmat=concatenate_optional("site_xmat"),
             split_points=new_split_points
         )
-        combined_info = traj_infos[0]
-        if len(traj_infos) > 1:
-            combined_info = replace(combined_info, metadata=None)
-        return new_traj_data, combined_info
+        # Metadata contains trajectory-local diagnostics (for example, frame
+        # indices corrected during retargeting), not structural information.
+        # Keeping the first trajectory's metadata would incorrectly describe
+        # the combined result, so retain it only when it is genuinely common.
+        common_metadata = traj_infos[0].metadata
+        if any(info.metadata != common_metadata for info in traj_infos[1:]):
+            common_metadata = None
+        new_traj_info = replace(traj_infos[0], metadata=common_metadata)
+        return new_traj_data, new_traj_info
 
     def len_trajectory(self, traj_ind):
         return self.split_points[traj_ind+1] - self.split_points[traj_ind]
@@ -1183,7 +1164,13 @@ class TrajectoryData(SingleData):
         return TrajectoryData(**dic)
 
 
-def interpolate_trajectories(traj_data: TrajectoryData, traj_info: TrajectoryInfo, new_frequency: float, backend: ModuleType = jnp):
+def interpolate_trajectories(
+    traj_data: TrajectoryData,
+    traj_info: TrajectoryInfo,
+    new_frequency: float,
+    backend: ModuleType = jnp,
+    bounded_qpos_ranges: dict[int, tuple[float, float] | tuple[float, float, bool]] | None = None,
+):
     """
     Interpolate the trajectories to a new frequency.
 
@@ -1268,8 +1255,20 @@ def interpolate_trajectories(traj_data: TrajectoryData, traj_info: TrajectoryInf
         traj_info = replace(traj_info, frequency=new_frequency)
         return new_traj_data, traj_info
 
-    # Slow path: spline/slerp interpolation for non-integer ratios
+    # Slow path: cubic/SLERP interpolation for non-integer ratios. For declared bounded
+    # scalar coordinates, a shape-preserving cubic is used only at samples where the
+    # ordinary cubic would cross that bound. This keeps the established interpolation
+    # everywhere else while avoiding synthetic joint-limit violations.
     new_traj_datas = []
+    rescued_frame_masks = []
+    rescued_angular_frame_masks = []
+    rescued_material_angular_frame_masks = []
+    rescued_value_count = 0
+    rescued_angular_value_count = 0
+    rescued_material_angular_value_count = 0
+    rescue_max_abs = 0.0
+    rescue_angular_max_abs = 0.0
+    material_angular_threshold = float(np.deg2rad(0.05))
     for i in tqdm(range(traj_data.n_trajectories), desc="Resampling trajectories"):
         traj_len = traj_data.len_trajectory(i)
         traj_data_slice = TrajectoryData.dynamic_slice_in_dim(traj_data, i, 0, traj_len)
@@ -1293,10 +1292,10 @@ def interpolate_trajectories(traj_data: TrajectoryData, traj_info: TrajectoryInf
             arr_np = np.asarray(arr)
             if arr_np.shape[0] == 1:
                 return backend.array(np.repeat(arr_np, x_new_len, axis=0), dtype=dtype)
-            return backend.array(
-                interp1d(np.asarray(x), arr_np, kind=interp_kind, axis=0)(np.asarray(x_new)),
-                dtype=dtype,
-            )
+            values = interp1d(
+                np.asarray(x), arr_np, kind=interp_kind, axis=0
+            )(np.asarray(x_new))
+            return backend.array(values, dtype=dtype)
 
         def set_qpos_columns(qpos_arr, ids, values):
             if backend == jnp:
@@ -1307,10 +1306,77 @@ def interpolate_trajectories(traj_data: TrajectoryData, traj_info: TrajectoryInf
         # do slerp interpolation for free joint orientation
         qpos_free_joint_quat_ids = [k[3:] for k in traj_info.joint_name2ind_qpos.values() if len(k) > 1]
         qpos_free_joint_quat_ids_flat = [item for sublist in qpos_free_joint_quat_ids for item in sublist]
-        qpos_other_ids = backend.array([k for k in range(traj_data.qpos.shape[-1])
-                                    if k not in qpos_free_joint_quat_ids_flat])
+        qpos_other_ids_np = np.asarray(
+            [
+                k
+                for k in range(traj_data.qpos.shape[-1])
+                if k not in qpos_free_joint_quat_ids_flat
+            ],
+            dtype=int,
+        )
+        qpos_other_ids = backend.array(qpos_other_ids_np)
         qpos = backend.zeros((x_new.shape[0], traj_data_slice.qpos.shape[-1]), dtype=traj_data_slice.qpos.dtype)
-        qpos = set_qpos_columns(qpos, qpos_other_ids, interpolate_array(traj_data_slice.qpos[:, qpos_other_ids]))
+        qpos_other = np.asarray(
+            interpolate_array(traj_data_slice.qpos[:, qpos_other_ids])
+        ).copy()
+        rescued = np.zeros(x_new_len, dtype=bool)
+        rescued_angular = np.zeros(x_new_len, dtype=bool)
+        rescued_material_angular = np.zeros(x_new_len, dtype=bool)
+        if bounded_qpos_ranges:
+            local_column = {int(qpos_id): i for i, qpos_id in enumerate(qpos_other_ids_np)}
+            for qpos_id, range_spec in bounded_qpos_ranges.items():
+                low, high = float(range_spec[0]), float(range_spec[1])
+                angular = bool(range_spec[2]) if len(range_spec) > 2 else True
+                column = local_column.get(int(qpos_id))
+                if column is None:
+                    continue
+                cubic = qpos_other[:, column]
+                outside = (cubic < low) | (cubic > high)
+                if not np.any(outside):
+                    continue
+                if angular:
+                    source = np.asarray(
+                        traj_data_slice.qpos[:, int(qpos_id)], dtype=float
+                    )
+                    if traj_len >= 3:
+                        replacement = PchipInterpolator(
+                            np.asarray(x), source, axis=0
+                        )(np.asarray(x_new))
+                    else:
+                        replacement = interp1d(
+                            np.asarray(x), source, kind="linear", axis=0
+                        )(np.asarray(x_new))
+                else:
+                    # Preserve the old output exactly for constrained slide coordinates;
+                    # the shape-preserving correction is only an angular-pose fix.
+                    replacement = cubic
+                replacement = np.clip(replacement, low, high)
+                correction = replacement[outside] - cubic[outside]
+                qpos_other[outside, column] = replacement[outside]
+                rescued |= outside
+                rescued_value_count += int(outside.sum())
+                rescue_max_abs = max(
+                    rescue_max_abs, float(np.max(np.abs(correction)))
+                )
+                if angular:
+                    material = outside.copy()
+                    material[outside] = (
+                        np.abs(correction) > material_angular_threshold
+                    )
+                    rescued_angular |= outside
+                    rescued_material_angular |= material
+                    rescued_angular_value_count += int(outside.sum())
+                    rescued_material_angular_value_count += int(material.sum())
+                    rescue_angular_max_abs = max(
+                        rescue_angular_max_abs,
+                        float(np.max(np.abs(correction))),
+                    )
+        rescued_frame_masks.append(rescued)
+        rescued_angular_frame_masks.append(rescued_angular)
+        rescued_material_angular_frame_masks.append(rescued_material_angular)
+        qpos = set_qpos_columns(
+            qpos, qpos_other_ids, backend.array(qpos_other, dtype=traj_data_slice.qpos.dtype)
+        )
         for quat_ids in qpos_free_joint_quat_ids:
             quat_ids = backend.array(quat_ids)
             qpos = set_qpos_columns(
@@ -1339,6 +1405,38 @@ def interpolate_trajectories(traj_data: TrajectoryData, traj_info: TrajectoryInf
 
     traj_info = replace(traj_info, frequency=new_frequency)
     new_traj_data, traj_info = TrajectoryData.concatenate(new_traj_datas, [traj_info] * len(new_traj_datas), backend)
+    if rescued_frame_masks:
+        rescued = np.concatenate(rescued_frame_masks)
+        rescued_angular = np.concatenate(rescued_angular_frame_masks)
+        rescued_material_angular = np.concatenate(
+            rescued_material_angular_frame_masks
+        )
+        metadata = dict(traj_info.metadata or {})
+        metadata.update(
+            {
+                "joint_range_interpolation_rescue_frame_count": int(rescued.sum()),
+                "joint_range_interpolation_rescue_value_count": rescued_value_count,
+                "joint_range_interpolation_rescue_max_abs": rescue_max_abs,
+                "joint_range_interpolation_rescue_frames": np.flatnonzero(rescued).tolist(),
+                "joint_range_interpolation_rescue_angular_frame_count": int(
+                    rescued_angular.sum()
+                ),
+                "joint_range_interpolation_rescue_angular_value_count": rescued_angular_value_count,
+                "joint_range_interpolation_rescue_angular_max_abs": rescue_angular_max_abs,
+                "joint_range_interpolation_rescue_angular_frames": np.flatnonzero(
+                    rescued_angular
+                ).tolist(),
+                "joint_range_interpolation_rescue_material_angular_threshold": material_angular_threshold,
+                "joint_range_interpolation_rescue_material_angular_frame_count": int(
+                    rescued_material_angular.sum()
+                ),
+                "joint_range_interpolation_rescue_material_angular_value_count": rescued_material_angular_value_count,
+                "joint_range_interpolation_rescue_material_angular_frames": np.flatnonzero(
+                    rescued_material_angular
+                ).tolist(),
+            }
+        )
+        traj_info = replace(traj_info, metadata=metadata)
     return new_traj_data, traj_info
 
 

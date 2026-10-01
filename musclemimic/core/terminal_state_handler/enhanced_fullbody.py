@@ -715,7 +715,11 @@ class MeanRelativeSiteDeviationWithRootTerminalStateHandler(TerminalStateHandler
 
         # Align the reference root to the per-episode XY origin used when the
         # simulator is initialized from trajectory data.
-        if self._root_qpos_ids_xy is not None and hasattr(env.th, "get_init_traj_data"):
+        if (
+            not getattr(env, "preserve_trajectory_root_xy", False)
+            and self._root_qpos_ids_xy is not None
+            and hasattr(env.th, "get_init_traj_data")
+        ):
             init_ref = env.th.get_init_traj_data(carry, backend)
             if hasattr(init_ref, "qpos"):
                 root_xy = init_ref.qpos[self._root_qpos_ids_xy]

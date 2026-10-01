@@ -1,0 +1,25 @@
+# MyoFullBody config with adaptive trajectory sampling
+# Prioritizes harder trajectories (higher early termination rate) during training
+#
+# Usage: python fullbody/train.py --config-name=conf_fullbody_adaptive
+defaults:
+  - conf_fullbody  # Inherit all base settings
+  - _self_
+
+wandb:
+  tags: ["fullbody", "adaptive-sampling"]
+
+experiment:
+  # Adaptive trajectory sampling based on early termination rate (count-EMA)
+  # Higher early termination rate -> higher sampling probability
+  adaptive_sampling:
+    enabled: true
+    # EMA decay rate: new_ema = (1-beta)*old_ema + beta*counts
+    # Higher beta = faster adaptation (noisier), lower = smoother estimates
+    beta: 0.2
+    alpha: 1.0          # Prioritization exponent (higher = more aggressive)
+    floor_mix: 0.1      # Uniform mixture floor (ensures all trajectories get some samples)
+    eps_div: 1e-6       # Division stability constant
+    eps_pow: 1e-6       # Power stability constant
+    ema_done_init: 10.0   # Pseudo-count prior for done EMA
+    ema_early_init: 5.0   # Pseudo-count prior for early termination EMA

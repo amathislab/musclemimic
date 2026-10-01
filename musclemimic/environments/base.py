@@ -1,6 +1,5 @@
 import warnings
-from collections.abc import Sequence
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import replace
 from types import ModuleType
 from typing import Any
@@ -22,6 +21,7 @@ from loco_mujoco.core.utils import info_property
 from loco_mujoco.core.utils.mujoco import mj_jntname2qposid
 from loco_mujoco.core.visuals import VideoRecorder
 from loco_mujoco.trajectory import Trajectory, TrajectoryHandler, TrajectoryTransitions, TrajState
+from loco_mujoco.trajectory.materialized_cache import mujoco_model_sha256
 from mujoco import MjData, MjModel, MjSpec
 from mujoco.mjx import Data, Model
 
@@ -43,6 +43,9 @@ class LocoCarry(MjxAdditionalCarry):
 
     traj_state: TrajState | None = None
     selected_traj_idx: jax.Array = struct.field(
+        default_factory=lambda: jnp.asarray(-1, dtype=jnp.int32)
+    )
+    selected_subtraj_step: jax.Array = struct.field(
         default_factory=lambda: jnp.asarray(-1, dtype=jnp.int32)
     )
     sampling_weights: jax.Array | None = None  # Shape (num_envs, n_traj) for weighted sampling
@@ -79,6 +82,7 @@ class LocoEnv(Mjx):
         default_camera_mode: str = "follow",
         th_params: dict = None,
         traj_params: dict = None,
+        preserve_trajectory_root_xy: bool = False,
         **core_params,
     ):
         """
@@ -90,6 +94,8 @@ class LocoEnv(Mjx):
             core_params (Dict): Dictionary of other core parameters.
 
         """
+
+        self.preserve_trajectory_root_xy = bool(preserve_trajectory_root_xy)
 
         if "geom_group_visualization_on_startup" not in core_params.keys():
             core_params["geom_group_visualization_on_startup"] = [0, 2]  # enable robot geom [0] and floor visual [2]
@@ -122,10 +128,10 @@ class LocoEnv(Mjx):
         self,
         traj: Trajectory = None,
         traj_path: str = None,
+        materialized_traj: Trajectory = None,
         warn: bool = True,
         cache_type="full",
         site_names=None,
-        motion_names: Sequence[str | None] | None = None,
     ) -> None:
         """
         Loads trajectories. If there were trajectories loaded already, this function overrides the latter.
@@ -137,7 +143,6 @@ class LocoEnv(Mjx):
                 with a 'traj_data' array and possibly a 'split_points' array inside. The 'traj_data'
                 should be in the shape (joints x observations). If traj_files is specified, this should be None.
             warn (bool): If True, a warning will be raised.
-            motion_names: Source name for each trajectory, in trajectory index order.
 
         """
 
@@ -150,13 +155,37 @@ class LocoEnv(Mjx):
             warn=warn,
             traj_path=traj_path,
             traj=traj,
+            materialized_traj=materialized_traj,
             control_dt=self.dt,
             cache_type=cache_type,
             site_names=site_names,
-            motion_names=motion_names,
             **th_params,
         )
 
+        self._initialize_from_trajectory_handler()
+
+    def install_shared_trajectory_handler(self, source: TrajectoryHandler) -> None:
+        """Install an independent handler that shares immutable trajectory arrays."""
+        if source.model_sha256 != mujoco_model_sha256(self._model):
+            raise ValueError("shared trajectory handler was materialized for a different MuJoCo model")
+        if not np.isclose(source.control_dt, self.dt, atol=1e-9):
+            raise ValueError("shared trajectory handler has a different control timestep")
+        cached_sites = source.traj.info.site_names
+        expected_sites = getattr(self, "sites_for_mimic", None)
+        if cached_sites is not None and expected_sites is not None and list(cached_sites) != list(expected_sites):
+            raise ValueError("shared trajectory handler has a different ordered mimic-site cache")
+        self.th = copy(source)
+        th_params = self._th_params or {}
+        for name in ("random_start", "fixed_start_conf", "start_from_random_step"):
+            if name in th_params:
+                setattr(self.th, name, th_params[name])
+        self.th.use_fixed_start = self.th.fixed_start_conf is not None
+        if self.th.use_fixed_start == bool(self.th.random_start):
+            raise ValueError("shared trajectory handler requires exactly one fixed or random start mode")
+        self._initialize_from_trajectory_handler()
+
+    def _initialize_from_trajectory_handler(self) -> None:
+        """Initialize every trajectory consumer after installing a handler."""
         if self.th.traj.obs_container is not None:
             assert self.obs_container == self.th.traj.obs_container, (
                 "Observation containers of trajectory and environment do not match. \n"
@@ -616,6 +645,9 @@ class LocoEnv(Mjx):
         Returns:
             MjData: The updated Mujoco data structure.
         """
+        if getattr(self, "preserve_trajectory_root_xy", False):
+            return Mjx.set_sim_state_from_traj_data(data, traj_data, carry)
+
         robot_free_jnt_name = self.root_free_joint_xml_name
         robot_free_jnt_qpos_id_xy = np.array(mj_jntname2qposid(robot_free_jnt_name, self._model))[:2]
         all_free_jnt_qpos_id_xy = self.free_jnt_qpos_id[:, :2].reshape(-1)
@@ -637,10 +669,12 @@ class LocoEnv(Mjx):
         Returns:
             Data: Updated Mujoco data.
         """
+        if getattr(self, "preserve_trajectory_root_xy", False):
+            return Mjx.mjx_set_sim_state_from_traj_data(data, traj_data, carry)
+
         robot_free_jnt_name = self.root_free_joint_xml_name
         robot_free_jnt_qpos_id_xy = np.array(mj_jntname2qposid(robot_free_jnt_name, self._model))[:2]
         all_free_jnt_qpos_id_xy = self.free_jnt_qpos_id[:, :2].reshape(-1)
-        traj_state = carry.traj_state
         # get the initial state of the current trajectory
         traj_data_init = self.th.get_init_traj_data(carry, jnp)
         # subtract the initial state from the current state
@@ -704,6 +738,7 @@ class LocoEnv(Mjx):
         self,
         key: jax.random.PRNGKey,
         selected_traj_idx: jax.Array | None = None,
+        selected_subtraj_step: jax.Array | None = None,
     ) -> MjxState:
         """
         Resets the environment.
@@ -722,6 +757,7 @@ class LocoEnv(Mjx):
         return super().mjx_reset(
             key,
             selected_traj_idx=selected_traj_idx,
+            selected_subtraj_step=selected_subtraj_step,
         )
 
     def _reset_carry(self, model: MjModel, data: MjData, carry: LocoCarry) -> tuple[MjData, LocoCarry]:
@@ -772,6 +808,29 @@ class LocoEnv(Mjx):
         data, carry = super()._mjx_reset_carry(model, data, carry)
 
         return data, carry
+
+    def _mjx_reset_carry_to_step(
+        self,
+        model: Model,
+        data: Data,
+        carry: MjxAdditionalCarry,
+        selected_traj_idx: jax.Array,
+        selected_subtraj_step: jax.Array | None,
+    ) -> tuple[Data, MjxAdditionalCarry]:
+        """Reset to an explicit frame without tracing random trajectory sampling."""
+        if self.th is not None:
+            data, carry = self.th.reset_state_to_step(
+                self,
+                self._model,
+                data,
+                carry,
+                jnp,
+                selected_traj_idx,
+                selected_subtraj_step,
+            )
+
+        # Reset all other episode state exactly as in the ordinary reset path.
+        return super()._mjx_reset_carry(model, data, carry)
 
     def _get_from_obs(self, obs: np.ndarray | jnp.ndarray, obs_name: str) -> np.ndarray | jnp.ndarray:
         """

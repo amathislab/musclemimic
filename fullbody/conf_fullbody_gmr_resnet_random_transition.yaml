@@ -1,0 +1,14 @@
+defaults:
+  - conf_fullbody_gmr_resnet
+
+wandb:
+  tags: ["fullbody", "gmr", "resnet", "amass_random", "transition"]
+
+experiment:
+  total_timesteps: 6144000000
+  task_factory:
+    params:
+      amass_dataset_conf:
+        dataset_group:
+          - "AMASS_RANDOM_TRAINING_MOTIONS"
+          - "KIT_KINESIS_TRANSITION_TRAINING_MOTIONS"

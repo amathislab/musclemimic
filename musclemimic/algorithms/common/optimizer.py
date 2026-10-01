@@ -69,6 +69,29 @@ def warmup_cosine_lr_schedule(
     return schedule(current_update)
 
 
+def warmup_hold_cosine_lr_schedule(
+    count: int,
+    num_minibatches: int,
+    update_epochs: int,
+    lr: float,
+    num_updates: int,
+    warmup_steps: int | None = None,
+    hold_fraction: float = 0.5,
+    min_lr_ratio: float = 0.0,
+) -> jnp.ndarray:
+    """Warm up, hold the peak rate, then cosine-decay by update index."""
+    steps_per_update = num_minibatches * update_epochs
+    current_update = count // steps_per_update
+    schedule = _build_warmup_hold_cosine_schedule(
+        lr,
+        num_updates,
+        warmup_steps,
+        hold_fraction,
+        min_lr_ratio,
+    )
+    return schedule(current_update)
+
+
 def _build_warmup_cosine_schedule(
     lr: float,
     num_updates: int,
@@ -93,6 +116,48 @@ def _build_warmup_cosine_schedule(
         decay_steps=decay_steps,
         end_value=lr * min_lr_ratio,
     )
+
+
+def _build_warmup_hold_cosine_schedule(
+    lr: float,
+    num_updates: int,
+    warmup_steps: int | None = None,
+    hold_fraction: float = 0.5,
+    min_lr_ratio: float = 0.0,
+) -> LRSchedule:
+    """Build an update-indexed warmup, peak hold, and cosine schedule."""
+    if num_updates < 1:
+        raise ValueError("num_updates must be positive")
+    if not 0.0 <= hold_fraction <= 1.0:
+        raise ValueError("hold_fraction must be between 0 and 1")
+    if not 0.0 <= min_lr_ratio <= 1.0:
+        raise ValueError("min_lr_ratio must be between 0 and 1")
+
+    if warmup_steps is None:
+        warmup_steps = max(1, int(0.1 * num_updates))
+    else:
+        warmup_steps = max(0, int(warmup_steps))
+    warmup_steps = min(warmup_steps, int(num_updates))
+    hold_end = max(warmup_steps, int(hold_fraction * num_updates))
+    hold_end = min(hold_end, int(num_updates))
+    decay_steps = max(int(num_updates) - hold_end, 1)
+
+    def schedule(update_index: int) -> jnp.ndarray:
+        update = jnp.asarray(update_index, dtype=jnp.float32)
+        peak = jnp.asarray(lr, dtype=jnp.float32)
+        minimum = peak * min_lr_ratio
+        warmup_rate = peak * update / max(warmup_steps, 1)
+        cosine_progress = jnp.clip((update - hold_end) / decay_steps, 0.0, 1.0)
+        cosine_rate = minimum + 0.5 * (peak - minimum) * (
+            1.0 + jnp.cos(jnp.pi * cosine_progress)
+        )
+        return jnp.where(
+            update < warmup_steps,
+            warmup_rate,
+            jnp.where(update < hold_end, peak, cosine_rate),
+        )
+
+    return schedule
 
 
 def build_optimizer(
@@ -145,7 +210,7 @@ def get_optimizer(exp: Any) -> optax.GradientTransformation:
     Schedule modes (exp.schedule):
         - "fixed": constant lr
         - "adaptive": constant lr, runtime adjustment via gradient scaling
-        - anneal_lr=True: linear or warmup_cosine decay
+        - anneal_lr=True: linear, warmup_cosine, or warmup_hold_cosine decay
 
     Args:
         exp: experiment config with training hyperparameters
@@ -179,6 +244,18 @@ def get_optimizer(exp: Any) -> optax.GradientTransformation:
 
         if lr_type == "warmup_cosine":
             schedule = _build_warmup_cosine_schedule(lr, num_updates, warmup, min_ratio)
+
+            def learning_rate(c):
+                return schedule(c // steps_per_update)
+        elif lr_type == "warmup_hold_cosine":
+            hold_fraction = _get("hold_fraction", 0.5)
+            schedule = _build_warmup_hold_cosine_schedule(
+                lr,
+                num_updates,
+                warmup,
+                hold_fraction,
+                min_ratio,
+            )
 
             def learning_rate(c):
                 return schedule(c // steps_per_update)

@@ -1,17 +1,204 @@
 """Unit tests for adaptive motion sampling functionality (count-EMA based)."""
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-
-# Import the functions from adaptive_sampling module
+from loco_mujoco.trajectory.handler import TrajectoryHandler
 from musclemimic.algorithms.common.adaptive_sampling import (
     compute_adaptive_weights,
+    compute_per_traj_difficulty_stats,
     compute_per_traj_termination_stats,
     compute_topk_weights,
 )
+from musclemimic.core.wrappers.mjx import AutoResetWrapper
+
+
+def _sampling_handler() -> TrajectoryHandler:
+    handler = TrajectoryHandler.__new__(TrajectoryHandler)
+    handler.traj = SimpleNamespace(
+        data=SimpleNamespace(
+            split_points=jnp.asarray([0, 200, 400], dtype=jnp.int32),
+        )
+    )
+    handler.start_from_random_step = True
+    handler.frame_zero_reset_probability = 0.5
+    handler.first_quarter_reset_probability = 0.25
+    return handler
+
+
+def test_reset_target_sampling_empirically_matches_motion_and_start_weights():
+    handler = _sampling_handler()
+    sample_count = 20_000
+    trajectory_keys = jax.random.split(jax.random.key(1), sample_count)
+    step_keys = jax.random.split(jax.random.key(2), sample_count)
+
+    def sample(trajectory_key, step_key, weights):
+        return handler.sample_start_indices(
+            trajectory_key,
+            step_key,
+            weights=weights,
+            backend=jnp,
+        )
+
+    one_hot_weights = jnp.broadcast_to(
+        jnp.asarray([0.0, 1.0]),
+        (sample_count, 2),
+    )
+    one_hot_ids, _, _ = jax.vmap(sample)(
+        trajectory_keys,
+        step_keys,
+        one_hot_weights,
+    )
+    assert np.all(np.asarray(one_hot_ids) == 1)
+
+    weighted = jnp.broadcast_to(
+        jnp.asarray([0.9, 0.1]),
+        (sample_count, 2),
+    )
+    trajectory_ids, start_steps, start_modes = jax.vmap(sample)(
+        trajectory_keys,
+        step_keys,
+        weighted,
+    )
+    np.testing.assert_allclose(np.mean(np.asarray(trajectory_ids) == 0), 0.9, atol=0.01)
+    mode_frequency = np.bincount(np.asarray(start_modes), minlength=3) / sample_count
+    np.testing.assert_allclose(mode_frequency, [0.5, 0.25, 0.25], atol=0.01)
+    assert np.all(np.asarray(start_steps)[np.asarray(start_modes) == 0] == 0)
+    assert np.all(np.asarray(start_steps)[np.asarray(start_modes) == 1] > 0)
+
+
+def test_autoreset_candidates_use_each_lanes_live_sampling_weights():
+    batch = 4_096
+
+    class WeightedResetEnv:
+        th = _sampling_handler()
+
+        @staticmethod
+        def reset_to_step(_keys, trajectory_ids, start_steps):
+            observation = jnp.stack((trajectory_ids, start_steps), axis=-1)
+            state = SimpleNamespace(
+                observation=observation,
+                additional_carry=SimpleNamespace(
+                    traj_state=SimpleNamespace(
+                        traj_no=trajectory_ids,
+                        subtraj_step_no=start_steps,
+                        subtraj_step_no_init=start_steps,
+                    )
+                ),
+            )
+            return observation, state
+
+    wrapper = AutoResetWrapper(WeightedResetEnv())
+    lane_weights = jnp.broadcast_to(jnp.asarray([0.0, 1.0]), (batch, 2))
+    inner = SimpleNamespace(
+        additional_carry=SimpleNamespace(sampling_weights=lane_weights),
+    )
+    reset_keys = jax.random.split(jax.random.key(3), batch)
+
+    observations, reset_inner, _reset_state, modes = wrapper._compute_reset_candidates(
+        reset_keys,
+        inner,
+    )
+
+    assert np.all(np.asarray(observations[:, 0]) == 1)
+    assert np.all(np.asarray(reset_inner.additional_carry.traj_state.traj_no) == 1)
+    mode_frequency = np.bincount(np.asarray(modes), minlength=3) / batch
+    np.testing.assert_allclose(mode_frequency, [0.5, 0.25, 0.25], atol=0.03)
+
+
+class TestComputePerTrajectoryDifficultyStats:
+    """Progress-aware evidence should distinguish early and late failures."""
+
+    def test_early_failure_is_harder_than_late_failure(self):
+        traj_state = SimpleNamespace(
+            traj_no=jnp.asarray([[0, 1, 2, 3]], dtype=jnp.int32),
+            subtraj_step_no=jnp.asarray([[10, 90, 99, 40]], dtype=jnp.int32),
+            subtraj_step_no_init=jnp.asarray([[0, 0, 0, 0]], dtype=jnp.int32),
+        )
+        done = jnp.asarray([[True, True, True, True]])
+        absorbing = jnp.asarray([[True, True, False, False]])
+        trajectory_end = jnp.asarray([[False, False, True, False]])
+        split_points = jnp.asarray([0, 100, 200, 300, 400], dtype=jnp.int32)
+
+        rates, outcomes, difficulty = compute_per_traj_difficulty_stats(
+            traj_state,
+            done,
+            absorbing,
+            trajectory_end,
+            split_points,
+            n_trajectories=4,
+            late_failure_floor=0.25,
+        )
+
+        assert rates[0] > rates[1] > rates[2]
+        np.testing.assert_allclose(difficulty[2], 0.0)
+        np.testing.assert_allclose(outcomes, [1.0, 1.0, 1.0, 0.0])
+        np.testing.assert_allclose(rates[3], 0.0)
+
+    def test_progress_is_relative_to_randomized_start(self):
+        traj_state = SimpleNamespace(
+            traj_no=jnp.asarray([[0]], dtype=jnp.int32),
+            subtraj_step_no=jnp.asarray([[80]], dtype=jnp.int32),
+            subtraj_step_no_init=jnp.asarray([[75]], dtype=jnp.int32),
+        )
+        rates, outcomes, _ = compute_per_traj_difficulty_stats(
+            traj_state,
+            jnp.asarray([[True]]),
+            jnp.asarray([[True]]),
+            jnp.asarray([[False]]),
+            jnp.asarray([0, 100], dtype=jnp.int32),
+            n_trajectories=1,
+            late_failure_floor=0.25,
+        )
+
+        np.testing.assert_allclose(outcomes, [1.0])
+        np.testing.assert_allclose(rates, [0.84375])
+
+    def test_simulator_fault_reset_is_excluded_from_difficulty_evidence(self):
+        """A numerical reset is observable but is not a policy failure."""
+
+        traj_state = SimpleNamespace(
+            traj_no=jnp.asarray([[0, 1]], dtype=jnp.int32),
+            subtraj_step_no=jnp.asarray([[1, 1]], dtype=jnp.int32),
+            subtraj_step_no_init=jnp.asarray([[0, 0]], dtype=jnp.int32),
+        )
+        rates, outcomes, difficulty = compute_per_traj_difficulty_stats(
+            traj_state,
+            done=jnp.asarray([[True, True]]),
+            absorbing=jnp.asarray([[True, True]]),
+            trajectory_end=jnp.asarray([[False, False]]),
+            trajectory_split_points=jnp.asarray([0, 10, 20], dtype=jnp.int32),
+            n_trajectories=2,
+            late_failure_floor=0.25,
+            excluded_transitions=jnp.asarray([[True, False]]),
+        )
+
+        np.testing.assert_allclose(outcomes, [0.0, 1.0])
+        np.testing.assert_allclose(difficulty[0], 0.0)
+        np.testing.assert_allclose(rates[0], 0.0)
+        assert float(difficulty[1]) > 0.0
+        assert float(rates[1]) > 0.0
+
+    def test_rejects_invalid_late_failure_floor(self):
+        state = SimpleNamespace(
+            traj_no=jnp.zeros((1, 1), dtype=jnp.int32),
+            subtraj_step_no=jnp.zeros((1, 1), dtype=jnp.int32),
+            subtraj_step_no_init=jnp.zeros((1, 1), dtype=jnp.int32),
+        )
+        with pytest.raises(ValueError, match="late_failure_floor"):
+            compute_per_traj_difficulty_stats(
+                state,
+                jnp.zeros((1, 1), dtype=bool),
+                jnp.zeros((1, 1), dtype=bool),
+                jnp.zeros((1, 1), dtype=bool),
+                jnp.asarray([0, 1]),
+                n_trajectories=1,
+                late_failure_floor=1.1,
+            )
 
 
 class TestComputeAdaptiveWeights:
@@ -30,7 +217,10 @@ class TestComputeAdaptiveWeights:
         ema_early = jnp.zeros(n_traj)
 
         weights, new_ema_done, new_ema_early, rate_hat = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=1.0,  # No smoothing for this test
             floor_mix=0.1,
             alpha=1.0,
@@ -60,7 +250,10 @@ class TestComputeAdaptiveWeights:
         ema_early = jnp.array([10.0, 10.0, 10.0])
 
         _, new_ema_done, new_ema_early, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=beta,
         )
 
@@ -83,7 +276,10 @@ class TestComputeAdaptiveWeights:
         ema_early = jnp.zeros(n_traj)
 
         weights, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=1.0,
             floor_mix=0.1,
             alpha=1.0,
@@ -107,13 +303,19 @@ class TestComputeAdaptiveWeights:
         ema_early = jnp.zeros(n_traj)
 
         weights_alpha1, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=1.0,
             floor_mix=0.0,
             alpha=1.0,
         )
         weights_alpha2, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=1.0,
             floor_mix=0.0,
             alpha=2.0,
@@ -139,7 +341,10 @@ class TestComputeAdaptiveWeights:
         ema_early = jnp.zeros(n_traj)
 
         weights, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=0.5,
             floor_mix=0.1,
             alpha=1.5,
@@ -161,7 +366,10 @@ class TestComputeAdaptiveWeights:
         ema_early = jnp.zeros(n_traj)
 
         _, new_ema_done, new_ema_early, rate_hat = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=1.0,  # No smoothing
             eps_div=1e-6,
         )
@@ -169,6 +377,48 @@ class TestComputeAdaptiveWeights:
         # Rate should be early / done
         expected_rate = early_counts / (done_counts + 1e-6)
         np.testing.assert_array_almost_equal(rate_hat, expected_rate, decimal=5)
+
+    def test_hierarchical_sampler_balances_groups_and_caps_motion_weights(self):
+        done_counts = jnp.full((6,), 10.0)
+        difficulty = jnp.asarray([10.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+        group_ids = jnp.asarray([0, 0, 0, 1, 1, 1], dtype=jnp.int32)
+
+        weights, *_ = compute_adaptive_weights(
+            done_counts,
+            difficulty,
+            jnp.zeros((6,)),
+            jnp.zeros((6,)),
+            beta=1.0,
+            group_ids=group_ids,
+            num_groups=2,
+            difficulty_mix=0.5,
+            max_weight_ratio=2.0,
+        )
+
+        np.testing.assert_allclose(np.asarray(weights[:3].sum()), 0.5, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(weights[3:].sum()), 0.5, atol=1e-6)
+        assert float(weights.max()) <= 2.0 / 6.0 + 1e-6
+        assert weights[0] > weights[1]
+
+    @pytest.mark.parametrize(
+        ("difficulty_mix", "max_weight_ratio", "message"),
+        [(-0.1, None, "difficulty_mix"), (1.1, None, "difficulty_mix"), (0.5, 0.9, "max_weight_ratio")],
+    )
+    def test_hierarchical_sampler_rejects_invalid_controls(
+        self,
+        difficulty_mix,
+        max_weight_ratio,
+        message,
+    ):
+        with pytest.raises(ValueError, match=message):
+            compute_adaptive_weights(
+                jnp.ones((2,)),
+                jnp.ones((2,)),
+                jnp.ones((2,)),
+                jnp.ones((2,)),
+                difficulty_mix=difficulty_mix,
+                max_weight_ratio=max_weight_ratio,
+            )
 
 
 class TestComputePerTrajTerminationStats:
@@ -184,29 +434,36 @@ class TestComputePerTrajTerminationStats:
         # Trajectory 0: 2 done, 1 early
         # Trajectory 1: 3 done, 2 early
         # Trajectory 2: 1 done, 0 early
-        final_traj_no = jnp.array([
-            [0, 1],
-            [1, 2],
-            [0, 1],
-            [1, 0],
-            [2, 1],
-        ], dtype=jnp.int32)
+        final_traj_no = jnp.array(
+            [
+                [0, 1],
+                [1, 2],
+                [0, 1],
+                [1, 0],
+                [2, 1],
+            ],
+            dtype=jnp.int32,
+        )
 
-        done = jnp.array([
-            [True, True],
-            [False, True],
-            [True, True],
-            [True, False],
-            [False, True],
-        ])
+        done = jnp.array(
+            [
+                [True, True],
+                [False, True],
+                [True, True],
+                [True, False],
+                [False, True],
+            ]
+        )
 
-        absorbing = jnp.array([
-            [True, False],
-            [False, True],
-            [False, True],
-            [True, False],
-            [False, True],
-        ])
+        absorbing = jnp.array(
+            [
+                [True, False],
+                [False, True],
+                [False, True],
+                [True, False],
+                [False, True],
+            ]
+        )
 
         traj_batch_info = {"final_traj_no": final_traj_no}
 
@@ -296,7 +553,10 @@ class TestEdgeCases:
         ema_early = jnp.zeros(n_traj)
 
         weights, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
         )
 
         # Single trajectory should have weight 1.0
@@ -312,7 +572,10 @@ class TestEdgeCases:
         ema_early = jnp.zeros(n_traj)
 
         weights, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
         )
 
         # With all zeros, should fall back to uniform (via NaN fallback)
@@ -330,7 +593,10 @@ class TestEdgeCases:
         ema_early = jnp.zeros(n_traj)
 
         weights, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=1.0,
             floor_mix=0.0,
             alpha=1.0,
@@ -352,7 +618,10 @@ class TestEdgeCases:
         ema_early = jnp.zeros(n_traj)
 
         weights, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
         )
 
         # Should fall back to uniform
@@ -370,7 +639,10 @@ class TestEdgeCases:
         ema_early = jnp.array([5.0, 10.0, 15.0, 20.0, 25.0])
 
         weights, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=0.5,
             floor_mix=0.0,  # No floor mix to test pure fallback
         )
@@ -395,7 +667,10 @@ class TestEdgeCases:
         ema_early = jnp.array([5.0, jnp.inf, 15.0, 20.0])  # Inf at index 1
 
         weights, _, _, _ = compute_adaptive_weights(
-            done_counts, early_counts, ema_done, ema_early,
+            done_counts,
+            early_counts,
+            ema_done,
+            ema_early,
             beta=0.5,
             floor_mix=0.0,
         )
@@ -417,8 +692,13 @@ class TestJITCompatibility:
         @jax.jit
         def jitted_compute(done_counts, early_counts, ema_done, ema_early):
             return compute_adaptive_weights(
-                done_counts, early_counts, ema_done, ema_early,
-                beta=0.2, floor_mix=0.1, alpha=1.0,
+                done_counts,
+                early_counts,
+                ema_done,
+                ema_early,
+                beta=0.2,
+                floor_mix=0.1,
+                alpha=1.0,
             )
 
         key = jax.random.PRNGKey(0)
@@ -428,9 +708,7 @@ class TestJITCompatibility:
         ema_early = jnp.zeros(n_traj)
 
         # Should not raise
-        weights, new_ema_done, new_ema_early, rate_hat = jitted_compute(
-            done_counts, early_counts, ema_done, ema_early
-        )
+        weights, new_ema_done, new_ema_early, rate_hat = jitted_compute(done_counts, early_counts, ema_done, ema_early)
         assert weights.shape == (n_traj,)
         assert new_ema_done.shape == (n_traj,)
         assert new_ema_early.shape == (n_traj,)
@@ -438,6 +716,7 @@ class TestJITCompatibility:
 
     def test_compute_topk_jit(self):
         """Test that compute_topk_weights works under JIT."""
+
         @jax.jit
         def jitted_topk(weights):
             return compute_topk_weights(weights, k=5)

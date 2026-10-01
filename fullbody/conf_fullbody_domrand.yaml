@@ -1,0 +1,65 @@
+# MyoFullBody with domain randomization
+# Inherits from conf_fullbody.yaml and adds domain randomization (no terrain)
+defaults:
+  - conf_fullbody
+  - _self_
+
+wandb:
+  tags: ["fullbody", "domrand"]
+
+experiment:
+  env_params:
+    # Domain randomization
+    domain_randomization_type: DefaultRandomizer
+    domain_randomization_params:
+      # Physics randomization (sampled at episode reset)
+
+      # Gravity: Earth ~9.81 m/s², ±5% variation
+      randomize_gravity: true
+      gravity_range: [9.3, 10.3]
+
+      # Ground friction: MuJoCo default ~1.0, reasonable range for different surfaces
+      randomize_geom_friction_tangential: true
+      geom_friction_tangential_range: [0.7, 1.3]
+      randomize_geom_friction_torsional: false
+      geom_friction_torsional_range: [0.001, 0.01]
+      randomize_geom_friction_rolling: false
+      geom_friction_rolling_range: [0.00001, 0.0001]
+
+      # Contact dynamics (disabled - can destabilize muscle model)
+      randomize_geom_damping: false
+      geom_damping_range: [0.5, 2.0]
+      randomize_geom_stiffness: false
+      geom_stiffness_range: [500, 2000]
+
+      # Mass: conservative for human ~70kg
+      randomize_base_mass: true
+      base_mass_to_add_range: [-2.0, 5.0]  # Simulates backpack/clothing
+      randomize_link_mass: true
+      link_mass_multiplier_range:
+        root_body: [0.9, 1.1]      # ±10% for torso
+        other_bodies: [0.95, 1.05]  # ±5% for limbs
+
+      # COM displacement: ±1.5cm (conservative)
+      randomize_com_displacement: true
+      com_displacement_range: [-0.015, 0.015]
+
+      # Joint dynamics (disabled - passive properties)
+      randomize_joint_friction_loss: false
+      joint_friction_loss_range: [0.0, 0.3]
+      randomize_joint_damping: false
+      joint_damping_range: [0.0, 0.3]
+      randomize_joint_armature: false
+      joint_armature_range: [0.0, 0.05]
+
+      # Observation noise (applied every step)
+      add_joint_pos_noise: true
+      joint_pos_noise_scale: 0.01   # ~0.6 degrees
+      add_joint_vel_noise: true
+      joint_vel_noise_scale: 0.2    # rad/s
+      add_gravity_noise: false
+      gravity_noise_scale: 0.05
+      add_free_joint_lin_vel_noise: true
+      lin_vel_noise_scale: 0.08     # m/s
+      add_free_joint_ang_vel_noise: true
+      ang_vel_noise_scale: 0.1      # rad/s

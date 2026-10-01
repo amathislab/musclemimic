@@ -15,17 +15,26 @@ def get_amass_dataset_groups() -> dict[str, list[str]]:
         AMASS_BIMANUAL_TRAIN_MOTIONS,
         AMASS_EKUT_DATASETS,
         AMASS_LOCOMOTION_DATASETS,
+        AMASS_NONFLAT_MOTIONS,
         AMASS_RANDOM_TRAINING_MOTIONS,
         AMASS_RANDOM_TRAINING_MOTIONS_2K,
         AMASS_TRANSITION_MOTIONS,
+        GAIT120_TESTING,
+        GAIT120_TESTING_SUBJECTS,
+        GAIT120_TESTING_SUBJECTS_TRIALS0104,
+        GAIT120_TESTING_TRIALS,
+        GAIT120_TRAINING_SUBJECTS,
+        GAIT120_TRAINING_TRIALS,
         KIT_KINESIS_TESTING_MOTIONS,
         KIT_KINESIS_TRAINING_MOTIONS,
         KIT_KINESIS_TRAINING_MOTIONS_MINT,
         KIT_KINESIS_TRAINING_MOTIONS_MINT_STRAIGHT_FORWARDS,
         KIT_KINESIS_TRANSITION_TRAINING_MOTIONS,
     )
+
     return {
         "AMASS_LOCOMOTION_DATASETS": AMASS_LOCOMOTION_DATASETS,
+        "AMASS_NONFLAT_MOTIONS": AMASS_NONFLAT_MOTIONS,
         "AMASS_EKUT_DATASETS": AMASS_EKUT_DATASETS,
         "AMASS_BIMANUAL_MARGINAL_MOTIONS": AMASS_BIMANUAL_MARGINAL_MOTIONS,
         "KIT_KINESIS_TRAINING_MOTIONS": KIT_KINESIS_TRAINING_MOTIONS,
@@ -38,6 +47,12 @@ def get_amass_dataset_groups() -> dict[str, list[str]]:
         "AMASS_RANDOM_TRAINING_MOTIONS_2K": AMASS_RANDOM_TRAINING_MOTIONS_2K,
         "AMASS_BIMANUAL_TEST_MOTIONS": AMASS_BIMANUAL_TEST_MOTIONS,
         "AMASS_BIMANUAL_TRAIN_MOTIONS": AMASS_BIMANUAL_TRAIN_MOTIONS,
+        "GAIT120_TRAINING_SUBJECTS": GAIT120_TRAINING_SUBJECTS,
+        "GAIT120_TESTING_SUBJECTS": GAIT120_TESTING_SUBJECTS,
+        "GAIT120_TRAINING_TRIALS": GAIT120_TRAINING_TRIALS,
+        "GAIT120_TESTING_TRIALS": GAIT120_TESTING_TRIALS,
+        "GAIT120_TESTING_SUBJECTS_TRIALS0104": GAIT120_TESTING_SUBJECTS_TRIALS0104,
+        "GAIT120_TESTING": GAIT120_TESTING,
     }
 
 
@@ -94,31 +109,54 @@ class AMASSDatasetConf:
             load from the AMASS dataset.
         dataset_group (Union[str, list]): A predefined dataset group name, a list of group names,
             or a `GROUP_A + GROUP_B` combination string to load from AMASS.
-        retargeting_method (str): The retargeting method to use (e.g., 'smpl', 'gmr'). Optional.
+        retargeting_method (str): The retargeting method to use (``smpl``, ``gmr``,
+            ``terra``, or ``omniretarget``). Optional.
+        output_cache_subdir (str): Optional cache namespace, independent from the
+            retargeting algorithm. Prefer the canonical method namespace unless an
+            experiment deliberately needs an isolated cache.
+        cache_root (str): Optional converted-AMASS cache root. This is useful for
+            released or experiment-specific retargeting caches.
+        load_paired_terrain (bool): Load the motion's ``_terrain.json`` sidecar and
+            construct the environment with that terrain. This requires exactly one motion.
+        require_nonflat_terrain (bool): Reject paired sidecars without terrain primitives.
         gmr_config (dict): Configuration for GMR retargeting. Optional.
+        terra_config (dict): Configuration for the TERRA adapter. Optional.
         max_motions (int, optional): If set, cap the number of motion paths loaded by
             sampling a subset of this size.
+        max_motions_seed (int): Seed used to choose a reproducible motion subset.
         clear_cache (bool): If True, overwrite existing cached retargeted files instead of loading them.
         trajectory_cache_type (str): Runtime trajectory cache layout. Use "sparse"
             to store only mimic site caches, "full" for all body/site caches, or
             "none" for qpos/qvel only.
 
     """
+
     rel_dataset_path: str | list = None
     dataset_group: str | list = None
     retargeting_method: str = None
+    output_cache_subdir: str = None
+    cache_root: str = None
+    load_paired_terrain: bool = False
+    require_nonflat_terrain: bool = False
     gmr_config: dict = None
+    terra_config: dict = None
     max_motions: int | None = None
+    max_motions_seed: int = 0
     clear_cache: bool = False
+    allow_cache_download: bool = True
     trajectory_cache_type: str = "sparse"
 
     def __post_init__(self):
-        assert self.rel_dataset_path is not None or self.dataset_group is not None, ("Either `rel_dataset_path` or "
-                                                                                     "`dataset_group` must be set.")
+        assert self.rel_dataset_path is not None or self.dataset_group is not None, (
+            "Either `rel_dataset_path` or `dataset_group` must be set."
+        )
         if self.max_motions is not None:
             self.max_motions = int(self.max_motions)
             if self.max_motions <= 0:
                 raise ValueError(f"max_motions must be > 0, got {self.max_motions}")
+        self.max_motions_seed = int(self.max_motions_seed)
+        if self.load_paired_terrain and self.retargeting_method != "terra":
+            raise ValueError("load_paired_terrain currently requires retargeting_method='terra'.")
 
 
 @dataclass
@@ -174,8 +212,9 @@ class LAFAN1DatasetConf:
     trajectory_cache_type: str = "full"
 
     def __post_init__(self):
-        assert self.dataset_name is not None or self.dataset_group is not None, ("Either `dataset_name` or "
-                                                                                 "`dataset_group` must be set.")
+        assert self.dataset_name is not None or self.dataset_group is not None, (
+            "Either `dataset_name` or `dataset_group` must be set."
+        )
 
 
 @dataclass
@@ -187,5 +226,6 @@ class CustomDatasetConf:
         traj (Trajectory): A custom trajectory to load.
 
     """
+
     traj: Trajectory
     trajectory_cache_type: str = "full"

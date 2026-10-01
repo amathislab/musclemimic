@@ -7,6 +7,10 @@ from flax import struct
 
 from loco_mujoco.core.utils.env import Box
 from musclemimic.core.mujoco_mjx import Mjx, MjxState
+from musclemimic.utils.running_stats import (
+    finite_global_batch_moments,
+    merge_running_moments,
+)
 
 
 class LocoMjxWrapper:
@@ -36,10 +40,30 @@ class LocoMjxWrapper:
         )
         return state.observation, state
 
+    def reset_to_step(self, rng_key, traj_idx, subtraj_step):
+        """Reset to an explicitly selected trajectory and frame."""
+        if isinstance(rng_key, (int, jnp.integer)):
+            rng_key = jax.random.PRNGKey(int(rng_key))
+
+        state = self.env.mjx_reset(
+            rng_key,
+            selected_traj_idx=traj_idx,
+            selected_subtraj_step=subtraj_step,
+        )
+        return state.observation, state
+
     def step(self, state, action):
         next_state = self.env.mjx_step(state, action)
-        next_obs = jnp.where(next_state.done, next_state.additional_carry.final_observation, next_state.observation)
-        return (next_obs, next_state.reward, next_state.absorbing, next_state.done, next_state.info, next_state)
+        # mjx_step returns the pre-reset observation. AutoResetWrapper owns
+        # resetting and keeps this value as the transition observation.
+        return (
+            next_state.observation,
+            next_state.reward,
+            next_state.absorbing,
+            next_state.done,
+            next_state.info,
+            next_state,
+        )
 
 
 def is_vectorized(env) -> bool:
@@ -108,6 +132,9 @@ class BaseWrapper:
     def reset_to(self, rng_key, traj_idx):
         return self.env.reset_to(rng_key, traj_idx)
 
+    def reset_to_step(self, rng_key, traj_idx, subtraj_step):
+        return self.env.reset_to_step(rng_key, traj_idx, subtraj_step)
+
     def step(self, state, action):
         return self.env.step(state, action)
 
@@ -167,11 +194,14 @@ class SummaryMetrics:
     early_termination_rate: float = 0.0
     horizon_timeout_count: float = 0.0
     horizon_timeout_rate: float = 0.0
+    reward_termination_count: float = 0.0
+    reward_termination_rate: float = 0.0
     # Reward sub-terms (mean over trajectory batch)
     reward_total: float = 0.0
     reward_qpos: float = 0.0
     reward_qvel: float = 0.0
     reward_root_pos: float = 0.0
+    reward_root_quat: float = 0.0
     reward_rpos: float = 0.0
     reward_rquat: float = 0.0
     reward_rvel_rot: float = 0.0
@@ -179,6 +209,9 @@ class SummaryMetrics:
     reward_root_vel: float = 0.0
     penalty_total: float = 0.0
     penalty_activation_energy: float = 0.0
+    activation_energy_raw: float = 0.0
+    reward_core_upper_body: float = 0.0
+    reward_terminal_quality_bonus: float = 0.0
     # Diagnostic error metrics
     err_root_xyz: float = 0.0
     err_root_yaw: float = 0.0
@@ -186,6 +219,7 @@ class SummaryMetrics:
     err_joint_vel: float = 0.0
     err_site_abs: float = 0.0
     err_rpos: float = 0.0
+    err_core_upper_body_relative: float = 0.0
 
 
 @struct.dataclass
@@ -214,6 +248,10 @@ class LogWrapper(BaseWrapper):
 
     def reset_to(self, rng_key, traj_idx):
         obs, env_state = self.env.reset_to(rng_key, traj_idx)
+        return self._wrap_reset_output(obs, env_state)
+
+    def reset_to_step(self, rng_key, traj_idx, subtraj_step):
+        obs, env_state = self.env.reset_to_step(rng_key, traj_idx, subtraj_step)
         return self._wrap_reset_output(obs, env_state)
 
     def _wrap_reset_output(self, obs, env_state):
@@ -341,6 +379,10 @@ class NStepWrapper(BaseWrapper):
         obs, env_state = self.env.reset_to(rng_key, traj_idx)
         return self._wrap_reset_output(obs, env_state)
 
+    def reset_to_step(self, rng_key, traj_idx, subtraj_step):
+        obs, env_state = self.env.reset_to_step(rng_key, traj_idx, subtraj_step)
+        return self._wrap_reset_output(obs, env_state)
+
     def _wrap_reset_output(self, obs, env_state):
         if self.split_goal:
             # Split obs into state and goal
@@ -405,6 +447,12 @@ class VecEnv(BaseWrapper):
         super().__init__(env)
         self._base_reset = jax.vmap(self.env.reset, in_axes=(0,))
         self._base_reset_to = jax.vmap(self.env.reset_to, in_axes=(0, 0))
+        reset_to_step = getattr(self.env, "reset_to_step", None)
+        self._base_reset_to_step = (
+            None
+            if reset_to_step is None
+            else jax.vmap(reset_to_step, in_axes=(0, 0, 0))
+        )
         self._base_step = jax.vmap(self.env.step, in_axes=(0, 0))
 
     def reset(self, rng_key):
@@ -421,6 +469,12 @@ class VecEnv(BaseWrapper):
     def reset_to(self, rng_key, traj_idx):
         """Reset all parallel environments to specific trajectories."""
         return self._base_reset_to(rng_key, traj_idx)
+
+    def reset_to_step(self, rng_key, traj_idx, subtraj_step):
+        """Reset all environments to explicit trajectory frames."""
+        if self._base_reset_to_step is None:
+            raise NotImplementedError("wrapped environment does not support reset_to_step")
+        return self._base_reset_to_step(rng_key, traj_idx, subtraj_step)
 
     def step(self, state, action):
         """Step all parallel environments.
@@ -470,6 +524,7 @@ class AutoResetWrapper(BaseWrapper):
         ("key", "where_done"),
         ("cur_step_in_episode", "constant_one"),
         ("last_action", "where_done"),
+        ("reward_state", "tree_map"),
         ("domain_randomizer_state", "tree_map"),
         ("terrain_state", "tree_map"),
         ("observation_states", "field_by_field"),  # make_dataclass creates incompatible types
@@ -526,7 +581,19 @@ class AutoResetWrapper(BaseWrapper):
     def reset(self, rng_keys):
         """Initialize environment with autoreset RNG cache."""
         obs, state = self.env.reset(rng_keys)
+        return self._initialize_reset_state(obs, state, rng_keys)
 
+    def reset_to(self, rng_keys, traj_idx):
+        """Initialize selected trajectories with the normal autoreset state."""
+        obs, state = self.env.reset_to(rng_keys, traj_idx)
+        return self._initialize_reset_state(obs, state, rng_keys)
+
+    def reset_to_step(self, rng_keys, traj_idx, subtraj_step):
+        """Initialize selected trajectory frames with normal autoreset state."""
+        obs, state = self.env.reset_to_step(rng_keys, traj_idx, subtraj_step)
+        return self._initialize_reset_state(obs, state, rng_keys)
+
+    def _initialize_reset_state(self, obs, state, rng_keys):
         inner, rewrap = self._unwrap_state(state)
 
         # Derive per-env RNG cache; handle both batched and single-key inputs
@@ -546,6 +613,8 @@ class AutoResetWrapper(BaseWrapper):
         info[f"{self._info_key}_done_count"] = jnp.zeros((batch,), dtype=jnp.int32)
         info["final_traj_no"] = jnp.zeros((batch,), dtype=jnp.int32)
         info["imitation_error_total"] = jnp.zeros((batch,), dtype=jnp.float32)
+        info["reset_traj_no"] = jnp.zeros((batch,), dtype=jnp.int32)
+        info["reset_start_mode"] = jnp.full((batch,), -1, dtype=jnp.int32)
 
         new_inner = inner.replace(info=info, additional_carry=new_carry)
         new_state = rewrap(new_inner)
@@ -567,7 +636,7 @@ class AutoResetWrapper(BaseWrapper):
         rng_next, reset_keys = split[:, 0], split[:, 1]
         return rng_next, reset_keys
 
-    def _compute_reset_candidates(self, reset_keys):
+    def _compute_reset_candidates(self, reset_keys, inner):
         """Build reset state candidates for done environments.
 
         Returns:
@@ -575,9 +644,32 @@ class AutoResetWrapper(BaseWrapper):
             reset_inner: Inner MjxState from fresh reset
             reset_state: Full wrapped state from fresh reset
         """
-        reset_obs, reset_state = self.env.reset(reset_keys)
+        weights = getattr(inner.additional_carry, "sampling_weights", None)
+        if weights is None:
+            reset_obs, reset_state = self.env.reset(reset_keys)
+            reset_start_modes = jnp.full((reset_keys.shape[0],), -1, dtype=jnp.int32)
+        else:
+            reset_key_pairs = self._vmapped_split(reset_keys)
+            environment_keys = reset_key_pairs[:, 0]
+            sampling_keys = reset_key_pairs[:, 1]
+            sampling_key_pairs = self._vmapped_split(sampling_keys)
+            trajectory_keys = sampling_key_pairs[:, 0]
+            step_keys = sampling_key_pairs[:, 1]
+            trajectory_ids, start_steps, reset_start_modes = jax.vmap(
+                lambda trajectory_key, step_key, lane_weights: self.th.sample_start_indices(
+                    trajectory_key,
+                    step_key,
+                    weights=lane_weights,
+                    backend=jnp,
+                )
+            )(trajectory_keys, step_keys, weights)
+            reset_obs, reset_state = self.env.reset_to_step(
+                environment_keys,
+                trajectory_ids,
+                start_steps,
+            )
         reset_inner, _ = self._unwrap_state(reset_state)
-        return reset_obs, reset_inner, reset_state
+        return reset_obs, reset_inner, reset_state, reset_start_modes
 
     def _step_inner(self, state, action):
         """Execute environment step with normalized interface.
@@ -661,14 +753,30 @@ class AutoResetWrapper(BaseWrapper):
         # Extract imitation error from reward_state
         reward_state = getattr(cur_carry, "reward_state", None)
         if reward_state is not None and hasattr(reward_state, "imitation_error_total"):
-            metrics["imitation_error_total"] = reward_state.imitation_error_total
+            metrics["imitation_error_total"] = jnp.nan_to_num(
+                reward_state.imitation_error_total,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
         else:
             metrics["imitation_error_total"] = jnp.zeros(done.shape, dtype=jnp.float32)
 
         return metrics
 
     def _apply_autoreset(
-        self, done, inner, next_inner, reset_obs, reset_inner, reset_state, obs, next_state, rng_next, where_done
+        self,
+        done,
+        inner,
+        next_inner,
+        reset_obs,
+        reset_inner,
+        reset_state,
+        reset_start_modes,
+        obs,
+        next_state,
+        rng_next,
+        where_done,
     ):
         """Apply autoreset: conditional swap + carry reset + info update.
 
@@ -701,6 +809,13 @@ class AutoResetWrapper(BaseWrapper):
         # Extract metrics before reset swap
         info_metrics = self._extract_info_metrics(next_inner.additional_carry, done)
         next_info.update(info_metrics)
+        reset_traj_state = getattr(reset_inner.additional_carry, "traj_state", None)
+        next_info["reset_traj_no"] = (
+            jnp.zeros(done.shape, dtype=jnp.int32)
+            if reset_traj_state is None
+            else reset_traj_state.traj_no
+        )
+        next_info["reset_start_mode"] = reset_start_modes
 
         # Apply table-driven carry reset
         cur_carry = next_inner.additional_carry
@@ -740,7 +855,10 @@ class AutoResetWrapper(BaseWrapper):
         rng_next, reset_keys = self._prepare_reset_keys(inner)
 
         # 2. Build reset candidates (computed every step for JIT compatibility)
-        reset_obs, reset_inner, reset_state = self._compute_reset_candidates(reset_keys)
+        reset_obs, reset_inner, reset_state, reset_start_modes = self._compute_reset_candidates(
+            reset_keys,
+            inner,
+        )
 
         # 3. Step inner env
         obs, reward, absorbing, done, _info, next_state, next_inner, _ = self._step_inner(state, action)
@@ -751,7 +869,17 @@ class AutoResetWrapper(BaseWrapper):
         # 4. Apply autoreset with conditional swapping
         where_done = self._make_where_done(done_out)
         new_obs, updated_state, next_info = self._apply_autoreset(
-            done_out, inner, next_inner, reset_obs, reset_inner, reset_state, obs, next_state, rng_next, where_done
+            done_out,
+            inner,
+            next_inner,
+            reset_obs,
+            reset_inner,
+            reset_state,
+            reset_start_modes,
+            obs,
+            next_state,
+            rng_next,
+            where_done,
         )
 
         return new_obs, reward, absorbing, done_out, next_info, updated_state, next_state, obs
@@ -805,18 +933,30 @@ class NormalizeVecRewEnvState(BaseWrapperState):
 
 
 class NormalizeVecReward(BaseWrapper):
-    def __init__(self, env, gamma):
+    def __init__(self, env, gamma, axis_name: str | None = None):
         super().__init__(env)
         self.gamma = gamma
+        self.axis_name = axis_name
 
     def reset(self, key):
         obs, state = self.env.reset(key)
+        return self._wrap_reset_output(obs, state)
+
+    def reset_to(self, key, traj_idx):
+        obs, state = self.env.reset_to(key, traj_idx)
+        return self._wrap_reset_output(obs, state)
+
+    def reset_to_step(self, key, traj_idx, subtraj_step):
+        obs, state = self.env.reset_to_step(key, traj_idx, subtraj_step)
+        return self._wrap_reset_output(obs, state)
+
+    def _wrap_reset_output(self, obs, state):
         batch_count = obs.shape[0]
         state = NormalizeVecRewEnvState(
-            mean=0.0,
-            var=1.0,
-            count=1e-4,
-            return_val=jnp.zeros((batch_count,)),
+            mean=jnp.asarray(0.0, dtype=obs.dtype),
+            var=jnp.asarray(1.0, dtype=obs.dtype),
+            count=jnp.asarray(1e-4, dtype=obs.dtype),
+            return_val=jnp.zeros((batch_count,), dtype=obs.dtype),
             env_state=state,
         )
         return obs, state
@@ -824,7 +964,7 @@ class NormalizeVecReward(BaseWrapper):
     def step(self, state, action):
         next_observation, reward, absorbing, done, info, env_state = self.env.step(state.env_state, action)
 
-        state, normalized_reward = self._normalize_step_output(state, next_observation, reward, done, env_state)
+        state, normalized_reward = self._normalize_step_output(state, reward, done, env_state)
 
         return next_observation, normalized_reward, absorbing, done, info, state
 
@@ -847,36 +987,84 @@ class NormalizeVecReward(BaseWrapper):
             transition_observation,
         ) = self.env.step_with_transition(state.env_state, action)
 
-        next_state, normalized_reward = self._normalize_step_output(state, next_observation, reward, done, env_state)
+        next_state, normalized_reward = self._normalize_step_output(state, reward, done, env_state)
         transition_state = next_state.replace(env_state=transition_env_state)
-        return next_observation, normalized_reward, absorbing, done, info, next_state, transition_state, transition_observation
+        return (
+            next_observation,
+            normalized_reward,
+            absorbing,
+            done,
+            info,
+            next_state,
+            transition_state,
+            transition_observation,
+        )
 
-    def _normalize_step_output(self, state, next_observation, reward, done, env_state):
+    def _normalize_step_output(self, state, reward, done, env_state):
         """Update running reward stats once and reuse them for carry/transition states."""
 
-        return_val = state.return_val * self.gamma * (1 - done) + reward
+        reward = jnp.asarray(reward)
+        finite_reward = jnp.isfinite(reward)
+        finite_previous_return = jnp.isfinite(state.return_val)
+        safe_reward = jnp.where(finite_reward, reward, 0.0)
+        safe_previous_return = jnp.where(finite_previous_return, state.return_val, 0.0)
+        discounted_return = safe_previous_return * self.gamma + safe_reward
+        transition_info = getattr(env_state, "info", {})
+        nonfinite_transition = jnp.asarray(
+            transition_info.get("numerics_nonfinite_transition", False),
+            dtype=bool,
+        )
+        valid_return = (
+            finite_reward
+            & finite_previous_return
+            & jnp.isfinite(discounted_return)
+            & ~nonfinite_transition
+        )
 
-        batch_mean = jnp.mean(return_val, axis=0)
-        batch_var = jnp.var(return_val, axis=0)
-        batch_count = next_observation.shape[0]
-
-        delta = batch_mean - state.mean
-        tot_count = state.count + batch_count
-
-        new_mean = state.mean + delta * batch_count / tot_count
-        m_a = state.var * state.count
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + jnp.square(delta) * state.count * batch_count / tot_count
-        new_var = m2 / tot_count
-        new_count = tot_count
+        batch_mean, batch_var, batch_count = finite_global_batch_moments(
+            discounted_return,
+            self.axis_name,
+            valid=valid_return,
+        )
+        previous_mean = jnp.where(jnp.isfinite(state.mean), state.mean, 0.0)
+        previous_var = jnp.where(
+            jnp.isfinite(state.var) & (state.var >= 0.0),
+            state.var,
+            1.0,
+        )
+        previous_count = jnp.where(
+            jnp.isfinite(state.count) & (state.count > 0.0),
+            state.count,
+            jnp.asarray(1e-4, dtype=reward.dtype),
+        )
+        merged_mean, merged_var, merged_count = merge_running_moments(
+            previous_mean,
+            previous_var,
+            previous_count,
+            batch_mean,
+            batch_var,
+            batch_count,
+        )
+        new_mean = jnp.where(jnp.isfinite(merged_mean), merged_mean, previous_mean)
+        new_var = jnp.where(
+            jnp.isfinite(merged_var) & (merged_var >= 0.0),
+            merged_var,
+            previous_var,
+        )
+        new_count = jnp.where(
+            jnp.isfinite(merged_count) & (merged_count > 0.0),
+            merged_count,
+            previous_count,
+        )
+        next_return = jnp.where(done | ~valid_return, 0.0, discounted_return)
 
         next_state = NormalizeVecRewEnvState(
             mean=new_mean,
             var=new_var,
             count=new_count,
-            return_val=return_val,
+            return_val=next_return,
             env_state=env_state,
         )
 
-        normalized_reward = reward / jnp.sqrt(next_state.var + 1e-8)
+        normalized_reward = safe_reward / jnp.sqrt(next_state.var + 1e-8)
         return next_state, normalized_reward

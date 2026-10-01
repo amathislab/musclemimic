@@ -39,7 +39,7 @@ class SoftMoELayer(nn.Module):
     gate_init_std: float = 0.01
 
     @nn.compact
-    def __call__(self, x, return_metrics=False):
+    def __call__(self, x, return_metrics=False, axis_name: str | None = None):
         batch_shape = x.shape[:-1]
         hidden_dim = self.hidden_dim or int(self.output_dim * self.expert_hidden_ratio)
 
@@ -83,23 +83,32 @@ class SoftMoELayer(nn.Module):
         output = jnp.sum(expert_outputs * gate_weights_expanded, axis=-2)
 
         if return_metrics:
-            # Compute load balancing metrics
-            # Importance: sum of weights for each expert across batch
-            importance = jnp.mean(gate_weights, axis=tuple(range(len(batch_shape))))
+            batch_axes = tuple(range(len(batch_shape)))
+            importance = jnp.mean(gate_weights, axis=batch_axes)
+            gate_entropy = -jnp.mean(jnp.sum(gate_weights * jnp.log(gate_weights + 1e-10), axis=-1))
+            top2_usage = jnp.mean(jnp.sum(jnp.sort(gate_weights, axis=-1)[..., -2:], axis=-1))
+            gate_weight_mean = jnp.mean(gate_weights)
+            gate_weight_second_moment = jnp.mean(jnp.square(gate_weights))
+
+            # The auxiliary loss is nonlinear in expert importance, so combine
+            # replica means before squaring. Averaging local losses is not equal.
+            if axis_name is not None:
+                importance = jax.lax.pmean(importance, axis_name=axis_name)
+                gate_entropy = jax.lax.pmean(gate_entropy, axis_name=axis_name)
+                top2_usage = jax.lax.pmean(top2_usage, axis_name=axis_name)
+                gate_weight_mean = jax.lax.pmean(gate_weight_mean, axis_name=axis_name)
+                gate_weight_second_moment = jax.lax.pmean(
+                    gate_weight_second_moment,
+                    axis_name=axis_name,
+                )
 
             # Load balancing loss encourages uniform usage
             # Scale by num_experts so minimum is ~1 regardless of expert count
             load_balance_loss = self.num_experts * jnp.sum(importance**2)
 
-            # Entropy of gate weights (higher = more uniform)
-            gate_entropy = -jnp.mean(jnp.sum(gate_weights * jnp.log(gate_weights + 1e-10), axis=-1))
-
             # Expert utilization variance (higher = less uniform)
             expert_utilization_var = jnp.var(importance)
-
-            # Top-k expert usage (fraction of samples using top-2 experts)
-            top2_weights = jnp.sum(jnp.sort(gate_weights, axis=-1)[..., -2:], axis=-1)
-            top2_usage = jnp.mean(top2_weights)
+            gate_weight_std = jnp.sqrt(jnp.maximum(gate_weight_second_moment - jnp.square(gate_weight_mean), 0.0))
 
             metrics = {
                 "load_balance_loss": load_balance_loss * self.load_balance_loss_weight,
@@ -107,8 +116,8 @@ class SoftMoELayer(nn.Module):
                 "expert_importance": importance,
                 "expert_utilization_var": expert_utilization_var,
                 "top2_expert_usage": top2_usage,
-                "gate_weights_mean": jnp.mean(gate_weights),
-                "gate_weights_std": jnp.std(gate_weights),
+                "gate_weights_mean": gate_weight_mean,
+                "gate_weights_std": gate_weight_std,
             }
             return output, metrics
 
@@ -164,7 +173,7 @@ class SoftMoEActorCritic(nn.Module):
         self.activation_fn = get_activation_fn(self.activation)
         self.running_mean_std = RunningMeanStd()
 
-    def _build_network(self, x, is_actor=True, return_metrics=False):
+    def _build_network(self, x, is_actor=True, return_metrics=False, axis_name: str | None = None):
         """Build either actor or critic network with optional MoE layers."""
         metrics = {}
         total_load_balance_loss = 0.0
@@ -187,7 +196,7 @@ class SoftMoEActorCritic(nn.Module):
                         load_balance_loss_weight=self.load_balance_loss_weight,
                         gate_init_std=self.gate_init_std,
                         name=f"{'actor' if is_actor else 'critic'}_moe_layer_{i}",
-                    )(x, return_metrics=True)
+                    )(x, return_metrics=True, axis_name=axis_name)
 
                     metrics[f"layer_{i}_metrics"] = layer_metrics
                     total_load_balance_loss += layer_metrics["load_balance_loss"]
@@ -236,7 +245,7 @@ class SoftMoEActorCritic(nn.Module):
                     load_balance_loss_weight=self.load_balance_loss_weight,
                     gate_init_std=self.gate_init_std,
                     name=f"{'actor' if is_actor else 'critic'}_moe_output",
-                )(x, return_metrics=True)
+                )(x, return_metrics=True, axis_name=axis_name)
 
                 metrics["output_metrics"] = layer_metrics
                 total_load_balance_loss += layer_metrics["load_balance_loss"]
@@ -265,7 +274,13 @@ class SoftMoEActorCritic(nn.Module):
         return x
 
     @nn.compact
-    def __call__(self, x, return_metrics=False):
+    def __call__(
+        self,
+        x,
+        return_metrics: bool = False,
+        actor_only: bool = False,
+        axis_name: str | None = None,
+    ):
         # Normalize input
         x = self.running_mean_std(x)
 
@@ -274,7 +289,12 @@ class SoftMoEActorCritic(nn.Module):
         # Build actor
         actor_x = x if self.actor_obs_ind is None else x[..., self.actor_obs_ind]
         if return_metrics:
-            actor_mean, actor_metrics = self._build_network(actor_x, is_actor=True, return_metrics=True)
+            actor_mean, actor_metrics = self._build_network(
+                actor_x,
+                is_actor=True,
+                return_metrics=True,
+                axis_name=axis_name,
+            )
             all_metrics["actor"] = actor_metrics
         else:
             actor_mean = self._build_network(actor_x, is_actor=True, return_metrics=False)
@@ -285,11 +305,18 @@ class SoftMoEActorCritic(nn.Module):
             actor_logtstd = jax.lax.stop_gradient(actor_logtstd)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+        if actor_only:
+            return pi
 
         # Build critic
         critic_x = x if self.critic_obs_ind is None else x[..., self.critic_obs_ind]
         if return_metrics:
-            critic_out, critic_metrics = self._build_network(critic_x, is_actor=False, return_metrics=True)
+            critic_out, critic_metrics = self._build_network(
+                critic_x,
+                is_actor=False,
+                return_metrics=True,
+                axis_name=axis_name,
+            )
             all_metrics["critic"] = critic_metrics
         else:
             critic_out = self._build_network(critic_x, is_actor=False, return_metrics=False)
@@ -305,3 +332,7 @@ class SoftMoEActorCritic(nn.Module):
             return pi, critic_value, all_metrics
 
         return pi, critic_value
+
+    def update_observation_stats(self, x, axis_name: str | None = None):
+        """Update only the observation normalizer, without running the policy."""
+        return self.running_mean_std(x, update_stats=True, axis_name=axis_name)

@@ -68,29 +68,30 @@ import sys
 from omegaconf import OmegaConf
 
 from fullbody._eval_terminal import apply_eval_terminal_defaults, apply_terminal_cli_overrides
-from musclemimic.algorithms import PPOJax
+from loco_mujoco.task_factories import TaskFactory
+from musclemimic.runner.engine import pick_algorithm
 from musclemimic.runner.eval_utils import (
     add_common_eval_args,
-    normalize_eval_args,
-    validate_viewer_args,
-    setup_headless,
-    load_checkpoint,
+    align_agent_state,
+    apply_configured_evaluation_backend,
     apply_temporal_params,
     apply_trajectory_selection,
+    check_trajectory_sync,
     configure_goal_visualization,
     configure_recording,
-    align_agent_state,
-    validate_traj_index,
     format_trajectory_listing,
-    verify_env_dt,
-    check_trajectory_sync,
+    load_checkpoint,
+    normalize_eval_args,
     run_validation_metrics,
     run_validation_metrics_mjx_all,
     run_validation_metrics_mujoco,
     run_with_mujoco_viewer,
     run_with_trajectory_export,
+    setup_headless,
+    validate_traj_index,
+    validate_viewer_args,
+    verify_env_dt,
 )
-from loco_mujoco.task_factories import TaskFactory
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True "
 from jax import config as jax_config
@@ -107,7 +108,7 @@ def apply_eval_init_state_overrides(env_params: dict, config) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Evaluate, visualize, or record a fullbody PPO policy.")
+    parser = argparse.ArgumentParser(description="Evaluate, visualize, or record a fullbody policy.")
     add_common_eval_args(parser, default_n_envs=10)
     parser.add_argument(
         "--hfield_length",
@@ -139,6 +140,13 @@ def main() -> int:
         default=False,
         action="store_true",
         help="Evaluate all trajectories in the dataset (default: False).",
+    )
+    parser.add_argument(
+        "--evaluate_all_passes",
+        type=int,
+        default=1,
+        help="With --evaluate_all --export_trajectory, repeat the full dataset sweep this many "
+        "times (default: 1). With --stochastic each pass is a different rollout.",
     )
     parser.add_argument(
         "--no_termination",
@@ -191,6 +199,16 @@ def main() -> int:
         print(f"Error: {exc}")
         return 1
 
+    config, agent_state, _metadata = load_checkpoint(args.path)
+    OmegaConf.set_struct(config, False)
+    try:
+        backend_changed = apply_configured_evaluation_backend(args, config)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+    if backend_changed:
+        print("Checkpoint evaluation backend: using CPU MuJoCo")
+
     viewer_err = validate_viewer_args(args)
     if viewer_err:
         print(viewer_err)
@@ -202,8 +220,7 @@ def main() -> int:
         print("   Use --no_render for headless operation")
         return 1
 
-    config, agent_state, _metadata = load_checkpoint(args.path)
-    OmegaConf.set_struct(config, False)
+    algorithm_cls = pick_algorithm(config)
 
     # Restore training configuration
     print("=== RESTORING TRAINING CONFIGURATION ===")
@@ -245,7 +262,7 @@ def main() -> int:
         old_stride = goal_params.get("n_step_stride")
         if old_stride is not None:
             # lookahead_time = stride * control_dt (keep constant)
-            new_stride = int(round(old_stride * training_control_dt / new_control_dt))
+            new_stride = round(old_stride * training_control_dt / new_control_dt)
             new_stride = max(1, new_stride)
             config.experiment.env_params["goal_params"]["n_step_stride"] = new_stride
             print(f"   n_step_stride: {old_stride} -> {new_stride} (preserving {old_stride * training_control_dt:.2f}s lookahead)")
@@ -328,7 +345,7 @@ def main() -> int:
             # Handle nested list/ListConfig - flatten to get first string path
             first_path = motion_paths
             while hasattr(first_path, "__iter__") and not isinstance(first_path, str):
-                first_path = list(first_path)[0] if first_path else None
+                first_path = next(iter(first_path)) if first_path else None
             if first_path:
                 # Use full path with / replaced by _ (e.g., "KIT/9/walking_run07_poses" -> "KIT_9_walking_run07_poses")
                 motion_name = str(first_path).replace("/", "_")
@@ -358,7 +375,7 @@ def main() -> int:
     validate_traj_index(env, args.traj_index)
 
     # Build agent configuration and align state for inference
-    agent_conf = PPOJax.init_agent_conf(env, config)
+    agent_conf = algorithm_cls.init_agent_conf(env, config)
     agent_state = align_agent_state(agent_state, agent_conf)
 
     # Verify env timing and trajectory sync
@@ -403,6 +420,7 @@ def main() -> int:
             _validation_summary, metrics_dict = run_validation_metrics(
                 config,
                 agent_state,
+                agent_conf,
                 train_state_seed=args.train_state_seed,
                 num_steps=args.metrics_steps,
                 num_envs=args.metrics_envs,
@@ -432,7 +450,7 @@ def main() -> int:
             print("Running evaluation with trajectory export...")
             if args.no_render:
                 print("  Headless mode enabled for trajectory export")
-            trajectory_filepath, trajectory_data = run_with_trajectory_export(
+            trajectory_filepath, _trajectory_data = run_with_trajectory_export(
                 env,
                 agent_conf,
                 agent_state,
@@ -442,6 +460,9 @@ def main() -> int:
                 train_state_seed=args.train_state_seed,
                 trajectory_dir=args.trajectory_dir,
                 file_prefix="myofullbody_episodes",
+                evaluate_all=args.evaluate_all,
+                evaluate_all_passes=args.evaluate_all_passes,
+                motion_group=args.motion_group,
             )
 
         elif args.use_mujoco and args.mujoco_viewer:
@@ -462,7 +483,7 @@ def main() -> int:
             viewer.run(n_steps=args.n_steps)
         elif args.use_mujoco:
             print("Running MuJoCo evaluation...")
-            PPOJax.play_policy_mujoco(
+            algorithm_cls.play_policy_mujoco(
                 env,
                 agent_conf,
                 agent_state,
@@ -476,7 +497,7 @@ def main() -> int:
             print("Running MJX evaluation...")
             mjx_play_envs = 1 if args.traj_index is not None else int(args.num_envs)
             use_sequential_mjx = args.traj_index is not None and not args.evaluate_all
-            PPOJax.play_policy(
+            algorithm_cls.play_policy(
                 env,
                 agent_conf,
                 agent_state,

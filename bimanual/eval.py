@@ -34,7 +34,7 @@ import sys
 from omegaconf import OmegaConf
 
 from loco_mujoco.task_factories import TaskFactory
-from musclemimic.algorithms import PPOJax
+from musclemimic.runner.engine import pick_algorithm
 from musclemimic.runner.eval_utils import (
     add_common_eval_args,
     align_agent_state,
@@ -63,7 +63,7 @@ jax_config.update("jax_default_matmul_precision", "high")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run evaluation with PPOJax.")
+    parser = argparse.ArgumentParser(description="Run fullbody or bimanual policy evaluation.")
     add_common_eval_args(parser, default_n_envs=5)
 
     parser.add_argument(
@@ -146,6 +146,7 @@ def main() -> int:
 
     config, agent_state, _metadata = load_checkpoint(args.path)
     OmegaConf.set_struct(config, False)
+    algorithm_cls = pick_algorithm(config)
 
     # Restore training configuration
     print("=== RESTORING TRAINING CONFIGURATION ===")
@@ -297,7 +298,7 @@ def main() -> int:
     validate_traj_index(env, args.traj_index)
 
     # Build agent configuration and align state for inference
-    agent_conf = PPOJax.init_agent_conf(env, config)
+    agent_conf = algorithm_cls.init_agent_conf(env, config)
     agent_state = align_agent_state(agent_state, agent_conf)
 
     # Verify env timing and trajectory sync
@@ -330,6 +331,7 @@ def main() -> int:
             _validation_summary, metrics_dict = run_validation_metrics(
                 config,
                 agent_state,
+                agent_conf,
                 train_state_seed=args.train_state_seed,
                 num_steps=args.metrics_steps,
                 num_envs=args.metrics_envs,
@@ -369,6 +371,7 @@ def main() -> int:
                 train_state_seed=args.train_state_seed,
                 trajectory_dir=args.trajectory_dir,
                 file_prefix="bimanual_episodes",
+                motion_group=args.motion_group,
             )
 
         elif args.use_mujoco and args.mujoco_viewer:
@@ -389,7 +392,7 @@ def main() -> int:
             viewer.run(n_steps=args.n_steps)
         elif args.use_mujoco:
             print("Running MuJoCo evaluation...")
-            PPOJax.play_policy_mujoco(
+            algorithm_cls.play_policy_mujoco(
                 env,
                 agent_conf,
                 agent_state,
@@ -401,7 +404,7 @@ def main() -> int:
             )
         else:
             print("Running MJX evaluation...")
-            PPOJax.play_policy(
+            algorithm_cls.play_policy(
                 env,
                 agent_conf,
                 agent_state,

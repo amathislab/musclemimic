@@ -1,0 +1,16 @@
+# MyoFullBody ablation: no muscle observations
+# Inherits from conf_fullbody.yaml and disables muscle observations
+defaults:
+  - conf_fullbody
+  - _self_
+
+wandb:
+  tags: ["fullbody", "ablation", "no_muscle_obs"]
+
+experiment:
+  env_params:
+    enable_muscle_length_observations: false
+    enable_muscle_velocity_observations: false
+    enable_muscle_force_observations: false
+    enable_muscle_excitation_observations: false
+    enable_muscle_activation_observations: false

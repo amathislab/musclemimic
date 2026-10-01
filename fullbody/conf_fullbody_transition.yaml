@@ -1,0 +1,32 @@
+# MyoFullBody MoE with transition dataset
+# Inherits from conf_fullbody.yaml
+defaults:
+  - conf_fullbody
+  - _self_
+
+wandb:
+  tags: ["fullbody", "transition"]
+
+experiment:
+  num_minibatches: 8
+
+  task_factory:
+    params:
+      amass_dataset_conf:
+        dataset_group: "KIT_KINESIS_TRANSITION_TRAINING_MOTIONS"
+
+  anneal_lr: true
+  lr_schedule_type: "linear"
+
+  env_params:
+    terminal_state_type: MeanRelativeSiteDeviationTerminalStateHandler
+    terminal_state_params:
+      mean_site_deviation_threshold: 0.25
+      enable_site_check: true
+
+  # Network architecture (for reference)
+  actor_hidden_layers: [1024, 2048, 2048, 2048, 2048, 1024, 1024]
+  critic_hidden_layers: [1024, 2048, 2048, 2048, 2048, 1024, 1024]
+
+  # Disable MoE
+  use_moe: false

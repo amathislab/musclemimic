@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
+from musclemimic.algorithms.common.distributed import mark_data_varying
 from musclemimic.core.mujoco_mjx import MjxState
 
 
@@ -33,6 +34,15 @@ def unwrap_to_mjx(state):
         return cur
 
     return inner, rewrap
+
+
+def preserve_data_axis_variation(next_state, previous_state, axis_name):
+    """Keep wrapped environment scan carry variation stable after a step."""
+    return mark_data_varying(
+        next_state,
+        axis_name,
+        empty_reference=previous_state,
+    )
 
 
 def update_carry_weights_normalized(env_state, new_weights):

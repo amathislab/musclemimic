@@ -1,0 +1,197 @@
+defaults:
+  - conf_fullbody_flashsac
+  - _self_
+
+wandb:
+  project: "terra"
+  tags: ["terra", "flashsac", "single-motion", "non-flat"]
+
+experiment:
+  # TERRA's accelerator contract is deliberately narrower than the generic
+  # full-body configuration: all training and in-loop rollouts use MuJoCo
+  # Warp through the MJX/JAX API.  Offline evaluation and rendering use the
+  # reference CPU MuJoCo environment instead (see evaluation_backend below).
+  training_backend: mjx_warp
+  evaluation_backend: mujoco
+
+  task_factory:
+    name: ImitationFactory
+    params:
+      amass_dataset_conf:
+        # Set by `terra-flashsac`; defaults retain the released demo recipe.
+        rel_dataset_path: ${oc.env:TERRA_MOTION,EKUT/EKUT/234/WSUF03_poses}
+        dataset_group: null
+        retargeting_method: terra
+        output_cache_subdir: terra
+        cache_root: ${oc.env:TERRA_RETARGETED_MOTIONS,retargeted_motions}
+        load_paired_terrain: true
+        require_nonflat_terrain: true
+        clear_cache: false
+        allow_cache_download: false
+        trajectory_cache_type: sparse
+
+  env_params:
+    env_name: MjxMyoFullBody
+    mjx_backend: warp
+    num_envs: 256
+    # The default pose produces 134 narrow-phase candidates with the paired
+    # box terrain and full self-contact graph. Keep headroom above that count.
+    nconmax: 192
+    njmax: 768
+    preserve_trajectory_root_xy: true
+    enable_global_root_position_observation: true
+    enable_heightmap_observations: true
+    heightmap_grid_rows: 11
+    heightmap_grid_cols: 11
+    heightmap_grid_resolution: 0.1
+    heightmap_body_name: pelvis
+
+    init_state_type: PerturbedTrajInitialStateHandler
+    init_state_params:
+      qpos_noise_std: 0.01
+      qvel_noise_std: 0.0
+      perturb_free_joint_pos: false
+      perturb_free_joint_quat: false
+      perturb_free_joint_vel: false
+      perturb_ball_joints: false
+
+    goal_type: GoalTrajMimic
+    goal_params:
+      n_step_lookahead: 2
+      n_step_stride: 10
+      upper_body_xml_name: torso
+      enable_motion_phase: true
+      use_concise_lookahead: false
+      enable_mimic_site_rpos_observations: true
+      enable_global_root_tracking_observations: true
+      sites_for_mimic:
+        - pelvis_mimic
+        - upper_body_mimic
+        - head_mimic
+        - left_shoulder_mimic
+        - left_elbow_mimic
+        - left_hand_mimic
+        - right_shoulder_mimic
+        - right_elbow_mimic
+        - right_hand_mimic
+        - left_hip_mimic
+        - left_knee_mimic
+        - left_ankle_mimic
+        - left_toes_mimic
+        - right_hip_mimic
+        - right_knee_mimic
+        - right_ankle_mimic
+        - right_toes_mimic
+
+    reward_type: TerraMimicReward
+    reward_params:
+      qpos_w_sum: 0.5
+      qvel_w_sum: 0.25
+      root_pos_w_sum: 1.0
+      root_quat_w_sum: 0.5
+      root_vel_w_sum: 0.5
+      rpos_w_sum: 1.0
+      rquat_w_sum: 0.5
+      rvel_w_sum: 0.5
+      qpos_w_exp: 5.0
+      qvel_w_exp: 0.5
+      root_pos_w_exp: 10.0
+      root_quat_w_exp: 6.25
+      root_vel_w_exp: 1.0
+      rpos_w_exp: 10.0
+      rquat_w_exp: 6.25
+      rvel_w_exp: 1.0
+      action_rate_coeff: 0.0001
+      use_mean_exp_reward: false
+      sites_for_mimic: ${experiment.env_params.goal_params.sites_for_mimic}
+
+    terminal_state_type: MeanRelativeSiteDeviationWithRootTerminalStateHandler
+    terminal_state_params:
+      mean_site_deviation_threshold: 1.0
+      root_deviation_threshold: 1.0
+      root_orientation_threshold: 1.0
+      enable_site_check: true
+
+    domain_randomization_type: DefaultRandomizer
+    domain_randomization_params:
+      randomize_gravity: false
+      gravity_range: [9.81, 9.81]
+      randomize_geom_friction_tangential: false
+      geom_friction_tangential_range: [1.0, 1.0]
+      randomize_geom_friction_torsional: false
+      geom_friction_torsional_range: [0.005, 0.005]
+      randomize_geom_friction_rolling: false
+      geom_friction_rolling_range: [0.0001, 0.0001]
+      randomize_geom_damping: false
+      geom_damping_range: [1.0, 1.0]
+      randomize_geom_stiffness: false
+      geom_stiffness_range: [1000.0, 1000.0]
+      randomize_base_mass: false
+      base_mass_to_add_range: [0.0, 0.0]
+      randomize_link_mass: false
+      link_mass_multiplier_range:
+        root_body: [1.0, 1.0]
+        other_bodies: [1.0, 1.0]
+      randomize_com_displacement: true
+      com_displacement_range: [-0.015, 0.015]
+      randomize_joint_friction_loss: false
+      joint_friction_loss_range: [0.0, 0.0]
+      randomize_joint_damping: false
+      joint_damping_range: [0.0, 0.0]
+      randomize_joint_armature: false
+      joint_armature_range: [0.0, 0.0]
+      add_joint_pos_noise: true
+      joint_pos_noise_scale: 0.01
+      add_joint_vel_noise: true
+      joint_vel_noise_scale: 0.2
+      add_gravity_noise: false
+      gravity_noise_scale: 0.0
+      add_free_joint_lin_vel_noise: true
+      lin_vel_noise_scale: 0.08
+      add_free_joint_ang_vel_noise: true
+      ang_vel_noise_scale: 0.1
+      apply_velocity_pushes: true
+      push_interval_range_s: [1.0, 3.0]
+      push_linear_velocity_max: [0.2, 0.2, 0.1]
+      push_angular_velocity_max: [0.2, 0.2, 0.3]
+
+  num_envs: ${experiment.env_params.num_envs}
+  total_timesteps: 50000000
+  normalize_env: false
+
+  flashsac_config:
+    buffer_capacity: 262144
+    min_buffer_size: 32768
+    sample_batch_size: 1024
+    replay_storage_dtype: bfloat16
+    updates_per_interaction: 1
+
+  validation:
+    active: true
+    deterministic: true
+    num_steps: ${oc.decode:${oc.env:TERRA_VALIDATION_STEPS,616}}
+    num_envs: 32
+    num: 50
+    start_from_beginning: true
+    env_params:
+      domain_randomization_type: NoDomainRandomization
+      domain_randomization_params: {}
+    init_state_type: TrajInitialStateHandler
+    init_state_params: {}
+    terminal_state_type: MeanRelativeSiteDeviationWithRootTerminalStateHandler
+    terminal_state_params:
+      mean_site_deviation_threshold: 1.0
+      root_deviation_threshold: 1.0
+      root_orientation_threshold: 1.0
+      enable_site_check: true
+    amass_dataset_conf:
+      rel_dataset_path: ${oc.env:TERRA_MOTION,EKUT/EKUT/234/WSUF03_poses}
+      dataset_group: null
+      retargeting_method: terra
+      output_cache_subdir: terra
+      cache_root: ${oc.env:TERRA_RETARGETED_MOTIONS,retargeted_motions}
+      load_paired_terrain: true
+      require_nonflat_terrain: true
+      clear_cache: false
+      allow_cache_download: false
+      trajectory_cache_type: sparse

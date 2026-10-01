@@ -8,6 +8,7 @@ from loco_mujoco.core import ObservationType
 from loco_mujoco.core.utils import info_property
 from musclemimic.environments import LocoEnv
 from musclemimic.utils.logging import setup_logger
+from musclemimic.utils.model_fixes import apply_myofullbody_model_fixes
 from mujoco import MjSpec
 import musclemimic_models
 
@@ -58,12 +59,19 @@ class MyoFullBody(LocoEnv):
         disable_fingers: bool = True,
         enable_joint_pos_observations: bool = True,
         enable_joint_vel_observations: bool = True,
+        enable_global_root_position_observation: bool = False,
         enable_muscle_length_observations: bool = False,
         enable_muscle_velocity_observations: bool = False,
         enable_muscle_force_observations: bool = False,
         enable_muscle_excitation_observations: bool = False,
         enable_muscle_activation_observations: bool = False,
         enable_touch_sensor_observations: bool = True,
+        enable_heightmap_observations: bool = False,
+        heightmap_grid_rows: int = 11,
+        heightmap_grid_cols: int = 11,
+        heightmap_grid_resolution: float = 0.1,
+        heightmap_grid_forward_offset: float = 0.0,
+        heightmap_body_name: str | None = None,
         spec: str | MjSpec = None,
         observation_spec: list[ObservationType] = None,
         actuation_spec: list[str] = None,
@@ -79,11 +87,18 @@ class MyoFullBody(LocoEnv):
             disable_fingers (bool): If True (default), finger joints and muscles are disabled
             enable_joint_pos_observations (bool): If True (default), include joint positions in observations
             enable_joint_vel_observations (bool): If True (default), include joint velocities in observations
+            enable_global_root_position_observation (bool): Include root x/y instead of removing them.
             enable_muscle_length_observations (bool): If True, include muscle length in observations
             enable_muscle_velocity_observations (bool): If True, include muscle velocity in observations
             enable_muscle_force_observations (bool): If True, include muscle force in observations
             enable_muscle_excitation_observations (bool): If True, include muscle excitation (neural drive from data.ctrl) in observations
             enable_muscle_activation_observations (bool): If True, include muscle activation (actual state from data.act) in observations
+            enable_heightmap_observations (bool): If True, include a yaw-aligned terrain height grid.
+            heightmap_grid_rows (int): Number of height samples in the forward direction.
+            heightmap_grid_cols (int): Number of height samples in the lateral direction.
+            heightmap_grid_resolution (float): Spacing between height samples in meters.
+            heightmap_grid_forward_offset (float): Forward shift of the yaw-aligned grid in meters.
+            heightmap_body_name (str): Body used as the grid origin. Defaults to the root body.
             spec (Union[str, MjSpec]): Path to XML file or MjSpec object. If None, uses default.
             observation_spec (List[ObservationType]): Custom observation specification.
             actuation_spec (List[str]): Custom action specification.
@@ -93,12 +108,23 @@ class MyoFullBody(LocoEnv):
         self._disable_fingers = disable_fingers
         self._enable_joint_pos_observations = enable_joint_pos_observations
         self._enable_joint_vel_observations = enable_joint_vel_observations
+        self._enable_global_root_position_observation = enable_global_root_position_observation
         self._enable_muscle_length_observations = enable_muscle_length_observations
         self._enable_muscle_velocity_observations = enable_muscle_velocity_observations
         self._enable_muscle_force_observations = enable_muscle_force_observations
         self._enable_muscle_excitation_observations = enable_muscle_excitation_observations
         self._enable_muscle_activation_observations = enable_muscle_activation_observations
         self._enable_touch_sensor_observations = enable_touch_sensor_observations
+        self._enable_heightmap_observations = enable_heightmap_observations
+        self._heightmap_grid_rows = int(heightmap_grid_rows)
+        self._heightmap_grid_cols = int(heightmap_grid_cols)
+        self._heightmap_grid_resolution = float(heightmap_grid_resolution)
+        self._heightmap_grid_forward_offset = float(heightmap_grid_forward_offset)
+        self._heightmap_body_name = heightmap_body_name
+        if self._heightmap_grid_rows < 1 or self._heightmap_grid_cols < 1:
+            raise ValueError("Heightmap grid dimensions must be positive.")
+        if self._heightmap_grid_resolution <= 0.0:
+            raise ValueError("heightmap_grid_resolution must be positive.")
 
         # Store mjx_backend for use in _modify_spec_for_mjx
         self.mjx_backend = mjx_backend
@@ -153,6 +179,10 @@ class MyoFullBody(LocoEnv):
         Returns:
             MjSpec: Modified specification
         """
+
+        # Correct bundled muscle wrap geometry before either the MuJoCo or MJX model is
+        # compiled, so online dynamics and offline retargeting metrics see the same paths.
+        spec = apply_myofullbody_model_fixes(spec)
 
         # Handle finger disabling if requested (same logic as MyoBimanualArm)
         if self._disable_fingers:
@@ -340,8 +370,12 @@ class MyoFullBody(LocoEnv):
 
         # Add joint position observations if enabled
         if self._enable_joint_pos_observations:
-            # Add free joint observation (position without x,y)
-            obs_spec.append(ObservationType.FreeJointPosNoXY("q_free_joint", self.root_free_joint_xml_name))
+            root_obs_type = (
+                ObservationType.FreeJointPos
+                if self._enable_global_root_position_observation
+                else ObservationType.FreeJointPosNoXY
+            )
+            obs_spec.append(root_obs_type("q_free_joint", self.root_free_joint_xml_name))
             # Add all joint positions
             obs_spec.append(ObservationType.JointPosArray("q_all_pos", j_names))
 
@@ -388,6 +422,19 @@ class MyoFullBody(LocoEnv):
             for sensor_name in touch_sensors:
                 obs_name = f"touch_{sensor_name}"
                 obs_spec.append(ObservationType.TouchSensor(obs_name, xml_name=sensor_name))
+
+        if self._enable_heightmap_observations:
+            obs_spec.append(
+                ObservationType.HeightMatrix(
+                    "terrain_heightmap",
+                    grid_rows=self._heightmap_grid_rows,
+                    grid_cols=self._heightmap_grid_cols,
+                    grid_resolution=self._heightmap_grid_resolution,
+                    grid_forward_offset=self._heightmap_grid_forward_offset,
+                    body_name=self._heightmap_body_name,
+                    allow_randomization=False,
+                )
+            )
 
         return obs_spec
 

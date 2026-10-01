@@ -7,6 +7,66 @@ import numpy as np
 
 from .asset_paths import resolve_pose_hand_prior_path
 
+_SMPLH_GENDERS = frozenset({"female", "male", "neutral"})
+_SMPLH_HAND_FIELDS = frozenset(
+    {"hands_componentsl", "hands_componentsr", "hands_meanl", "hands_meanr"}
+)
+
+
+def _resolve_smplh_model_file(model_path: str | Path, gender: str) -> tuple[Path, str]:
+    """Resolve the concrete SMPL-H asset required by the parser."""
+
+    path = Path(model_path)
+    gender = gender.lower()
+    if gender not in _SMPLH_GENDERS:
+        supported = ", ".join(sorted(_SMPLH_GENDERS))
+        raise ValueError(f"Unsupported SMPL-H gender {gender!r}; expected one of: {supported}.")
+    requested_ext = path.suffix.lower().lstrip(".")
+    if requested_ext in {"pkl", "npz"} and not path.is_file():
+        raise FileNotFoundError(f"SMPL-H model file not found: {path}")
+    if path.is_file():
+        if requested_ext not in {"pkl", "npz"}:
+            raise ValueError(f"Unsupported SMPL-H model file extension: {path}")
+        return path, requested_ext
+
+    roots = [path]
+    if path.name != "smplh" and (path / "smplh").is_dir():
+        roots.append(path / "smplh")
+    candidates: list[Path] = []
+    for root in roots:
+        candidates.extend(
+            [
+                root / f"SMPLH_{gender.upper()}.pkl",
+                root / f"SMPLH_{gender.upper()}.npz",
+            ]
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate, candidate.suffix.lower().lstrip(".")
+
+    expected = ", ".join(str(candidate.relative_to(path)) for candidate in candidates)
+    raise FileNotFoundError(
+        f"No {gender} SMPL-H model found under {path}. Expected one of: {expected}."
+    )
+
+
+def _validate_smplh_model_file(model_file: Path, model_ext: str) -> None:
+    """Check NPZ assets for the hand parameters required by SMPL-H."""
+
+    if model_ext != "npz":
+        return
+    try:
+        with np.load(model_file, allow_pickle=False) as archive:
+            missing = sorted(_SMPLH_HAND_FIELDS - set(archive.files))
+    except Exception as exc:
+        raise ValueError(f"Unable to read SMPL-H model archive: {model_file}") from exc
+    if missing:
+        fields = ", ".join(missing)
+        raise ValueError(
+            f"SMPL-H model archive is missing required hand parameters ({fields}): "
+            f"{model_file}"
+        )
+
 
 def _resolve_smplx_model_file(model_path: str | Path, gender: str) -> tuple[Path, str]:
     path = Path(model_path)
@@ -319,9 +379,18 @@ def _make_surface_model(
     device: str,
 ):
     if surface_model_type == "smplh":
+        model_file, model_ext = _resolve_smplh_model_file(smpl_model_path, gender)
+        _validate_smplh_model_file(model_file, model_ext)
+
         from loco_mujoco.smpl import SMPLH_Parser
 
-        return SMPLH_Parser(model_path=smpl_model_path, gender=gender, create_transl=False).to(device), 156
+        smpl = SMPLH_Parser(
+            model_path=str(model_file),
+            gender=gender,
+            create_transl=False,
+            ext=model_ext,
+        ).to(device)
+        return smpl, 156
     if surface_model_type == "smplx":
         smpl = SMPLXParserAdapter(model_path=smpl_model_path, gender=gender, create_transl=False).to(device)
         return smpl, smpl.pose_dim

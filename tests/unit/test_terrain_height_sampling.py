@@ -44,6 +44,7 @@ class TestHeightMatrixBasics:
         assert obs.grid_rows == 10
         assert obs.grid_cols == 10
         assert obs.grid_resolution == 0.1
+        assert obs.grid_forward_offset == 0.0
         assert obs.body_name is None
 
 

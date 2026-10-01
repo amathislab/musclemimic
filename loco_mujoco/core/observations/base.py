@@ -59,6 +59,7 @@ class ObservationContainer(UserDict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._stateful_obs = []
+        self._state_classes = {}
         self._locked = False
 
     def __setitem__(self, key, observation: Observation):
@@ -123,10 +124,16 @@ class ObservationContainer(UserDict):
         stateful_obs = self.list_all_stateful()
         # Create a dictionary with the stateful observations
         stateful_obs_dict = {obs.name: obs.init_state(env, key, model, data, backend) for obs in stateful_obs}
-        # Dynamically create a class with fields from the dictionary
-        dynamic_class = make_dataclass("ObservationStates", stateful_obs_dict.keys())
-        # convert to flax dataclass
-        dynamic_class = struct.dataclass(dynamic_class, frozen=False)
+        # Reuse one class identity for each state schema. JAX compares pytree
+        # node types by identity, so recreating this class during shape
+        # inference and compiled tracing makes otherwise identical outputs
+        # incompatible with shard_map out_specs.
+        field_names = tuple(stateful_obs_dict)
+        dynamic_class = self._state_classes.get(field_names)
+        if dynamic_class is None:
+            dynamic_class = make_dataclass("ObservationStates", field_names)
+            dynamic_class = struct.dataclass(dynamic_class, frozen=False)
+            self._state_classes[field_names] = dynamic_class
         # create instance
         return dynamic_class(**stateful_obs_dict)
 
@@ -998,6 +1005,7 @@ class HeightMatrix(StatefulObservation):
         grid_rows: Number of rows in the sampling grid (default: 10).
         grid_cols: Number of columns in the sampling grid (default: 10).
         grid_resolution: Distance in meters between sample points (default: 0.1).
+        grid_forward_offset: Forward shift of the yaw-aligned grid (default: 0.0).
         body_name: Name of the body to center the grid on (default: root body).
     """
 
@@ -1005,12 +1013,14 @@ class HeightMatrix(StatefulObservation):
                  grid_rows: int = 10,
                  grid_cols: int = 10,
                  grid_resolution: float = 0.1,
+                 grid_forward_offset: float = 0.0,
                  body_name: str = None,
                  **kwargs):
         super().__init__(obs_name, **kwargs)
         self.grid_rows = grid_rows
         self.grid_cols = grid_cols
         self.grid_resolution = grid_resolution
+        self.grid_forward_offset = grid_forward_offset
         self.body_name = body_name
         self.dim = grid_rows * grid_cols
 
@@ -1036,7 +1046,10 @@ class HeightMatrix(StatefulObservation):
         offsets = []
         for i in range(self.grid_rows):
             for j in range(self.grid_cols):
-                x_offset = (i - half_rows) * self.grid_resolution  # Forward direction
+                x_offset = (
+                    (i - half_rows) * self.grid_resolution
+                    + self.grid_forward_offset
+                )  # Forward direction
                 y_offset = (j - half_cols) * self.grid_resolution  # Lateral direction
                 offsets.append([x_offset, y_offset])
 

@@ -1,0 +1,20 @@
+# MyoFullBody with terrain randomization
+# Inherits from conf_fullbody.yaml and adds terrain randomization
+defaults:
+  - conf_fullbody
+  - _self_
+
+wandb:
+  tags: ["fullbody", "terrain_rand"]
+
+experiment:
+  env_params:
+    # Terrain randomization
+    terrain_type: RoughTerrain
+    terrain_params:
+      inner_platform_size_in_meters: 1.5   # Flat spawn area in center (meters)
+      random_min_height: -0.015            # Min terrain bump height (meters)
+      random_max_height: 0.015             # Max terrain bump height (meters)
+      random_step: 0.005                   # Height quantization step
+      random_downsampled_scale: 0.5        # Terrain smoothness (higher = smoother)
+      hfield_length: 60                    # Grid resolution

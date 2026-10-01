@@ -4,15 +4,92 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import mujoco
 import numpy as np
 from flax import struct
+from mujoco import mjx
+from mujoco.mjx import Data, Model
 
-import mujoco
 from loco_mujoco.core.mujoco_base import AdditionalCarry, Mujoco
 from loco_mujoco.core.visuals import MujocoViewer
 from loco_mujoco.trajectory import TrajectoryData
-from mujoco import mjx
-from mujoco.mjx import Data, Model
+
+
+_NUMERICS_INFO_KEYS = (
+    "numerics_nonfinite_observation",
+    "numerics_nonfinite_qpos",
+    "numerics_nonfinite_qvel",
+    "numerics_nonfinite_reward",
+    "numerics_nonfinite_reward_info",
+    "numerics_nonfinite_transition",
+)
+
+
+def _is_inexact(value: Any) -> bool:
+    """Return whether a JAX-compatible value can contain NaN or infinity."""
+    try:
+        return jnp.issubdtype(jnp.asarray(value).dtype, jnp.inexact)
+    except (TypeError, ValueError):
+        return False
+
+
+def _tree_has_nonfinite(tree: Any) -> jax.Array:
+    """Return a scalar flag for nonfinite floating-point leaves in ``tree``."""
+    flags = [
+        jnp.any(~jnp.isfinite(jnp.asarray(leaf)))
+        for leaf in jax.tree_util.tree_leaves(tree)
+        if _is_inexact(leaf)
+    ]
+    if not flags:
+        return jnp.asarray(False)
+    return jnp.any(jnp.stack(flags))
+
+
+def _sanitize_inexact_tree(tree: Any) -> Any:
+    """Replace NaN and infinities in floating-point leaves with finite zeros."""
+
+    def sanitize(value):
+        if not _is_inexact(value):
+            return value
+        return jnp.nan_to_num(jnp.asarray(value), nan=0.0, posinf=0.0, neginf=0.0)
+
+    return jax.tree_util.tree_map(sanitize, tree)
+
+
+def _preserve_scan_carry_axis_types(next_tree: Any, previous_tree: Any) -> Any:
+    """Preserve manual-axis variation erased by opaque simulation calls.
+
+    MJX-Warp steps through an FFI boundary that can return arrays without the
+    manual-axis variation carried by their inputs.  A ``lax.scan`` requires the
+    input and output carry types to match exactly, including those annotations.
+    Make every non-empty output depend on its corresponding input without
+    changing its value.  Empty buffers keep the previous value, which is
+    equivalent and retains its annotation.
+    """
+
+    def preserve(next_value: Any, previous_value: Any) -> Any:
+        if next_value.size == 0:
+            return previous_value
+        input_dependent = previous_value == previous_value
+        return jnp.where(input_dependent, next_value, next_value)
+
+    return jax.tree_util.tree_map(preserve, next_tree, previous_tree)
+
+
+def _parse_warp_graph_mode(value: str):
+    """Translate the public configuration value to MuJoCo's Warp enum."""
+    from mujoco.mjx.warp.types import GraphMode
+
+    graph_modes = {
+        "jax": GraphMode.JAX,
+        "warp": GraphMode.WARP,
+        "warp_staged_ex": GraphMode.WARP_STAGED_EX,
+    }
+    requested_mode = str(value).lower()
+    if requested_mode not in graph_modes:
+        valid_modes = ", ".join(repr(mode) for mode in graph_modes)
+        raise ValueError(f"mjx_warp_graph_mode must be one of {{{valid_modes}}}; got {value!r}")
+    return graph_modes[requested_mode]
 
 
 @struct.dataclass
@@ -64,9 +141,15 @@ class Mjx(Mujoco):
 
     """
 
-    def __init__(self, mjx_backend="jax", **kwargs):
+    def __init__(
+        self,
+        mjx_backend="jax",
+        mjx_warp_graph_mode: str | None = None,
+        **kwargs,
+    ):
         # Extract mjx_backend parameter before passing to parent
         self.mjx_backend = mjx_backend
+        self.mjx_warp_graph_mode = mjx_warp_graph_mode
 
         # call base mujoco env
         super().__init__(**kwargs)
@@ -82,48 +165,42 @@ class Mjx(Mujoco):
         backend_impl = self._get_mjx_backend()
         self._backend_impl = backend_impl
 
-        self.sys = mjx.put_model(self._model, impl=backend_impl)
+        put_model_kwargs = {}
+        if backend_impl == "warp" and mjx_warp_graph_mode is not None:
+            put_model_kwargs["graph_mode"] = _parse_warp_graph_mode(mjx_warp_graph_mode)
+        sys = mjx.put_model(self._model, impl=backend_impl, **put_model_kwargs)
+        # Warp's FFI buffers must first be materialized by each transformed
+        # replica, not eagerly bound to device zero during Python setup.
+        self.sys = jax.device_get(sys) if backend_impl == "warp" else sys
 
         # Handle data creation based on backend
         if backend_impl == "warp":
-            # MJX-Warp cannot build Data from an MjData via mjx.put_data, so resets
-            # must start from a fresh mjx.make_data allocation.
-            # new mjx update: nconmax=per-env, naconmax=total across all envs
-            # Use the calculated values from the environment if available, otherwise model defaults
+            # The model/spec nconmax remains the per-world contact budget, while
+            # MJX-Warp 3.11 allocates contacts through naconmax across all worlds.
+            # Use the calculated values from the environment if available, otherwise model defaults.
             nconmax_val = getattr(self, "nconmax", self._model.nconmax)
             njmax_val = getattr(self, "njmax", self._model.njmax)
-            # naconmax: total contacts across all envs (required for MuJoCo 3.3.7+)
+            # naconmax is the total active-contact capacity across all environments.
             naconmax_val = getattr(self, "naconmax", nconmax_val)
             # Store budgets for use in reset
             self._nconmax = int(nconmax_val)
             self._njmax = int(njmax_val)
             self._naconmax = int(naconmax_val)
-            # Avoid debug prints inside initialization to keep tracing pure
-            data = mjx.make_data(self._model, impl=backend_impl, nconmax=nconmax_val, njmax=njmax_val, naconmax=naconmax_val)
-
-            data = data.replace(
-                qpos=jnp.array(self._data.qpos),
-                qvel=jnp.array(self._data.qvel),
-                ctrl=jnp.array(self._data.ctrl),
-                act=jnp.array(self._data.act),
-                xpos=jnp.array(self._data.xpos),
-                xquat=jnp.array(self._data.xquat),
-                site_xpos=jnp.array(self._data.site_xpos),
-                cvel=jnp.array(self._data.cvel),
-                xipos=jnp.array(self._data.xipos),
-                subtree_com=jnp.array(self._data.subtree_com),
-                xmat=jnp.array(self._data.xmat).reshape(-1, 3, 3) if hasattr(self._data, "xmat") else data.xmat,
-                ximat=jnp.array(self._data.ximat).reshape(-1, 3, 3) if hasattr(self._data, "ximat") else data.ximat,
-                site_xmat=jnp.array(self._data.site_xmat).reshape(-1, 3, 3)
-                if hasattr(self._data, "site_xmat")
-                else data.site_xmat,
-            )
-        else:
-            data = mjx.put_data(self._model, self._data, impl=backend_impl)
-
         # NOTE: No longer storing _first_data - it will be created fresh in each reset
         # This avoids sharing Data objects across vmapped instances (causes BatchTracer leaks)
         self._backend_impl = backend_impl
+
+    def _make_device_data(self) -> Data:
+        """Create fresh backend data from the reset and forwarded CPU template."""
+        if self._backend_impl == "warp":
+            return mjx.put_data(
+                self._model,
+                self._data,
+                impl="warp",
+                njmax=self._njmax,
+                naconmax=self._naconmax,
+            )
+        return mjx.put_data(self._model, self._data, impl=self._backend_impl)
 
     def _get_mjx_backend(self):
         """
@@ -140,10 +217,10 @@ class Mjx(Mujoco):
             # Check if Warp is available - raise error if not
             try:
                 import warp
-            except ImportError:
+            except ImportError as error:
                 raise ImportError(
                     "Warp backend requested but warp-lang not installed. Install with: pip install warp-lang"
-                )
+                ) from error
 
             # Check if CUDA is available for Warp - raise error if not
             if not warp.is_cuda_available():
@@ -159,6 +236,7 @@ class Mjx(Mujoco):
         self,
         key: jax.random.PRNGKey,
         selected_traj_idx: jax.Array | None = None,
+        selected_subtraj_step: jax.Array | None = None,
     ) -> MjxState:
         """
         Resets the environment.
@@ -173,19 +251,7 @@ class Mjx(Mujoco):
 
         key, subkey = jax.random.split(key)
 
-        # Create fresh Data for this reset
-        # NOTE: This is called OUTSIDE vmap (by VecEnv), so mjx.make_data is safe for all backends
-        if self._backend_impl == "warp":
-            data = mjx.make_data(self._model, impl=self._backend_impl, nconmax=self._nconmax, njmax=self._njmax, naconmax=self._naconmax)
-            # Initialize with current model state
-            data = data.replace(
-                qpos=jnp.array(self._data.qpos),
-                qvel=jnp.array(self._data.qvel),
-                ctrl=jnp.array(self._data.ctrl),
-                act=jnp.array(self._data.act),
-            )
-        else:
-            data = mjx.put_data(self._model, self._data, impl=self._backend_impl)
+        data = self._make_device_data()
 
         # Forward kinematics for initial carry initialization
         data = mjx.forward(self.sys, data)
@@ -195,9 +261,23 @@ class Mjx(Mujoco):
             carry = carry.replace(
                 selected_traj_idx=jnp.asarray(selected_traj_idx, dtype=jnp.int32),
             )
+        if selected_subtraj_step is not None and hasattr(carry, "selected_subtraj_step"):
+            carry = carry.replace(
+                selected_subtraj_step=jnp.asarray(selected_subtraj_step, dtype=jnp.int32),
+            )
 
-        # Sample/reset all episode-specific state (may update qpos/qvel and randomizer/terrain states)
-        data, carry = self._mjx_reset_carry(self.sys, data, carry)
+        # Explicit trajectory resets have a separate static path so data-parallel
+        # compilation does not trace the ordinary random-start branch.
+        if selected_traj_idx is None:
+            data, carry = self._mjx_reset_carry(self.sys, data, carry)
+        else:
+            data, carry = self._mjx_reset_carry_to_step(
+                self.sys,
+                data,
+                carry,
+                selected_traj_idx,
+                selected_subtraj_step,
+            )
 
         # Apply terrain/domain randomization and recompute derived quantities so the initial
         # observation uses the correct model parameters and kinematics.
@@ -215,11 +295,11 @@ class Mjx(Mujoco):
 
         # Initialize reward_info keys with zeros for JAX scan compatibility
         dummy_action = jnp.zeros(self._mdp_info.action_space.shape[0])
-        _, carry, reward_info = self._mjx_reward(
-            obs, dummy_action, obs, absorbing, info, self._model, data, carry
-        )
+        _, carry, reward_info = self._mjx_reward(obs, dummy_action, obs, absorbing, info, self._model, data, carry)
         for key, val in reward_info.items():
             info[key] = jnp.zeros_like(val)
+        for key in _NUMERICS_INFO_KEYS:
+            info[key] = jnp.asarray(False)
 
         return MjxState(
             data=data, observation=obs, reward=reward, absorbing=absorbing, done=done, info=info, additional_carry=carry
@@ -238,17 +318,11 @@ class Mjx(Mujoco):
         Returns:
             Reset state with same pytree structure as input
         """
-        if self._backend_impl == "warp":
-            raise NotImplementedError(
-                "_mjx_reset_in_step is not available for MJX-Warp because mjx.put_data(..., impl='warp') "
-                "is not implemented. Use the AutoResetWrapper or native mjwarp reset APIs instead."
-            )
-
         carry = state.additional_carry
 
         # Rebuild a fresh MJX Data from the CPU template and then reapply environment-specific reset logic.
         # NOTE: We use self._data as template - it's read-only, not shared mutable state
-        data = mjx.put_data(self._model, self._data, impl=self._backend_impl)
+        data = self._make_device_data()
         data, carry = self._mjx_reset_carry(self.sys, data, carry)
 
         # Reset carry (no special filtering needed - state.info has same structure)
@@ -311,8 +385,9 @@ class Mjx(Mujoco):
 
             # Use scan instead of fori_loop for vmap compatibility
             def single_step(data, _):
-                data = mjx.step(sys, data)
-                return data, None
+                next_data = mjx.step(sys, data)
+                next_data = _preserve_scan_carry_axis_types(next_data, data)
+                return next_data, None
 
             _data = jax.lax.scan(single_step, _data, (), self._n_substeps)[0]
 
@@ -340,14 +415,46 @@ class Mjx(Mujoco):
         reward, carry, reward_info = self._mjx_reward(
             state.observation, action, cur_obs, absorbing, cur_info, self._model, data, carry
         )
-        # merge reward components into info for logging
+
+        # Contain a bad transition before it reaches episode/reward wrappers.
+        # Reward implementations may sanitize their scalar output, so honor an
+        # explicit pre-sanitization marker in addition to inspecting values.
+        reward_marker = jnp.any(
+            jnp.asarray(reward_info.get("numerics_nonfinite_reward", False), dtype=bool)
+        )
+        nonfinite_observation = _tree_has_nonfinite(cur_obs)
+        nonfinite_qpos = _tree_has_nonfinite(data.qpos)
+        nonfinite_qvel = _tree_has_nonfinite(data.qvel)
+        nonfinite_reward = reward_marker | _tree_has_nonfinite(reward)
+        nonfinite_reward_info = _tree_has_nonfinite(reward_info)
+        nonfinite_transition = (
+            nonfinite_observation
+            | nonfinite_qpos
+            | nonfinite_qvel
+            | nonfinite_reward
+            | nonfinite_reward_info
+        )
+
+        reward = jnp.where(nonfinite_transition, jnp.zeros_like(reward), reward)
+        cur_obs = jnp.nan_to_num(cur_obs, nan=0.0, posinf=0.0, neginf=0.0)
+        reward_info = dict(_sanitize_inexact_tree(reward_info))
+        reward_info.update(
+            {
+                "numerics_nonfinite_observation": nonfinite_observation,
+                "numerics_nonfinite_qpos": nonfinite_qpos,
+                "numerics_nonfinite_qvel": nonfinite_qvel,
+                "numerics_nonfinite_reward": nonfinite_reward,
+                "numerics_nonfinite_reward_info": nonfinite_reward_info,
+                "numerics_nonfinite_transition": nonfinite_transition,
+            }
+        )
+        # Merge finite reward components and numerical flags into info for logging.
         cur_info.update(reward_info)
+        absorbing = jnp.logical_or(absorbing, nonfinite_transition)
 
         # check if done
         done = self._mjx_is_done(cur_obs, absorbing, cur_info, data, carry)
-
-        done = jnp.logical_or(done, jnp.any(jnp.isnan(cur_obs)))
-        cur_obs = jnp.nan_to_num(cur_obs, nan=0.0)
+        done = jnp.logical_or(done, nonfinite_transition)
 
         # create state
         carry = carry.replace(cur_step_in_episode=carry.cur_step_in_episode + 1)
@@ -508,6 +615,11 @@ class Mjx(Mujoco):
         Returns:
             Tuple[Model, Data, MjxAdditionalCarry]: Updated model, data, and carry.
         """
+        # Multi-GPU Warp keeps ``self.sys`` host-resident until reset/step is
+        # transformed so it is not eagerly bound to device zero.  Terrain and
+        # domain-randomizer hooks use JAX functional updates (``array.at``), so
+        # materialize a replica-local working model at their shared boundary.
+        model = jax.tree.map(jnp.asarray, model)
         model, data, carry = self._terrain.update(self, model, data, carry, jnp)
         model, data, carry = self._domain_randomizer.update(self, model, data, carry, jnp)
         return model, data, carry
@@ -583,6 +695,22 @@ class Mjx(Mujoco):
         data, carry = self._reward_function.reset(self, model, data, carry, jnp)
         return data, carry
 
+    def _mjx_reset_carry_to_step(
+        self,
+        model: Model,
+        data: Data,
+        carry: MjxAdditionalCarry,
+        selected_traj_idx: jax.Array,
+        selected_subtraj_step: jax.Array | None,
+    ) -> tuple[Data, MjxAdditionalCarry]:
+        """Reset hook for an explicitly selected trajectory frame.
+
+        Non-trajectory environments retain the normal reset behavior.  LocoEnv
+        overrides this hook to install the selected trajectory state directly.
+        """
+        del selected_traj_idx, selected_subtraj_step
+        return self._mjx_reset_carry(model, data, carry)
+
     def _mjx_step_finalize(
         self, obs: jnp.ndarray, model: Model, data: Data, info: dict, carry: MjxAdditionalCarry
     ) -> tuple[jnp.ndarray, Data, dict, MjxAdditionalCarry]:
@@ -656,7 +784,7 @@ class Mjx(Mujoco):
             ),
         )
 
-    def mjx_render(self, state, record: bool = False, debug_info: dict = None) -> np.ndarray:
+    def mjx_render(self, state, record: bool = False, debug_info: dict | None = None) -> np.ndarray:
         """
         Renders all environments in parallel.
 
@@ -671,7 +799,7 @@ class Mjx(Mujoco):
         # Unwrap wrapper states (e.g., LogWrapper/NormalizeVecReward) to bare MjxState
         unwrapped_state = state
         while hasattr(unwrapped_state, "env_state"):
-            unwrapped_state = getattr(unwrapped_state, "env_state")
+            unwrapped_state = unwrapped_state.env_state
 
         if self._viewer is None:
             if "default_camera_mode" not in self._viewer_params.keys():
@@ -706,7 +834,7 @@ class Mjx(Mujoco):
         # Unwrap first element if trajectory contains wrapper states
         first_state = trajectory[0]
         while hasattr(first_state, "env_state"):
-            first_state = getattr(first_state, "env_state")
+            first_state = first_state.env_state
 
         if self._viewer is None:
             # Only pass parameters that MujocoViewer.__init__ accepts
@@ -721,7 +849,7 @@ class Mjx(Mujoco):
             for state in trajectory:
                 cur_state = state
                 while hasattr(cur_state, "env_state"):
-                    cur_state = getattr(cur_state, "env_state")
+                    cur_state = cur_state.env_state
                 self._data.qpos, self._data.qvel = cur_state.data.qpos[i, :], cur_state.data.qvel[i, :]
                 mujoco.mj_forward(self._model, self._data)
                 self._viewer.render(self._data, record)

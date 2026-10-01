@@ -19,16 +19,20 @@ retargeting pipeline (fit_smpl_motion / fit_gmr_motion).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as sRot
 
+from musclemimic.utils.torso_frame import relative_torso_frame_torch
+
 from .c3d.asset_paths import resolve_pose_body_prior_path
 from .c3d.markers import (
     MOSHPP_STAGEI_WT_ANNEALING,
     MOSHPP_STAGEI_WT_INIT,
+    MOSHPP_STAGEII_WT_VELO,
     PreparedMarkerObservations,
     StageIHeadMarkerCorrelation,
     StageIIWeights,
@@ -38,6 +42,7 @@ from .c3d.markers import (
     compute_stagei_weights,
     compute_stageii_weights,
     load_c3d_markers,
+    load_marker_trajectory,
     load_stagei_head_marker_correlation,
     pick_stagei_frames,
     prepare_marker_observations,
@@ -45,7 +50,11 @@ from .c3d.markers import (
 )
 from .c3d.optim import _minimize_dogleg_dense
 from .c3d.pose_prior import MoshGmmPosePrior
-from .c3d.smpl_models import _make_surface_model, _resolve_smplx_model_file
+from .c3d.smpl_models import (
+    _make_surface_model,
+    _resolve_smplh_model_file,
+    _resolve_smplx_model_file,
+)
 from .c3d.surface_markers import (
     SurfaceMarkerModel,
     _point_to_triangle_distance_torch,
@@ -55,7 +64,7 @@ from .c3d.surface_markers import (
 
 logger = logging.getLogger(__name__)
 
-C3D_TO_SMPL_CACHE_VERSION = 1
+C3D_TO_SMPL_CACHE_VERSION = 2
 DEFAULT_STAGE1_SHAPE_SOLVER = "joint_dogleg_jax"
 
 
@@ -64,8 +73,51 @@ DEFAULT_STAGE1_SHAPE_SOLVER = "joint_dogleg_jax"
 # frozen at zero in both Stage I and Stage II.
 _TOES_POSE_AA_SLICE = slice(30, 36)
 
+# SMPL-H body-pose indices for the two non-flexion components of each knee.
+# The first local axis (12 for left, 15 for right) is the flexion axis and remains free.
+_KNEE_NON_HINGE_POSE_AA = np.array([13, 14, 16, 17], dtype=np.int64)
 
-def _make_pose_freeze_hook(body_end: int, *, optimize_toes: bool):
+_TORSO_FRAME_MARKERS = ("LBWT", "LFWT", "RBWT", "RFWT", "LSHO", "RSHO")
+_SMPL_LEFT_SHOULDER = 16
+_SMPL_RIGHT_SHOULDER = 17
+
+
+def _observed_torso_frames(observed, availability, labels: tuple[str, ...]):
+    """Build observed torso frames and their validity mask, or return ``(None, None)``."""
+    import torch
+
+    if not set(_TORSO_FRAME_MARKERS).issubset(labels):
+        return None, None
+    index = {label: labels.index(label) for label in _TORSO_FRAME_MARKERS}
+    pelvis_ids = [index[label] for label in ("LBWT", "LFWT", "RBWT", "RFWT")]
+    required = [*pelvis_ids, index["LSHO"], index["RSHO"]]
+    valid = availability[:, required].all(dim=1)
+    points = torch.nan_to_num(observed)
+    frames = relative_torso_frame_torch(
+        points[:, [index["LBWT"], index["LFWT"]]].mean(dim=1),
+        points[:, [index["RBWT"], index["RFWT"]]].mean(dim=1),
+        points[:, index["LSHO"]],
+        points[:, index["RSHO"]],
+    )
+    return frames, valid
+
+
+def _fitted_torso_frames(joints):
+    """Build the equivalent frames from the first 18 standard SMPL-H joints."""
+    return relative_torso_frame_torch(
+        joints[:, 1],
+        joints[:, 2],
+        joints[:, _SMPL_LEFT_SHOULDER],
+        joints[:, _SMPL_RIGHT_SHOULDER],
+    )
+
+
+def _make_pose_freeze_hook(
+    body_end: int,
+    *,
+    optimize_toes: bool,
+    enforce_knee_hinge: bool = False,
+):
     """Backward hook matching MoSh++ default pose free variables.
 
     MoSh++ defaults optimize only root and body pose; hand/face pose dims are
@@ -77,6 +129,8 @@ def _make_pose_freeze_hook(body_end: int, *, optimize_toes: bool):
         new_grad = grad.clone()
         if not optimize_toes:
             new_grad[..., _TOES_POSE_AA_SLICE] = 0.0
+        if enforce_knee_hinge:
+            new_grad[..., _KNEE_NON_HINGE_POSE_AA] = 0.0
         new_grad[..., body_end:] = 0.0
         return new_grad
 
@@ -113,6 +167,11 @@ def fit_smpl_to_c3d(
     surface_model_type: str = "smplx",
     gender: str = "male",
     stage1_shape_solver: str = DEFAULT_STAGE1_SHAPE_SOLVER,
+    stage1_state_path: str | None = None,
+    stage2_solver: str = "frame_lbfgs",
+    enforce_knee_hinge: bool = False,
+    stage2_marker_weight_overrides: dict[str, float] | None = None,
+    stage2_torso_frame_weight: float = 0.0,
 ) -> dict:
     # `optimize_toes` matches moshpp_conf.yaml's flag (default false). When false,
     # SMPL joints L_Foot (idx 10) and R_Foot (idx 11) are frozen at zero. For gait
@@ -124,9 +183,17 @@ def fit_smpl_to_c3d(
     # strict_frame_picking=False.
     import torch
 
+    requested_device = str(torch.device(device))
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"C3D fitting requested device={requested_device!r}, but this PyTorch build "
+            "cannot access CUDA"
+        )
+    device = requested_device
+
     body_end = 66
 
-    raw_positions, raw_labels, fps = load_c3d_markers(c3d_path)
+    raw_positions, raw_labels, fps = load_marker_trajectory(c3d_path)
     prepared = prepare_marker_observations(raw_positions, raw_labels, surface_model_type=surface_model_type)
 
     # MoSh++ fits at native mocap rate. Keep that as the default; callers can
@@ -162,6 +229,12 @@ def fit_smpl_to_c3d(
     )
     label_to_index = {label: idx for idx, label in enumerate(prepared.labels)}
     ordered_labels = marker_layout.labels
+    marker_weights = _resolve_stage2_marker_weights(
+        ordered_labels, stage2_marker_weight_overrides
+    )
+    stage2_torso_frame_weight = float(stage2_torso_frame_weight)
+    if not np.isfinite(stage2_torso_frame_weight) or stage2_torso_frame_weight < 0.0:
+        raise ValueError("stage2_torso_frame_weight must be finite and non-negative")
     observed = np.stack([prepared.positions[:, label_to_index[label]] for label in ordered_labels], axis=1).astype(
         np.float32
     )
@@ -224,38 +297,76 @@ def fit_smpl_to_c3d(
         )
 
     observed_t = torch.as_tensor(observed, dtype=torch.float32, device=device)
-    betas_opt, markers_latent_opt, stage1_debug = _fit_stagei(
-        smpl=smpl,
-        marker_model=marker_model,
-        observed_t=observed_t,
-        availability=availability,
-        ref_indices=ref_indices,
-        pose_dim=pose_dim,
-        body_end=body_end,
-        stage1_iters=stage1_iters,
-        device=device,
-        optimize_toes=optimize_toes,
-        pose_prior=pose_prior,
-        pose_prior_name=pose_prior_name,
-        head_marker_corr=head_marker_corr,
-        stage1_shape_solver=stage1_shape_solver,
-    )
+    state_path = Path(stage1_state_path).expanduser() if stage1_state_path is not None else None
+    if state_path is not None and state_path.exists():
+        betas_opt, markers_latent_opt = _load_stage1_state(
+            state_path,
+            ordered_labels=ordered_labels,
+            surface_model_type=surface_model_type,
+            gender=gender,
+            smpl_model_path=smpl_model_path,
+            device=device,
+        )
+        stage1_debug = {"reused": True, "state_path": str(state_path)}
+        logger.info("Reused subject Stage-I calibration: %s", state_path)
+    else:
+        betas_opt, markers_latent_opt, stage1_debug = _fit_stagei(
+            smpl=smpl,
+            marker_model=marker_model,
+            observed_t=observed_t,
+            availability=availability,
+            ref_indices=ref_indices,
+            pose_dim=pose_dim,
+            body_end=body_end,
+            stage1_iters=stage1_iters,
+            device=device,
+            optimize_toes=optimize_toes,
+            pose_prior=pose_prior,
+            pose_prior_name=pose_prior_name,
+            head_marker_corr=head_marker_corr,
+            stage1_shape_solver=stage1_shape_solver,
+            enforce_knee_hinge=enforce_knee_hinge,
+        )
+        stage1_debug["reused"] = False
+        if state_path is not None:
+            _save_stage1_state(
+                state_path,
+                betas_opt=betas_opt,
+                markers_latent_opt=markers_latent_opt,
+                ordered_labels=ordered_labels,
+                surface_model_type=surface_model_type,
+                gender=gender,
+                smpl_model_path=smpl_model_path,
+            )
+            stage1_debug["state_path"] = str(state_path)
+            logger.info("Saved subject Stage-I calibration: %s", state_path)
 
-    fit_pose, trans, stage2_debug = _fit_stageii(
-        smpl=smpl,
-        marker_model=marker_model,
-        observed_t=observed_t,
-        availability=availability,
-        betas_opt=betas_opt,
-        markers_latent_opt=markers_latent_opt,
-        pose_dim=pose_dim,
-        body_end=body_end,
-        stage2_iters=stage2_iters,
-        device=device,
-        optimize_toes=optimize_toes,
-        pose_prior=pose_prior,
-        pose_prior_name=pose_prior_name,
-    )
+    stage2_kwargs = {
+        "smpl": smpl,
+        "marker_model": marker_model,
+        "observed_t": observed_t,
+        "availability": availability,
+        "betas_opt": betas_opt,
+        "markers_latent_opt": markers_latent_opt,
+        "pose_dim": pose_dim,
+        "body_end": body_end,
+        "stage2_iters": stage2_iters,
+        "device": device,
+        "optimize_toes": optimize_toes,
+        "pose_prior": pose_prior,
+        "pose_prior_name": pose_prior_name,
+        "enforce_knee_hinge": enforce_knee_hinge,
+        "marker_weights": marker_weights,
+        "torso_frame_weight": stage2_torso_frame_weight,
+    }
+    if stage2_solver == "frame_lbfgs":
+        fit_pose, trans, stage2_debug = _fit_stageii(**stage2_kwargs)
+    elif stage2_solver == "batched_lbfgs":
+        fit_pose, trans, stage2_debug = _fit_stageii_batched(**stage2_kwargs)
+    else:
+        raise ValueError(
+            f"Unsupported stage2_solver={stage2_solver!r}; expected 'frame_lbfgs' or 'batched_lbfgs'."
+        )
     fullpose = _pose_to_full_pose_numpy(smpl, fit_pose, device=device)
     stageii_frame_vids_t = None
     if isinstance(stage2_debug, dict) and stage2_debug.get("frame_vids") is not None:
@@ -301,8 +412,111 @@ def fit_smpl_to_c3d(
             "pose_prior": pose_prior_name,
             "head_marker_corr_path": None if head_marker_corr is None else head_marker_corr.path,
             "stage1_shape_solver": stage1_shape_solver,
+            "stage2_solver": stage2_solver,
+            "enforce_knee_hinge": enforce_knee_hinge,
+            "stage2_marker_weight_overrides": {
+                label: float(weight)
+                for label, weight in zip(ordered_labels, marker_weights, strict=True)
+                if weight != 1.0
+            },
+            "stage2_torso_frame_weight": stage2_torso_frame_weight,
         },
     }
+
+
+def _resolve_stage2_marker_weights(
+    ordered_labels: list[str], overrides: dict[str, float] | None
+) -> np.ndarray:
+    """Resolve optional canonical-label multipliers for Stage-II marker residuals."""
+    weights = np.ones(len(ordered_labels), dtype=np.float32)
+    if not overrides:
+        return weights
+    unknown = sorted(set(overrides) - set(ordered_labels))
+    if unknown:
+        raise ValueError(
+            "Stage-II marker weights reference unavailable canonical labels: "
+            + ", ".join(unknown)
+        )
+    for index, label in enumerate(ordered_labels):
+        if label not in overrides:
+            continue
+        weight = float(overrides[label])
+        if not np.isfinite(weight) or weight <= 0.0:
+            raise ValueError(
+                f"Stage-II marker weight for {label} must be finite and positive"
+            )
+        weights[index] = weight
+    return weights
+
+
+def _save_stage1_state(
+    path: Path,
+    *,
+    betas_opt,
+    markers_latent_opt,
+    ordered_labels: list[str],
+    surface_model_type: str,
+    gender: str,
+    smpl_model_path: str,
+) -> None:
+    """Atomically persist the subject-specific shape and marker calibration."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    with tmp_path.open("wb") as fh:
+        np.savez(
+            fh,
+            betas=betas_opt.detach().cpu().numpy().reshape(-1),
+            markers_latent=markers_latent_opt.detach().cpu().numpy(),
+            labels=np.asarray(ordered_labels),
+            surface_model_type=np.array(surface_model_type),
+            gender=np.array(gender),
+            smpl_model_path=np.array(str(Path(smpl_model_path).expanduser().resolve(strict=False))),
+            version=np.array(1, dtype=np.int64),
+        )
+    tmp_path.replace(path)
+
+
+def _load_stage1_state(
+    path: Path,
+    *,
+    ordered_labels: list[str],
+    surface_model_type: str,
+    gender: str,
+    smpl_model_path: str,
+    device: str,
+):
+    """Load and validate a subject-specific Stage-I calibration."""
+
+    import torch
+
+    with np.load(path, allow_pickle=False) as data:
+        labels = [str(label) for label in np.asarray(data["labels"]).reshape(-1)]
+        stored_surface = str(np.asarray(data["surface_model_type"]).reshape(()))
+        stored_gender = str(np.asarray(data["gender"]).reshape(()))
+        stored_model = str(np.asarray(data["smpl_model_path"]).reshape(()))
+        betas = np.asarray(data["betas"], dtype=np.float32).reshape(1, -1)
+        markers_latent = np.asarray(data["markers_latent"], dtype=np.float32)
+
+    expected_model = str(Path(smpl_model_path).expanduser().resolve(strict=False))
+    mismatches = []
+    if labels != ordered_labels:
+        mismatches.append("marker labels/order")
+    if stored_surface != surface_model_type:
+        mismatches.append(f"surface model {stored_surface!r} != {surface_model_type!r}")
+    if stored_gender != gender:
+        mismatches.append(f"gender {stored_gender!r} != {gender!r}")
+    if stored_model != expected_model:
+        mismatches.append(f"model path {stored_model!r} != {expected_model!r}")
+    if markers_latent.shape != (len(ordered_labels), 3):
+        mismatches.append(f"markers_latent shape {markers_latent.shape} != {(len(ordered_labels), 3)}")
+    if mismatches:
+        raise ValueError(f"Incompatible Stage-I state {path}: {'; '.join(mismatches)}")
+
+    return (
+        torch.as_tensor(betas, dtype=torch.float32, device=device),
+        torch.as_tensor(markers_latent, dtype=torch.float32, device=device),
+    )
 
 
 def fit_smpl_to_c3d_cached(
@@ -333,16 +547,24 @@ def fit_smpl_to_c3d_cached(
     cache_path = Path(cache_dir) / f"{c3d_name}_smpl_v{C3D_TO_SMPL_CACHE_VERSION}{suffix}.npz"
     if cache_path.exists() and not clear_cache:
         logger.info("Loading cached SMPL fit from %s", cache_path)
-        data = np.load(cache_path, allow_pickle=False)
-        result = {
-            "pose_aa": data["pose_aa"],
-            "trans": data["trans"],
-            "betas": data["betas"],
-            "fps": float(data["fps"]),
-            "gender": str(data["gender"]),
-        }
-        if "fullpose" in data.files:
-            result["fullpose"] = data["fullpose"]
+        try:
+            with np.load(cache_path, allow_pickle=False) as data:
+                result = {
+                    "pose_aa": data["pose_aa"],
+                    "trans": data["trans"],
+                    "betas": data["betas"],
+                    "fps": float(data["fps"]),
+                    "gender": str(data["gender"]),
+                }
+                if "fullpose" in data.files:
+                    result["fullpose"] = data["fullpose"]
+                if "debug_json" in data.files:
+                    result["debug"] = json.loads(str(np.asarray(data["debug_json"]).reshape(())))
+        except (KeyError, OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"Failed to load cached C3D-to-SMPL fit at {cache_path}; "
+                "rerun with clear_cache=True"
+            ) from exc
         return result
     if cache_path.exists() and clear_cache:
         logger.info("Ignoring cached SMPL fit because clear_cache=True: %s", cache_path)
@@ -350,16 +572,20 @@ def fit_smpl_to_c3d_cached(
     result = fit_smpl_to_c3d(c3d_path, smpl_model_path, **kwargs)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        cache_path,
-        pose_aa=result["pose_aa"],
-        fullpose=result.get("fullpose", result["pose_aa"]),
-        trans=result["trans"],
-        betas=result["betas"],
-        fps=np.array(result["fps"], dtype=np.float32),
-        gender=np.array(str(result["gender"])),
-        cache_version=np.array(C3D_TO_SMPL_CACHE_VERSION, dtype=np.int64),
-    )
+    staged_cache = cache_path.with_name(f".{cache_path.name}.tmp")
+    with staged_cache.open("wb") as stream:
+        np.savez(
+            stream,
+            pose_aa=result["pose_aa"],
+            fullpose=result.get("fullpose", result["pose_aa"]),
+            trans=result["trans"],
+            betas=result["betas"],
+            fps=np.array(result["fps"], dtype=np.float32),
+            gender=np.array(str(result["gender"])),
+            debug_json=np.array(json.dumps(_json_ready(result.get("debug", {})), sort_keys=True)),
+            cache_version=np.array(C3D_TO_SMPL_CACHE_VERSION, dtype=np.int64),
+        )
+    staged_cache.replace(cache_path)
     logger.info("Cached SMPL fit to %s", cache_path)
     return result
 
@@ -373,6 +599,51 @@ def _path_hash(path: str | Path | None) -> str:
         return "none"
     resolved = Path(path).expanduser().resolve(strict=False)
     return _short_hash(str(resolved))
+
+
+def _file_content_hash(path: str | Path | None) -> str:
+    if path is None:
+        return "none"
+    resolved = Path(path).expanduser().resolve(strict=False)
+    if not resolved.is_file():
+        return "missing"
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()[:12]
+
+
+def _surface_model_asset_path(
+    smpl_model_path: str | Path,
+    surface_model_type: str,
+    gender: str,
+) -> Path | None:
+    if surface_model_type == "smplh":
+        resolver = _resolve_smplh_model_file
+    elif surface_model_type == "smplx":
+        resolver = _resolve_smplx_model_file
+    else:
+        return None
+    try:
+        model_file, _ = resolver(smpl_model_path, gender)
+    except (FileNotFoundError, ValueError):
+        return None
+    return model_file
+
+
+def _json_ready(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
 
 
 def _cache_suffix_for_fit(smpl_model_path: str, kwargs: dict, *, c3d_path: str | Path | None = None) -> str:
@@ -394,7 +665,13 @@ def _cache_suffix_for_fit(smpl_model_path: str, kwargs: dict, *, c3d_path: str |
         "head_marker_corr_path": None,
         "surface_model_type": "smplx",
         "gender": "male",
+        "device": "cpu",
         "stage1_shape_solver": DEFAULT_STAGE1_SHAPE_SOLVER,
+        "stage1_state_path": None,
+        "stage2_solver": "frame_lbfgs",
+        "enforce_knee_hinge": False,
+        "stage2_marker_weight_overrides": None,
+        "stage2_torso_frame_weight": 0.0,
     }
 
     def get(name: str):
@@ -403,22 +680,52 @@ def _cache_suffix_for_fit(smpl_model_path: str, kwargs: dict, *, c3d_path: str |
     surface_model_type = get("surface_model_type")
     gender = get("gender")
     suffix += f"_{surface_model_type}_{gender}"
+    model_asset = _surface_model_asset_path(smpl_model_path, surface_model_type, gender)
+    if model_asset is not None:
+        suffix += f"_asset{_file_content_hash(model_asset)}"
+    if c3d_path is not None and Path(c3d_path).expanduser().is_file():
+        suffix += f"_src{_file_content_hash(c3d_path)}"
 
     if get("optimize_toes"):
         suffix += "_toes"
     if get("wrist_markers_on_stick"):
         suffix += "_wriststick"
     suffix += f"_s1shape{get('stage1_shape_solver')}"
+    if get("stage1_state_path") is not None:
+        suffix += (
+            f"_s1state{_path_hash(get('stage1_state_path'))}"
+            f"c{_file_content_hash(get('stage1_state_path'))}"
+        )
+    if get("stage2_solver") != "frame_lbfgs":
+        suffix += f"_s2solver{get('stage2_solver')}"
+    if get("enforce_knee_hinge"):
+        suffix += "_kneeh"
+    marker_weight_overrides = get("stage2_marker_weight_overrides")
+    if marker_weight_overrides:
+        serialized = ",".join(
+            f"{label}:{float(weight):g}"
+            for label, weight in sorted(marker_weight_overrides.items())
+        )
+        suffix += f"_s2mw{_short_hash(serialized)}"
 
     if get("pose_body_prior_path") is not None:
-        suffix += f"_gmm{_path_hash(get('pose_body_prior_path'))}"
+        suffix += (
+            f"_gmm{_path_hash(get('pose_body_prior_path'))}"
+            f"c{_file_content_hash(get('pose_body_prior_path'))}"
+        )
     resolved_head_corr_path = resolve_stagei_head_marker_corr_path(
         get("head_marker_corr_path"),
         smpl_model_path=smpl_model_path,
         surface_model_type=surface_model_type,
     )
     if resolved_head_corr_path is not None:
-        suffix += f"_headcorr{_path_hash(resolved_head_corr_path)}"
+        suffix += (
+            f"_headcorr{_path_hash(resolved_head_corr_path)}"
+            f"c{_file_content_hash(resolved_head_corr_path)}"
+        )
+
+    if get("device") != "cpu":
+        suffix += f"_dev{_short_hash(str(get('device')))}"
 
     numeric_fields = (
         ("stage1_iters", "s1"),
@@ -427,6 +734,7 @@ def _cache_suffix_for_fit(smpl_model_path: str, kwargs: dict, *, c3d_path: str |
         ("target_fps", "fps"),
         ("seed", "seed"),
         ("least_avail_markers", "avail"),
+        ("stage2_torso_frame_weight", "torso"),
     )
     for name, label in numeric_fields:
         value = get(name)
@@ -503,6 +811,7 @@ def _fit_stagei(
     pose_prior_name: str = "l2",
     head_marker_corr: StageIHeadMarkerCorrelation | None = None,
     stage1_shape_solver: str = DEFAULT_STAGE1_SHAPE_SOLVER,
+    enforce_knee_hinge: bool = False,
 ):
     import torch
 
@@ -609,7 +918,11 @@ def _fit_stagei(
         terms["init_head_corr"] = (head_marker_corr_t @ head_loss * head_weight).reshape(-1)
         return terms
 
-    free_pose_np = _stagei_free_pose_indices(body_end, optimize_toes=optimize_toes)
+    free_pose_np = _stagei_free_pose_indices(
+        body_end,
+        optimize_toes=optimize_toes,
+        enforce_knee_hinge=enforce_knee_hinge,
+    )
     free_pose_t = torch.as_tensor(free_pose_np, dtype=torch.long, device=device)
     n_free_pose = int(free_pose_np.shape[0])
 
@@ -877,6 +1190,9 @@ def _fit_stageii(
     device: str,
     pose_prior=None,
     pose_prior_name: str = "l2",
+    enforce_knee_hinge: bool = False,
+    marker_weights: np.ndarray | None = None,
+    torso_frame_weight: float = 0.0,
 ):
     import torch
 
@@ -894,6 +1210,20 @@ def _fit_stageii(
 
     markers_latent_opt = markers_latent_opt.to(device)
     availability_t = torch.as_tensor(availability, dtype=torch.bool, device=device)
+    marker_weights_t = torch.as_tensor(
+        np.ones(observed_t.shape[1], dtype=np.float32)
+        if marker_weights is None
+        else marker_weights,
+        dtype=torch.float32,
+        device=device,
+    )
+    observed_torso_frames, torso_frame_valid = _observed_torso_frames(
+        observed_t,
+        availability_t,
+        marker_model.labels,
+    )
+    if torso_frame_weight > 0.0 and observed_torso_frames is None:
+        logger.warning("Stage-II torso-frame consistency requested, but its markers are unavailable")
 
     # Pixel-perfect parity with MoSh++: with betas + markers_latent frozen at
     # Stage I output, recompute the closest 3 vertices (kNN) to anchor each
@@ -957,6 +1287,14 @@ def _fit_stageii(
                 optimize_toes=optimize_toes,
                 pose_prior=pose_prior,
                 frame_vids_override=stageii_frame_vids,
+                enforce_knee_hinge=enforce_knee_hinge,
+                marker_weights=marker_weights_t,
+                torso_frame_target=(
+                    observed_torso_frames[frame_idx : frame_idx + 1]
+                    if observed_torso_frames is not None and torso_frame_valid[frame_idx]
+                    else None
+                ),
+                torso_frame_weight=torso_frame_weight,
             )
             pose, trans, _ = _optimize_frame(
                 smpl=smpl,
@@ -976,6 +1314,14 @@ def _fit_stageii(
                 optimize_toes=optimize_toes,
                 pose_prior=pose_prior,
                 frame_vids_override=stageii_frame_vids,
+                enforce_knee_hinge=enforce_knee_hinge,
+                marker_weights=marker_weights_t,
+                torso_frame_target=(
+                    observed_torso_frames[frame_idx : frame_idx + 1]
+                    if observed_torso_frames is not None and torso_frame_valid[frame_idx]
+                    else None
+                ),
+                torso_frame_weight=torso_frame_weight,
             )
         else:
             pose = prev_pose.detach().clone()
@@ -1000,6 +1346,14 @@ def _fit_stageii(
             optimize_toes=optimize_toes,
             pose_prior=pose_prior,
             frame_vids_override=stageii_frame_vids,
+            enforce_knee_hinge=enforce_knee_hinge,
+            marker_weights=marker_weights_t,
+            torso_frame_target=(
+                observed_torso_frames[frame_idx : frame_idx + 1]
+                if observed_torso_frames is not None and torso_frame_valid[frame_idx]
+                else None
+            ),
+            torso_frame_weight=torso_frame_weight,
         )
 
         pose_out[frame_idx] = pose.detach().cpu().numpy().reshape(-1)
@@ -1021,6 +1375,203 @@ def _fit_stageii(
             "frame_loss": stage2_losses,
             "missing_markers": missing_markers,
             "frame_vids": stageii_frame_vids.detach().cpu().numpy(),
+            "torso_frame_weight": float(torso_frame_weight),
+            "torso_frame_valid_frames": int(
+                torso_frame_valid.sum().item() if torso_frame_valid is not None else 0
+            ),
+        },
+    )
+
+
+def _fit_stageii_batched(
+    *,
+    smpl,
+    marker_model: SurfaceMarkerModel,
+    observed_t,
+    availability: np.ndarray,
+    betas_opt,
+    markers_latent_opt,
+    pose_dim: int,
+    body_end: int,
+    optimize_toes: bool = False,
+    stage2_iters: int,
+    device: str,
+    pose_prior=None,
+    pose_prior_name: str = "l2",
+    enforce_knee_hinge: bool = False,
+    marker_weights: np.ndarray | None = None,
+    torso_frame_weight: float = 0.0,
+):
+    """Fit every Stage-II frame jointly in one GPU-friendly LBFGS problem.
+
+    The framewise solver above mirrors MoSh++'s warm-start execution, but each
+    problem contains only 69 free values and therefore leaves a GPU almost
+    entirely launch-bound.  This formulation retains the same marker, pose,
+    and velocity residuals while solving all frames together.  The velocity
+    residual becomes an ordinary joint second-difference term rather than a
+    penalty against already-frozen preceding solutions.
+    """
+
+    import torch
+
+    n_frames = int(observed_t.shape[0])
+    logger.info(
+        "Stage II: jointly fitting %d frames (%d LBFGS iters) with %s body-pose prior on %s...",
+        n_frames,
+        stage2_iters,
+        pose_prior_name,
+        device,
+    )
+    availability_t = torch.as_tensor(availability, dtype=torch.bool, device=device)
+    marker_weights_t = torch.as_tensor(
+        np.ones(observed_t.shape[1], dtype=np.float32)
+        if marker_weights is None
+        else marker_weights,
+        dtype=torch.float32,
+        device=device,
+    )
+    observed_t = observed_t.to(device)
+    betas_opt = betas_opt.to(device)
+    markers_latent_opt = markers_latent_opt.to(device)
+    observed_torso_frames, torso_frame_valid = _observed_torso_frames(
+        observed_t,
+        availability_t,
+        marker_model.labels,
+    )
+    if torso_frame_weight > 0.0 and observed_torso_frames is None:
+        logger.warning("Stage-II torso-frame consistency requested, but its markers are unavailable")
+
+    with torch.no_grad():
+        zero_pose = torch.zeros(1, pose_dim, dtype=torch.float32, device=device)
+        canonical_verts, _ = smpl.get_joints_verts(zero_pose, th_betas=betas_opt)
+        frame_vids_np = SurfaceMarkerModel.compute_dynamic_frame_vids(
+            canonical_verts[0].detach().cpu().numpy(),
+            markers_latent_opt.detach().cpu().numpy(),
+        )
+        frame_vids = torch.as_tensor(frame_vids_np, dtype=torch.long, device=device)
+        marker_coeffs = marker_model.latents_to_coeffs(
+            canonical_verts[0], markers_latent_opt, frame_vids_override=frame_vids
+        )
+        template_markers = marker_model.reconstruct(
+            canonical_verts[0], coeffs=marker_coeffs, frame_vids_override=frame_vids
+        ).detach().cpu().numpy()
+
+    observed_np = observed_t.detach().cpu().numpy()
+    pose_init = np.zeros((n_frames, pose_dim), dtype=np.float32)
+    trans_init = np.zeros((n_frames, 3), dtype=np.float32)
+    for frame_idx in range(n_frames):
+        mask = availability[frame_idx]
+        if int(mask.sum()) < 3:
+            if frame_idx == 0:
+                raise ValueError(f"Frame {frame_idx} has fewer than 3 visible markers.")
+            pose_init[frame_idx] = pose_init[frame_idx - 1]
+            trans_init[frame_idx] = trans_init[frame_idx - 1]
+            continue
+        rotation, translation = _procrustes_align(template_markers[mask], observed_np[frame_idx, mask])
+        pose_init[frame_idx, :3] = sRot.from_matrix(rotation).as_rotvec().astype(np.float32)
+        trans_init[frame_idx] = translation
+
+    pose = torch.as_tensor(pose_init, dtype=torch.float32, device=device).requires_grad_(True)
+    trans = torch.as_tensor(trans_init, dtype=torch.float32, device=device).requires_grad_(True)
+    pose.register_hook(
+        _make_pose_freeze_hook(
+            body_end,
+            optimize_toes=optimize_toes,
+            enforce_knee_hinge=enforce_knee_hinge,
+        )
+    )
+
+    frame_weights = [compute_stageii_weights(int(mask.sum()), len(marker_model.vids)) for mask in availability]
+    data_weights = torch.as_tensor([weight.data for weight in frame_weights], dtype=torch.float32, device=device)
+    pose_weights = torch.as_tensor([weight.pose_body for weight in frame_weights], dtype=torch.float32, device=device)
+    velocity_weight = float(MOSHPP_STAGEII_WT_VELO)
+    expanded_betas = betas_opt.expand(n_frames, -1)
+
+    def per_frame_terms(body_pose_weight_scale: float, include_velocity: bool):
+        verts, joints = smpl.get_joints_verts(pose, th_betas=expanded_betas, th_trans=trans)
+        predicted = marker_model.reconstruct(verts, coeffs=marker_coeffs, frame_vids_override=frame_vids)
+        residual = torch.where(availability_t[..., None], predicted - observed_t, 0.0)
+        residual = residual * marker_weights_t[None, :, None]
+        data_terms = residual.pow(2).sum(dim=(1, 2)) * data_weights.pow(2)
+
+        if pose_prior is not None:
+            prior_residuals = pose_prior.residuals(pose[:, 3:body_end]).reshape(n_frames, -1)
+            pose_base = prior_residuals.pow(2).sum(dim=1)
+        else:
+            pose_base = pose[:, 3:body_end].pow(2).sum(dim=1)
+        pose_terms = pose_base * (pose_weights * body_pose_weight_scale).pow(2)
+
+        velocity_terms = torch.zeros(n_frames, dtype=torch.float32, device=device)
+        if include_velocity and n_frames > 1:
+            velocity_terms[1] = (pose[1, :body_end] - pose[0, :body_end]).pow(2).sum() * (
+                0.5 * velocity_weight
+            ) ** 2
+        if include_velocity and n_frames > 2:
+            acceleration = pose[2:, :body_end] - 2.0 * pose[1:-1, :body_end] + pose[:-2, :body_end]
+            velocity_terms[2:] = acceleration.pow(2).sum(dim=1) * velocity_weight**2
+        torso_terms = torch.zeros(n_frames, dtype=torch.float32, device=device)
+        if torso_frame_weight > 0.0 and observed_torso_frames is not None:
+            fitted_frames = _fitted_torso_frames(joints)
+            frame_error = (fitted_frames - observed_torso_frames).pow(2).sum(dim=(1, 2))
+            torso_terms = torch.where(
+                torso_frame_valid,
+                frame_error * torso_frame_weight**2,
+                torso_terms,
+            )
+        return data_terms, pose_terms, velocity_terms, torso_terms
+
+    phase_specs = (
+        (max(10, stage2_iters // 4), 10.0, False),
+        (max(10, stage2_iters // 4), 5.0, False),
+        (stage2_iters, 1.0, True),
+    )
+    for phase_idx, (phase_iters, pose_scale, include_velocity) in enumerate(phase_specs, start=1):
+        optimizer = torch.optim.LBFGS(
+            [pose, trans],
+            lr=1.0,
+            max_iter=phase_iters,
+            history_size=20,
+            tolerance_grad=1e-7,
+            tolerance_change=1e-9,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure(optimizer=optimizer, pose_scale=pose_scale, include_velocity=include_velocity):
+            optimizer.zero_grad()
+            data_terms, pose_terms, velocity_terms, torso_terms = per_frame_terms(
+                pose_scale, include_velocity
+            )
+            loss = data_terms.sum() + pose_terms.sum() + velocity_terms.sum() + torso_terms.sum()
+            loss.backward()
+            return loss
+
+        loss = optimizer.step(closure)
+        logger.info(
+            "  Batched Stage-II phase %d/%d done: loss=%.5f, pose_scale=%.1f, velocity=%s",
+            phase_idx,
+            len(phase_specs),
+            float(loss.detach().cpu()),
+            pose_scale,
+            include_velocity,
+        )
+
+    with torch.no_grad():
+        data_terms, pose_terms, velocity_terms, torso_terms = per_frame_terms(1.0, True)
+        frame_losses = (
+            data_terms + pose_terms + velocity_terms + torso_terms
+        ).detach().cpu().numpy().astype(np.float32)
+    return (
+        pose.detach().cpu().numpy().astype(np.float32),
+        trans.detach().cpu().numpy().astype(np.float32),
+        {
+            "frame_loss": frame_losses,
+            "missing_markers": (~availability).sum(axis=1).astype(np.int64),
+            "frame_vids": frame_vids_np,
+            "solver": "batched_lbfgs",
+            "torso_frame_weight": float(torso_frame_weight),
+            "torso_frame_valid_frames": int(
+                torso_frame_valid.sum().item() if torso_frame_valid is not None else 0
+            ),
         },
     )
 
@@ -1100,10 +1651,17 @@ def _compute_fitted_marker_error(
     }
 
 
-def _stagei_free_pose_indices(body_end: int, *, optimize_toes: bool) -> np.ndarray:
+def _stagei_free_pose_indices(
+    body_end: int,
+    *,
+    optimize_toes: bool,
+    enforce_knee_hinge: bool = False,
+) -> np.ndarray:
     free = np.ones(body_end, dtype=bool)
     if not optimize_toes:
         free[_TOES_POSE_AA_SLICE] = False
+    if enforce_knee_hinge:
+        free[_KNEE_NON_HINGE_POSE_AA] = False
     return np.flatnonzero(free).astype(np.int64)
 
 
@@ -1126,6 +1684,10 @@ def _optimize_frame(
     optimize_toes: bool = False,
     pose_prior=None,
     frame_vids_override=None,
+    enforce_knee_hinge: bool = False,
+    marker_weights=None,
+    torso_frame_target=None,
+    torso_frame_weight: float = 0.0,
 ):
     """Per-frame Stage II solver.
 
@@ -1142,7 +1704,13 @@ def _optimize_frame(
 
     pose = init_pose.clone().detach().requires_grad_(True)
     trans = init_trans.clone().detach().requires_grad_(True)
-    pose.register_hook(_make_pose_freeze_hook(body_end, optimize_toes=optimize_toes))
+    pose.register_hook(
+        _make_pose_freeze_hook(
+            body_end,
+            optimize_toes=optimize_toes,
+            enforce_knee_hinge=enforce_knee_hinge,
+        )
+    )
 
     optimizer = torch.optim.LBFGS(
         [pose, trans],
@@ -1169,12 +1737,14 @@ def _optimize_frame(
 
     def closure():
         optimizer.zero_grad()
-        verts, _ = smpl.get_joints_verts(pose, th_betas=betas_opt, th_trans=trans)
+        verts, joints = smpl.get_joints_verts(pose, th_betas=betas_opt, th_trans=trans)
         pred_markers = marker_model.reconstruct(verts[0], coeffs=marker_coeffs, frame_vids_override=frame_vids_override)
 
         # Pixel-perfect parity with MoSh++: configured weights multiply residuals,
         # then the solver minimizes their sum of squares.
         residual = pred_markers[mask] - obs_frame[mask]
+        if marker_weights is not None:
+            residual = residual * marker_weights[mask, None]
         data_loss = residual.pow(2).sum() * (weights.data**2)
         if pose_prior is not None:
             pose_loss = pose_prior(pose[:, 3:body_end]) * ((weights.pose_body * body_pose_weight_scale) ** 2)
@@ -1188,7 +1758,14 @@ def _optimize_frame(
         elif prev_pose is not None:
             velo_loss = (pose[:, :body_end] - prev_pose[:, :body_end]).pow(2).sum() * ((0.5 * weights.velo) ** 2)
 
-        total = data_loss + pose_loss + velo_loss
+        torso_loss = torch.zeros((), dtype=torch.float32, device=pose.device)
+        if torso_frame_target is not None and torso_frame_weight > 0.0:
+            torso_loss = (
+                (_fitted_torso_frames(joints) - torso_frame_target).pow(2).sum()
+                * torso_frame_weight**2
+            )
+
+        total = data_loss + pose_loss + velo_loss + torso_loss
         total.backward()
         final_loss[0] = float(total.detach().cpu().item())
         return total

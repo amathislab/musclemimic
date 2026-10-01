@@ -5,19 +5,22 @@ This file is separate from test_mjx_reset_parity.py because Warp requires CUDA,
 while the main test file sets CUDA_VISIBLE_DEVICES="" for CPU-only testing.
 """
 
-import numpy as np
-import pytest
+import os
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 
 # Ensure default registry entries are available for this minimal test env.
 import loco_mujoco.core.reward  # noqa: F401
 import loco_mujoco.core.terminal_state_handler  # noqa: F401
-
 from loco_mujoco.core.observations import ObservationType
 from musclemimic.core.mujoco_mjx import Mjx
 from musclemimic.core.wrappers.mjx import AutoResetWrapper, VecEnv
+from musclemimic.runner.warp_graph_cache import clear_warp_graph_cache, require_safe_warp_graph_mode
+
+_STRICT_TWO_GPU_ENV = "MUSCLEMIMIC_REQUIRE_TWO_GPU_TEST"
 
 
 def _warp_available():
@@ -31,6 +34,31 @@ def _warp_available():
 
 
 requires_warp = pytest.mark.skipif(not _warp_available(), reason="Warp not available or CUDA not available")
+
+
+def _require_exactly_two_warp_gpus():
+    """Return the gate devices, failing closed when strict hardware mode is requested."""
+    strict_value = os.environ.get(_STRICT_TWO_GPU_ENV, "").strip().lower()
+    if strict_value not in {"", "0", "1", "false", "true"}:
+        pytest.fail(
+            f"{_STRICT_TWO_GPU_ENV} must be one of 0, 1, false, or true; got {strict_value!r}",
+            pytrace=False,
+        )
+    strict = strict_value in {"1", "true"}
+
+    if not _warp_available():
+        message = "requires Warp with CUDA support"
+        if strict:
+            pytest.fail(f"{_STRICT_TWO_GPU_ENV}=1 {message}", pytrace=False)
+        pytest.skip(message)
+
+    devices = tuple(device for device in jax.local_devices() if device.platform == "gpu")
+    if len(devices) != 2:
+        message = f"requires exactly two JAX CUDA devices; found {len(devices)}"
+        if strict:
+            pytest.fail(f"{_STRICT_TWO_GPU_ENV}=1 {message}", pytrace=False)
+        pytest.skip(message)
+    return devices
 
 
 def _carry_keys_from_reset_keys(keys):
@@ -198,6 +226,62 @@ def test_warp_backend_mjx_env_step(warp_test_xml):
 
     assert next_state.observation.shape == (7,)
     assert next_state.done.shape == ()
+
+
+def test_warp_runs_two_device_pmap_scan_across_quiescent_cache_clear(warp_test_xml):
+    """Exercise device-local Warp capture and production's block/clear lifecycle."""
+    devices = _require_exactly_two_warp_gpus()
+    env = _WarpTestEnv(warp_test_xml, mjx_warp_graph_mode="warp")
+    require_safe_warp_graph_mode(env)
+    actions = jnp.zeros((3, 0), dtype=jnp.float32)
+
+    def rollout(key, sentinel):
+        state = env.mjx_reset(key)
+        data = state.data.replace(qpos=state.data.qpos.at[0].set(sentinel))
+        state = state.replace(
+            data=data,
+            observation=state.observation.at[0].set(sentinel),
+        )
+
+        def step(state, action):
+            next_state = env.mjx_step(state, action)
+            return next_state, next_state.observation
+
+        final_state, observations = jax.lax.scan(step, state, actions)
+        return jax.lax.axis_index("devices"), final_state.observation, observations
+
+    pmapped_rollout = jax.pmap(rollout, axis_name="devices", devices=devices)
+    executions = (
+        (jax.random.PRNGKey(0), np.asarray([1.0, 2.0], dtype=np.float32)),
+        (jax.random.PRNGKey(1), np.asarray([11.0, 12.0], dtype=np.float32)),
+    )
+    for root_key, sentinels in executions:
+        replica_indices, final_observation, observations = pmapped_rollout(
+            jax.random.split(root_key, len(devices)),
+            sentinels,
+        )
+        jax.block_until_ready((replica_indices, final_observation, observations))
+
+        for value in (replica_indices, final_observation, observations):
+            assert {shard.device for shard in value.addressable_shards} == set(devices)
+
+        np.testing.assert_array_equal(np.asarray(replica_indices), [0, 1])
+        assert final_observation.shape == (2, 7)
+        assert observations.shape == (2, 3, 7)
+        np.testing.assert_allclose(np.asarray(final_observation)[:, 0], sentinels, atol=0.0, rtol=0.0)
+        np.testing.assert_allclose(
+            np.asarray(observations)[:, :, 0],
+            np.broadcast_to(sentinels[:, None], (2, actions.shape[0])),
+            atol=0.0,
+            rtol=0.0,
+        )
+        assert np.isfinite(np.asarray(final_observation)).all()
+        assert np.isfinite(np.asarray(observations)).all()
+
+        # Production clears only after all replicas finish a chunk. The second
+        # call must recapture cleanly with new replica-local data; clearing the
+        # second capture also leaves the test process at a quiescent boundary.
+        clear_warp_graph_cache()
 
 
 @requires_warp

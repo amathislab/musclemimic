@@ -38,6 +38,7 @@ VALIDATION_STEP_METRIC_KEYS = (
     "reward_qpos",
     "reward_qvel",
     "reward_root_pos",
+    "reward_root_quat",
     "reward_rpos",
     "reward_rquat",
     "reward_rvel_rot",
@@ -77,6 +78,19 @@ class QuantityContainer:
 
 @struct.dataclass
 class ValidationSummary(SummaryMetrics):
+    # Completed episodes behind the episode-level means and rates. Distributed
+    # PPO uses this count to combine replicas without biasing smaller batches.
+    episode_count: float = 0.0
+    # Exhaustive multi-motion validation metrics.  Arrays are indexed by the
+    # configured trajectory order so every motion can be inspected separately.
+    motion_success_rate: float = 0.0
+    mean_frame_coverage: float = 0.0
+    worst_quartile_frame_coverage: float = 0.0
+    mean_return_per_frame: float = 0.0
+    motion_count: float = 0.0
+    per_motion_success: jnp.ndarray = struct.field(default_factory=lambda: jnp.empty(0))
+    per_motion_frame_coverage: jnp.ndarray = struct.field(default_factory=lambda: jnp.empty(0))
+    per_motion_return_per_frame: jnp.ndarray = struct.field(default_factory=lambda: jnp.empty(0))
     euclidean_distance: QuantityContainer = struct.field(default_factory=QuantityContainer)
     dynamic_time_warping: QuantityContainer = struct.field(default_factory=QuantityContainer)
     discrete_frechet_distance: QuantityContainer = struct.field(default_factory=QuantityContainer)
@@ -94,6 +108,19 @@ class MetricsHandler:
 
         # Store reference to trajectory handler instead of trajectory data
         self._trajectory_handler = env.th if env.th is not None else None
+        if self._trajectory_handler is None:
+            self._trajectory_lengths = ()
+            self._validation_horizon = 0
+        else:
+            # Validation runs inside the compiled FlashSAC interaction scan.
+            # Materialize trajectory lengths while the handler is still eager;
+            # converting len_trajectory() results to Python integers while JAX
+            # traces the scan raises ConcretizationTypeError.
+            self._trajectory_lengths = tuple(
+                int(jax.device_get(self._trajectory_handler.len_trajectory(index)))
+                for index in range(int(self._trajectory_handler.n_trajectories))
+            )
+            self._validation_horizon = max(self._trajectory_lengths, default=0)
 
         self.quantaties = OmegaConf.select(self._config, "validation.quantities")
         self.measures = OmegaConf.select(self._config, "validation.measures")
@@ -538,6 +565,7 @@ class MetricsHandler:
         )
 
         return ValidationSummary(
+            episode_count=num_done,
             mean_episode_return=mean_episode_return,
             mean_episode_length=mean_episode_length,
             max_timestep=max_timestep,
@@ -784,6 +812,7 @@ class MetricsHandler:
         )
 
         return ValidationSummary(
+            episode_count=jnp.array(0.0),
             mean_episode_return=jnp.array(0.0),
             mean_episode_length=jnp.array(0.0),
             max_timestep=jnp.array(0),
@@ -818,14 +847,34 @@ def flatten_validation_metrics(
                          If None, logs all error metrics for backward compatibility.
     """
     metrics: dict[str, float] = {
+        "val_episode_count": float(validation_metrics.episode_count),
         "val_mean_episode_return": float(validation_metrics.mean_episode_return),
         "val_mean_episode_length": float(validation_metrics.mean_episode_length),
         "val_early_termination_count": float(validation_metrics.early_termination_count),
         "val_early_termination_rate": float(validation_metrics.early_termination_rate),
+        "val_horizon_timeout_count": float(validation_metrics.horizon_timeout_count),
+        "val_horizon_timeout_rate": float(validation_metrics.horizon_timeout_rate),
+        "val_reward_termination_count": float(validation_metrics.reward_termination_count),
+        "val_reward_termination_rate": float(validation_metrics.reward_termination_rate),
+        "val_motion_success_rate": float(validation_metrics.motion_success_rate),
+        "val_mean_frame_coverage": float(validation_metrics.mean_frame_coverage),
+        "val_worst_quartile_frame_coverage": float(
+            validation_metrics.worst_quartile_frame_coverage
+        ),
+        "val_mean_return_per_frame": float(validation_metrics.mean_return_per_frame),
+        "val_motion_count": float(validation_metrics.motion_count),
         # Root error metrics do not depend on configured quantity selection.
         "val_err_root_xyz": float(validation_metrics.err_root_xyz),
         "val_err_root_yaw": float(validation_metrics.err_root_yaw),
     }
+    per_motion_fields = {
+        "success": validation_metrics.per_motion_success,
+        "frame_coverage": validation_metrics.per_motion_frame_coverage,
+        "return_per_frame": validation_metrics.per_motion_return_per_frame,
+    }
+    for metric_name, values in per_motion_fields.items():
+        for index, value in enumerate(values):
+            metrics[f"val_motion_{index:03d}_{metric_name}"] = float(value)
     enabled_quantities_set = set(enabled_quantities) if enabled_quantities is not None else None
 
     error_metric_quantities = {

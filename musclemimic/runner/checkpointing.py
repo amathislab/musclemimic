@@ -4,21 +4,23 @@ import json
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
 
 # Fields excluded from config hash (they don't affect training identity)
-_HASH_EXCLUDE_FIELDS = frozenset({
-    "resume_from",
-    "reset_logging_timestep",
-    "checkpoint_dir",
-    "checkpoint_root",
-    "run_id",
-    "auto_resume",
-})
+_HASH_EXCLUDE_FIELDS = frozenset(
+    {
+        "resume_from",
+        "reset_logging_timestep",
+        "checkpoint_dir",
+        "checkpoint_root",
+        "run_id",
+        "auto_resume",
+    }
+)
 
 
 def _is_checkpoint_complete(checkpoint_path: Path) -> bool:
@@ -108,9 +110,22 @@ def _get_git_sha() -> str | None:
             timeout=5,
         )
         if result.returncode == 0:
-            return result.stdout.strip()[:12]
+            git_sha = result.stdout.strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", git_sha):
+                return git_sha
     except Exception:
         pass
+    return None
+
+
+def _get_expected_git_sha() -> str | None:
+    """Resolve the full source identity, preferring TERRA's launch pin."""
+    expected_commit = os.environ.get("TERRA_EXPECTED_COMMIT")
+    if expected_commit is None:
+        return _get_git_sha()
+    expected_commit = expected_commit.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        return expected_commit
     return None
 
 
@@ -118,6 +133,8 @@ def write_manifest(
     checkpoint_dir: str | Path,
     config: Any,
     config_hash_value: str,
+    *,
+    require_full_git_sha: bool = False,
 ) -> None:
     """Write manifest.json in checkpoint directory on first save.
 
@@ -125,6 +142,9 @@ def write_manifest(
         checkpoint_dir: Checkpoint directory path.
         config: Experiment config to save.
         config_hash_value: Pre-computed config hash.
+        require_full_git_sha: Refuse to create the manifest when the source
+            identity cannot be resolved. PPO enables this; legacy callers keep
+            their existing permissive behavior.
     """
     checkpoint_dir = Path(checkpoint_dir)
     manifest_path = checkpoint_dir / "manifest.json"
@@ -135,10 +155,17 @@ def write_manifest(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    git_sha = _get_expected_git_sha()
+    if require_full_git_sha and git_sha is None:
+        raise ValueError(
+            "cannot write a strict checkpoint manifest because the current git SHA "
+            "is unavailable or TERRA_EXPECTED_COMMIT is not a full 40-character SHA"
+        )
+
     manifest = {
         "config_hash": config_hash_value,
-        "git_sha": _get_git_sha(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "git_sha": git_sha,
+        "created_at": datetime.now(UTC).isoformat(),
         "experiment_config": OmegaConf.to_container(config, resolve=True),
     }
 
@@ -171,7 +198,7 @@ def validate_checkpoint_compatibility(
 
         saved_hash = manifest.get("config_hash")
         if saved_hash and saved_hash != current_hash:
-            print(f"WARNING: Config hash mismatch!")
+            print("WARNING: Config hash mismatch!")
             print(f"  Checkpoint: {saved_hash}")
             print(f"  Current:    {current_hash}")
             print("  Continuing anyway (override with explicit resume_from if needed)")
@@ -180,6 +207,66 @@ def validate_checkpoint_compatibility(
         print(f"Warning: Could not read manifest: {e}")
 
     return True
+
+
+def require_ppo_local_resume_compatibility(
+    checkpoint_dir: str | Path,
+    current_hash: str,
+    *,
+    current_git_sha: str | None = None,
+) -> None:
+    """Fail closed unless a local PPO checkpoint manifest exactly matches.
+
+    This deliberately does not change :func:`validate_checkpoint_compatibility`,
+    whose missing/unreadable-manifest behavior is retained for legacy FlashSAC
+    resumes.  PPO calls this stricter API only for an implicit local auto-resume;
+    an explicitly selected checkpoint remains an operator decision.
+
+    Args:
+        checkpoint_dir: Directory containing ``manifest.json``.
+        current_hash: Current experiment config hash.
+        current_git_sha: Current repository SHA, primarily injectable for tests.
+            When omitted, it is resolved from the local checkout.
+
+    Raises:
+        ValueError: If either identity is unavailable or does not exactly match
+            the persisted manifest.
+    """
+    manifest_path = Path(checkpoint_dir) / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"manifest is missing: {manifest_path}")
+
+    try:
+        with open(manifest_path, encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"manifest is unreadable: {manifest_path} ({type(error).__name__}: {error})") from error
+    if not isinstance(manifest, dict):
+        raise ValueError(f"manifest must contain a JSON object: {manifest_path}")
+
+    expected_hash = manifest.get("config_hash")
+    if not isinstance(expected_hash, str) or not expected_hash.strip():
+        raise ValueError(f"manifest config_hash is missing or invalid: {manifest_path}")
+    if not isinstance(current_hash, str) or not current_hash.strip():
+        raise ValueError("current config hash is unavailable")
+    if expected_hash != current_hash:
+        raise ValueError(f"experiment config hash changed (checkpoint={expected_hash}, current={current_hash})")
+
+    expected_git_sha = manifest.get("git_sha")
+    if not isinstance(expected_git_sha, str) or not expected_git_sha.strip():
+        raise ValueError(f"manifest git_sha is missing or invalid: {manifest_path}")
+    resolved_git_sha = current_git_sha if current_git_sha is not None else _get_expected_git_sha()
+    if not isinstance(resolved_git_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", resolved_git_sha.strip().lower()):
+        raise ValueError(
+            "current git SHA is unavailable or invalid; TERRA_EXPECTED_COMMIT, "
+            "when set, must be a full 40-character SHA"
+        )
+    resolved_git_sha = resolved_git_sha.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_git_sha.strip().lower()):
+        raise ValueError(f"manifest git_sha must be a full 40-character SHA: {manifest_path}")
+    expected_git_sha = expected_git_sha.strip().lower()
+    if expected_git_sha != resolved_git_sha:
+        raise ValueError(f"git SHA changed (checkpoint={expected_git_sha}, current={resolved_git_sha})")
 
 
 def resolve_checkpoint_dir(
@@ -209,9 +296,13 @@ def resolve_checkpoint_dir(
     if checkpoint_root:
         base = checkpoint_root if os.path.isabs(checkpoint_root) else os.path.join(launch_dir, checkpoint_root)
     elif auto_resume:
-        base = configured_ckpt_dir if os.path.isabs(configured_ckpt_dir) else os.path.join(launch_dir, configured_ckpt_dir)
+        base = (
+            configured_ckpt_dir if os.path.isabs(configured_ckpt_dir) else os.path.join(launch_dir, configured_ckpt_dir)
+        )
     else:
-        base = configured_ckpt_dir if os.path.isabs(configured_ckpt_dir) else os.path.join(result_dir, configured_ckpt_dir)
+        base = (
+            configured_ckpt_dir if os.path.isabs(configured_ckpt_dir) else os.path.join(result_dir, configured_ckpt_dir)
+        )
 
     # Append experiment_id for auto_resume, otherwise use unique suffix
     if auto_resume:
@@ -220,7 +311,7 @@ def resolve_checkpoint_dir(
         return base  # Caller adds unique suffix
 
 
-def _download_from_huggingface(repo_id: str, revision: str = None) -> str:
+def _download_from_huggingface(repo_id: str, revision: str | None = None) -> str:
     """Download checkpoint from HuggingFace and return local path.
 
     Args:
@@ -239,7 +330,7 @@ def _download_from_huggingface(repo_id: str, revision: str = None) -> str:
     return local_dir
 
 
-def _canonicalize_resume_path(path_like: str, revision: str = None) -> str:
+def _canonicalize_resume_path(path_like: str, revision: str | None = None) -> str:
     r"""Return a concrete checkpoint path to resume from.
 
     Accepts multiple user-friendly inputs and normalizes to an Orbax checkpoint
@@ -286,6 +377,7 @@ def _canonicalize_resume_path(path_like: str, revision: str = None) -> str:
     if (p / "train_state").is_dir():
         # Read step from metadata/metadata and create expected checkpoint_<step> structure
         import json
+
         metadata_file = p / "metadata" / "metadata"
         if metadata_file.is_symlink():
             metadata_file = metadata_file.resolve()
@@ -330,9 +422,7 @@ def resume_or_fresh(
             agent_conf,
             mh=mh,
             online_logging_callback=logging_callback,
-            logging_interval=getattr(
-                config.experiment, "online_logging_interval", logging_interval
-            ),
+            logging_interval=getattr(config.experiment, "online_logging_interval", logging_interval),
             val_env=val_env,
         )
 
@@ -346,9 +436,7 @@ def resume_or_fresh(
         canonical,
         mh=mh,
         online_logging_callback=logging_callback,
-        logging_interval=getattr(
-            config.experiment, "online_logging_interval", logging_interval
-        ),
+        logging_interval=getattr(config.experiment, "online_logging_interval", logging_interval),
         val_env=val_env,
         apply_resume_resets=apply_resume_resets,
     )

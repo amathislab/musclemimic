@@ -25,8 +25,11 @@ class TrainingConfig:
     @classmethod
     def from_experiment_config(cls, exp_config):
         """Extract from OmegaConf experiment config."""
+        num_envs = getattr(exp_config, "global_num_envs", None)
+        if num_envs is None:
+            num_envs = exp_config.num_envs
         return cls(
-            num_envs=int(exp_config.num_envs),
+            num_envs=int(num_envs),
             num_steps=int(exp_config.num_steps),
             num_minibatches=int(exp_config.num_minibatches),
             update_epochs=int(exp_config.update_epochs),

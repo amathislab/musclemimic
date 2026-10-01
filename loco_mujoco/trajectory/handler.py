@@ -1,5 +1,5 @@
+import json
 import logging
-from collections.abc import Sequence
 from dataclasses import replace
 
 import jax
@@ -17,6 +17,7 @@ from loco_mujoco.trajectory.dataclasses import (
     recompute_trajectory_velocities,
     trajectory_info_with_cache_metadata,
 )
+from loco_mujoco.trajectory.materialized_cache import mujoco_model_sha256
 
 
 @struct.dataclass
@@ -35,22 +36,10 @@ class TrajectoryHandler(StatefulObject):
     interpolates the trajectory to the desired control frequency.
 
     """
-
-    def __init__(
-        self,
-        model,
-        traj_path=None,
-        traj: Trajectory = None,
-        control_dt=0.01,
-        random_start=True,
-        fixed_start_conf=None,
-        start_from_random_step=True,
-        clip_trajectory_to_joint_ranges=False,
-        warn=True,
-        cache_type: TrajectoryCacheType | str = TrajectoryCacheType.FULL,
-        site_names: list[str] | None = None,
-        motion_names: Sequence[str | None] | None = None,
-    ):
+    def __init__(self, model, traj_path=None, traj: Trajectory = None, materialized_traj: Trajectory = None,
+                 control_dt=0.01, random_start=True,
+                 fixed_start_conf=None, start_from_random_step=True, clip_trajectory_to_joint_ranges=False, warn=True,
+                 cache_type: TrajectoryCacheType | str = TrajectoryCacheType.FULL, site_names: list[str] | None = None):
         """
         Constructor.
 
@@ -64,12 +53,13 @@ class TrajectoryHandler(StatefulObject):
             control_dt (float): Model control frequency used to interpolate the trajectory.
             start_from_random_step (bool): If True, start from a random step in the trajectory.
             warn (bool): If True, a warning will be raised, if some trajectory ranges are violated. todo
-            motion_names: Source name for each trajectory, in trajectory index order.
 
         """
 
-        assert (traj_path is not None) != (traj is not None), ("Please specify either traj_path or "
-                                                               "trajectory, but not both.")
+        sources = (traj_path is not None, traj is not None, materialized_traj is not None)
+        assert sum(sources) == 1, (
+            "Please specify exactly one of traj_path, traj, or materialized_traj."
+        )
 
         # load data
         if traj_path is not None:
@@ -85,15 +75,19 @@ class TrajectoryHandler(StatefulObject):
         self.start_from_random_step = start_from_random_step
 
         self.control_dt = control_dt
-        self.traj = materialize_trajectory(
-            traj,
-            model=model,
-            control_dt=control_dt,
-            cache_type=cache_type,
-            site_names=site_names,
-        )
+        self.model_sha256 = mujoco_model_sha256(model)
+        if materialized_traj is None:
+            self.traj = materialize_trajectory(
+                traj,
+                model=model,
+                control_dt=control_dt,
+                cache_type=cache_type,
+                site_names=site_names,
+                clip_joint_ranges=clip_trajectory_to_joint_ranges,
+            )
+        else:
+            self.traj = materialized_traj
         self._is_numpy = True if isinstance(self.traj.data.qpos, np.ndarray) else False
-        self.motion_names = self._normalize_motion_names(motion_names)
 
         # Update traj_dt from interpolated trajectory info
         self.traj_dt = 1.0 / self.traj.info.frequency
@@ -108,24 +102,6 @@ class TrajectoryHandler(StatefulObject):
     def n_trajectories(self):
         return len(self.traj.data.split_points) - 1
 
-    def _normalize_motion_names(
-        self,
-        motion_names: Sequence[str | None] | None,
-    ) -> tuple[str | None, ...] | None:
-        if motion_names is None:
-            return None
-
-        normalized = tuple(None if name is None else str(name) for name in motion_names)
-        if len(normalized) != self.n_trajectories:
-            raise ValueError(f"Expected {self.n_trajectories} motion names, got {len(normalized)}.")
-        return normalized
-
-    def get_motion_name(self, traj_index: int) -> str | None:
-        """Return the source name for a trajectory index."""
-        if self.motion_names is None:
-            return None
-        return self.motion_names[traj_index]
-
     def last_step_idx(self, traj_ind):
         """Return the last valid step index for a trajectory."""
         return self.len_trajectory(traj_ind) - 1
@@ -136,6 +112,107 @@ class TrajectoryHandler(StatefulObject):
         if backend == jnp:
             return jnp.greater_equal(traj_state.subtraj_step_no, last_step_idx)
         return traj_state.subtraj_step_no >= last_step_idx
+
+    def sample_start_indices(self, trajectory_key, step_key, weights=None, backend=jnp):
+        """Sample a trajectory and one of the configured start regions.
+
+        The returned mode is 0 for frame zero, 1 for a random positive frame
+        in the first quarter, and 2 for a random frame over the full clip.
+        """
+        frame_zero_probability = float(getattr(self, "frame_zero_reset_probability", 0.0))
+        first_quarter_probability = float(
+            getattr(self, "first_quarter_reset_probability", 0.0)
+        )
+        if (
+            frame_zero_probability < 0.0
+            or first_quarter_probability < 0.0
+            or frame_zero_probability + first_quarter_probability > 1.0
+        ):
+            raise ValueError(
+                "frame-zero and first-quarter reset probabilities must be non-negative and sum to at most 1"
+            )
+
+        if backend == jnp:
+            if weights is None:
+                trajectory = jax.random.randint(
+                    trajectory_key,
+                    shape=(),
+                    minval=0,
+                    maxval=self.n_trajectories,
+                )
+            else:
+                trajectory = jax.random.choice(
+                    trajectory_key,
+                    self.n_trajectories,
+                    p=weights,
+                )
+            if not self.start_from_random_step:
+                return trajectory, jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32)
+
+            mode_key, full_frame_key, quarter_frame_key = jax.random.split(step_key, 3)
+            mode = jax.random.categorical(
+                mode_key,
+                jnp.log(
+                    jnp.asarray(
+                        (
+                            frame_zero_probability,
+                            first_quarter_probability,
+                            1.0 - frame_zero_probability - first_quarter_probability,
+                        ),
+                        dtype=jnp.float32,
+                    )
+                ),
+            ).astype(jnp.int32)
+            trajectory_length = self.len_trajectory(trajectory).astype(jnp.int32)
+            full_clip_step = jax.random.randint(
+                full_frame_key,
+                shape=(),
+                minval=0,
+                maxval=jnp.maximum(trajectory_length, 1),
+            )
+            first_quarter_limit = jnp.maximum((trajectory_length + 3) // 4, 2)
+            first_quarter_step = jax.random.randint(
+                quarter_frame_key,
+                shape=(),
+                minval=1,
+                maxval=first_quarter_limit,
+            )
+            first_quarter_step = jnp.minimum(
+                first_quarter_step,
+                jnp.maximum(trajectory_length - 1, 0),
+            )
+            start_step = jnp.where(
+                mode == 0,
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.where(mode == 1, first_quarter_step, full_clip_step),
+            )
+            return trajectory, start_step, mode
+
+        probabilities = np.asarray(
+            (
+                frame_zero_probability,
+                first_quarter_probability,
+                1.0 - frame_zero_probability - first_quarter_probability,
+            )
+        )
+        trajectory = int(
+            np.random.choice(
+                self.n_trajectories,
+                p=None if weights is None else np.asarray(weights),
+            )
+        )
+        if not self.start_from_random_step:
+            return trajectory, 0, 0
+        mode = int(np.random.choice(3, p=probabilities))
+        trajectory_length = int(self.len_trajectory(trajectory))
+        if mode == 0:
+            start_step = 0
+        elif mode == 1:
+            start_step = int(np.random.randint(1, max(2, (trajectory_length + 3) // 4)))
+            start_step = min(start_step, max(trajectory_length - 1, 0))
+        else:
+            start_step = int(np.random.randint(0, max(trajectory_length, 1)))
+        return trajectory, start_step, mode
 
     @staticmethod
     def filter_and_extend(traj_data, traj_info, model):
@@ -156,14 +233,14 @@ class TrajectoryHandler(StatefulObject):
             TrajectoryData, TrajectoryInfo: Filtered and extended trajectory data and trajectory info.
 
         """
-
+        
         # Special handling for MyoBimanualArm: detect if this is a MyoBimanualArm trajectory
         # by checking if the trajectory has exactly 7 sites matching MyoBimanualArm's sites_for_mimic
         is_bimanual_muscle_traj = False
-        bimanual_sites = ["right_shoulder_mimic", "right_elbow_mimic", "right_hand_mimic",
+        bimanual_sites = ["right_shoulder_mimic", "right_elbow_mimic", "right_hand_mimic", 
                            "left_shoulder_mimic", "left_elbow_mimic", "left_hand_mimic"]
-
-        if (traj_info.site_names is not None and
+        
+        if (traj_info.site_names is not None and 
             len(traj_info.site_names) == 6 and
             set(traj_info.site_names) == set(bimanual_sites)):
             is_bimanual_muscle_traj = True
@@ -263,7 +340,7 @@ class TrajectoryHandler(StatefulObject):
             # and skip adding sites from the model to maintain memory optimization
             has_many_model_sites = len(site_names) > len(traj_info.site_names) * 10  # Model has 10x more sites than trajectory
             is_muscle_model = is_bimanual_muscle_traj or has_many_model_sites
-
+            
             if not is_muscle_model:
                 # Only add sites for non-muscle models
                 for s_name in site_names:
@@ -293,7 +370,7 @@ class TrajectoryHandler(StatefulObject):
             new_site_order = []
             has_many_model_sites = len(site_names) > len(traj_info.site_names) * 10  # Model has 10x more sites than trajectory
             is_muscle_model = is_bimanual_muscle_traj or has_many_model_sites
-
+            
             if is_muscle_model:
                 # For muscle models, maintain the existing order of mimic sites
                 # without trying to reorder to match all model sites
@@ -324,7 +401,13 @@ class TrajectoryHandler(StatefulObject):
 
         def _selected_idx():
             traj_idx = backend.asarray(carry.selected_traj_idx, dtype=backend.int32)
-            return traj_idx, backend.asarray(0, dtype=backend.int32)
+            selected_step = getattr(carry, "selected_subtraj_step", None)
+            if selected_step is None:
+                subtraj_step_idx = backend.asarray(0, dtype=backend.int32)
+            else:
+                selected_step = backend.asarray(selected_step, dtype=backend.int32)
+                subtraj_step_idx = backend.maximum(selected_step, backend.asarray(0, dtype=backend.int32))
+            return traj_idx, subtraj_step_idx
 
         def _random_start_idx():
             if backend == jnp:
@@ -384,6 +467,29 @@ class TrajectoryHandler(StatefulObject):
         return data, carry.replace(key=key, traj_state=TrajState(self.new_traj_no, new_subtraj_step_no,
                                                                  self.new_subtraj_step_no_init))
 
+    def reset_state_to_step(self, env, model, data, carry, backend, traj_idx, subtraj_step):
+        """Reset directly to an explicitly selected trajectory frame.
+
+        This deliberately avoids tracing the random-reset branch.  Under a
+        data-parallel ``shard_map``, tracing that branch inside ``lax.cond``
+        makes the replicated trajectory split points data-varying and causes
+        JAX's VMA checker to reject the dynamic indexing used by ``randint``.
+        """
+        del env, model
+        traj_idx = backend.asarray(traj_idx, dtype=backend.int32)
+        if subtraj_step is None:
+            subtraj_step = backend.asarray(0, dtype=backend.int32)
+        else:
+            subtraj_step = backend.maximum(
+                backend.asarray(subtraj_step, dtype=backend.int32),
+                backend.asarray(0, dtype=backend.int32),
+            )
+
+        self.new_traj_no = traj_idx
+        self.new_subtraj_step_no_init = subtraj_step
+        traj_state = TrajState(traj_idx, subtraj_step, subtraj_step)
+        return data, carry.replace(traj_state=traj_state)
+
     def update_state(self, env, model, data, carry, backend):
         traj_state = carry.traj_state
         last_step_idx = self.last_step_idx(traj_state.traj_no)
@@ -417,18 +523,18 @@ class TrajectoryHandler(StatefulObject):
         return self.traj.data.get(traj_no, subtraj_step_no, backend)
 
     def to_numpy(self):
-        if not self._is_numpy:
-            traj_model = self.traj.info.model.to_numpy()
-            traj_info = replace(self.traj.info, model=traj_model)
-            self.traj = replace(self.traj, data=self.traj.data.to_numpy(), info=traj_info)
-            self._is_numpy = True
+        # Retargeting caches can contain mixed NumPy/JAX fields, so qpos is
+        # not a sufficient backend sentinel. Convert every field.
+        traj_model = self.traj.info.model.to_numpy()
+        traj_info = replace(self.traj.info, model=traj_model)
+        self.traj = replace(self.traj, data=self.traj.data.to_numpy(), info=traj_info)
+        self._is_numpy = True
 
     def to_jax(self):
-        if self._is_numpy:
-            traj_model = self.traj.info.model.to_jax()
-            traj_info = replace(self.traj.info, model=traj_model)
-            self.traj = replace(self.traj, data=self.traj.data.to_jax(), info=traj_info)
-            self._is_numpy = False
+        traj_model = self.traj.info.model.to_jax()
+        traj_info = replace(self.traj.info, model=traj_model)
+        self.traj = replace(self.traj, data=self.traj.data.to_jax(), info=traj_info)
+        self._is_numpy = False
 
     @property
     def is_numpy(self):
@@ -441,6 +547,7 @@ def materialize_trajectory(
     control_dt: float,
     cache_type: TrajectoryCacheType | str = TrajectoryCacheType.FULL,
     site_names: list[str] | None = None,
+    clip_joint_ranges: bool = False,
 ) -> Trajectory:
     cache_type = TrajectoryCacheType(cache_type)
     backend = np if isinstance(traj.data.qpos, np.ndarray) else jnp
@@ -458,7 +565,26 @@ def materialize_trajectory(
     )
 
     if not np.isclose(traj_dt, control_dt, atol=1e-9):
-        traj_data, traj_info = interpolate_trajectories(traj_data, traj_info, target_frequency, backend=backend)
+        bounded_qpos_ranges = None
+        if clip_joint_ranges:
+            bounded_qpos_ranges = {
+                int(model.jnt_qposadr[joint_id]): (
+                    float(model.jnt_range[joint_id, 0]),
+                    float(model.jnt_range[joint_id, 1]),
+                    bool(model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_HINGE),
+                )
+                for joint_id in range(model.njnt)
+                if model.jnt_limited[joint_id]
+                and model.jnt_type[joint_id]
+                in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)
+            }
+        traj_data, traj_info = interpolate_trajectories(
+            traj_data,
+            traj_info,
+            target_frequency,
+            backend=backend,
+            bounded_qpos_ranges=bounded_qpos_ranges,
+        )
         print(
             f"[TrajectoryHandler] INFO: Interpolated trajectory from {original_frequency:.1f} Hz "
             f"to {target_frequency:.1f} Hz ({original_samples} -> {int(np.asarray(traj_data.n_samples))} samples)"
@@ -471,6 +597,92 @@ def materialize_trajectory(
                 target_frequency,
                 original_samples,
                 int(np.asarray(traj_data.n_samples)),
+            )
+
+    if clip_joint_ranges:
+        qpos = np.asarray(traj_data.qpos).copy()
+        changed = np.zeros(len(qpos), dtype=bool)
+        angular_changed = np.zeros(len(qpos), dtype=bool)
+        material_angular_changed = np.zeros(len(qpos), dtype=bool)
+        changed_values = 0
+        angular_changed_values = 0
+        material_angular_changed_values = 0
+        max_abs_correction = 0.0
+        angular_max_abs_correction = 0.0
+        material_angular_threshold = float(np.deg2rad(0.05))
+        by_joint = {}
+        for joint_id in range(model.njnt):
+            if not model.jnt_limited[joint_id]:
+                continue
+            if model.jnt_type[joint_id] not in (
+                mujoco.mjtJoint.mjJNT_HINGE,
+                mujoco.mjtJoint.mjJNT_SLIDE,
+            ):
+                continue
+            address = int(model.jnt_qposadr[joint_id])
+            before = qpos[:, address].copy()
+            qpos[:, address] = np.clip(qpos[:, address], *model.jnt_range[joint_id])
+            correction = qpos[:, address] - before
+            joint_changed = correction != 0
+            changed |= joint_changed
+            if np.any(joint_changed):
+                joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+                is_angular = model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_HINGE
+                material = joint_changed & (
+                    np.abs(correction) > material_angular_threshold
+                ) if is_angular else np.zeros(len(qpos), dtype=bool)
+                by_joint[joint_name or str(joint_id)] = {
+                    "frame_count": int(joint_changed.sum()),
+                    "max_abs_correction": float(np.max(np.abs(correction[joint_changed]))),
+                    "angular": bool(is_angular),
+                    "material_frame_count": int(material.sum()),
+                }
+                changed_values += int(joint_changed.sum())
+                max_abs_correction = max(
+                    max_abs_correction,
+                    float(np.max(np.abs(correction[joint_changed]))),
+                )
+                if is_angular:
+                    angular_changed |= joint_changed
+                    material_angular_changed |= material
+                    angular_changed_values += int(joint_changed.sum())
+                    material_angular_changed_values += int(material.sum())
+                    angular_max_abs_correction = max(
+                        angular_max_abs_correction,
+                        float(np.max(np.abs(correction[joint_changed]))),
+                    )
+        projection_metadata = dict(traj_info.metadata or {})
+        projection_metadata.update(
+            {
+                "joint_range_projection_frame_count": int(changed.sum()),
+                "joint_range_projection_value_count": changed_values,
+                "joint_range_projection_max_abs": max_abs_correction,
+                "joint_range_projection_frames": np.flatnonzero(changed).tolist(),
+                "joint_range_projection_angular_frame_count": int(angular_changed.sum()),
+                "joint_range_projection_angular_value_count": angular_changed_values,
+                "joint_range_projection_angular_max_abs": angular_max_abs_correction,
+                "joint_range_projection_angular_frames": np.flatnonzero(
+                    angular_changed
+                ).tolist(),
+                "joint_range_projection_material_angular_threshold": material_angular_threshold,
+                "joint_range_projection_material_angular_frame_count": int(
+                    material_angular_changed.sum()
+                ),
+                "joint_range_projection_material_angular_value_count": material_angular_changed_values,
+                "joint_range_projection_material_angular_frames": np.flatnonzero(
+                    material_angular_changed
+                ).tolist(),
+                "joint_range_projection_by_joint_json": json.dumps(
+                    by_joint, sort_keys=True, separators=(",", ":")
+                ),
+            }
+        )
+        traj_info = replace(traj_info, metadata=projection_metadata)
+        if np.any(changed):
+            traj_data = traj_data.replace(qpos=backend.asarray(qpos))
+            print(
+                "[TrajectoryHandler] INFO: Projected "
+                f"{int(changed.sum())}/{len(changed)} frame(s) onto declared joint ranges"
             )
 
     traj_data = recompute_trajectory_velocities(traj_data, traj_info, model, backend=backend)

@@ -27,7 +27,14 @@ from loco_mujoco.core.terrain.base import Terrain
 from loco_mujoco.core.utils.env import Box
 from loco_mujoco.trajectory.dataclasses import SingleData
 from musclemimic.core.mujoco_mjx import Mjx, MjxState
-from musclemimic.core.wrappers.mjx import AutoResetWrapper, LogWrapper, NStepWrapper, NormalizeVecReward, VecEnv
+from musclemimic.core.wrappers.mjx import (
+    AutoResetWrapper,
+    LocoMjxWrapper,
+    LogWrapper,
+    NStepWrapper,
+    NormalizeVecReward,
+    VecEnv,
+)
 from musclemimic.environments.base import LocoEnv
 from musclemimic.environments.humanoids.myofullbody import MjxMyoFullBody, MyoFullBody
 
@@ -66,6 +73,27 @@ class _ResetMutatesQposEnv(Mjx):
         return model, data, carry
 
 
+class _SelectedResetHookEnv(Mjx):
+    """Expose which reset hook was selected through the root x position."""
+
+    def _mjx_reset_carry(self, model, data, carry):
+        data, carry = super()._mjx_reset_carry(model, data, carry)
+        return data.replace(qpos=data.qpos.at[0].set(-1.0)), carry
+
+    def _mjx_reset_carry_to_step(
+        self,
+        model,
+        data,
+        carry,
+        selected_traj_idx,
+        selected_subtraj_step,
+    ):
+        data, carry = super()._mjx_reset_carry(model, data, carry)
+        selected_subtraj_step = jnp.asarray(selected_subtraj_step, dtype=jnp.float32)
+        value = jnp.asarray(selected_traj_idx, dtype=jnp.float32) + selected_subtraj_step
+        return data.replace(qpos=data.qpos.at[0].set(value)), carry
+
+
 class _ModelMassObservationEnv(Mjx):
     """Test-only env to ensure the model returned from pre_step is used for observations."""
 
@@ -81,6 +109,44 @@ class _ModelMassObservationEnv(Mjx):
         obs = jnp.zeros(self.info.observation_space.shape, dtype=jnp.float32)
         obs = obs.at[0].set(model.body_mass[self.TARGET_BODY_ID])
         return obs, carry
+
+
+class _NonfiniteTransitionEnv(Mjx):
+    """Inject nonfinite physics and reward values after one valid reset."""
+
+    def _mjx_simulation_post_step(self, model, data, carry):
+        del model
+        data = data.replace(
+            qpos=data.qpos.at[0].set(jnp.nan),
+            qvel=data.qvel.at[0].set(jnp.inf),
+        )
+        return data, carry
+
+    def _mjx_reward(self, obs, action, next_obs, absorbing, info, model, data, carry):
+        del obs, action, next_obs, absorbing, info, model, data
+        return (
+            jnp.asarray(jnp.nan, dtype=jnp.float32),
+            carry,
+            {
+                "reward_finite_component": jnp.asarray(2.0, dtype=jnp.float32),
+                "reward_nonfinite_component": jnp.asarray(jnp.inf, dtype=jnp.float32),
+            },
+        )
+
+
+class _MarkedNonfiniteRewardEnv(Mjx):
+    """Return a finite reward carrying TERRA's pre-sanitization marker."""
+
+    def _mjx_reward(self, obs, action, next_obs, absorbing, info, model, data, carry):
+        del obs, action, next_obs, absorbing, info, model, data
+        return (
+            jnp.asarray(1.0, dtype=jnp.float32),
+            carry,
+            {
+                "reward_finite_component": jnp.asarray(1.0, dtype=jnp.float32),
+                "numerics_nonfinite_reward": jnp.asarray(True),
+            },
+        )
 
 
 class _DummyLocoEnv(LocoEnv):
@@ -279,6 +345,31 @@ def test_mjx_reset_runs_pre_step_and_forward_after_reset_carry(minimal_freejoint
     assert float(state.observation[0]) == pytest.approx(2.0)
 
 
+def test_mjx_reset_dispatches_explicit_trajectory_resets_statically(minimal_freejoint_xml):
+    env = _SelectedResetHookEnv(
+        spec=minimal_freejoint_xml,
+        actuation_spec=[],
+        observation_spec=[ObservationType.FreeJointPos("q_free", xml_name="free")],
+        horizon=2,
+        reward_type="NoReward",
+        terminal_state_type="NoTerminalStateHandler",
+        domain_randomization_type="NoDomainRandomization",
+        terrain_type="StaticTerrain",
+        init_state_type="DefaultInitialStateHandler",
+        control_type="DefaultControl",
+    )
+
+    random_state = env.mjx_reset(jax.random.PRNGKey(0))
+    explicit_state = jax.jit(env.mjx_reset)(
+        jax.random.PRNGKey(1),
+        selected_traj_idx=jnp.asarray(3, dtype=jnp.int32),
+        selected_subtraj_step=jnp.asarray(4, dtype=jnp.int32),
+    )
+
+    assert float(random_state.data.qpos[0]) == pytest.approx(-1.0)
+    assert float(explicit_state.data.qpos[0]) == pytest.approx(7.0)
+
+
 def test_mjx_reset_in_step_applies_pre_step_and_forward(minimal_freejoint_xml):
     env = _ResetMutatesQposEnv(
         spec=minimal_freejoint_xml,
@@ -327,6 +418,96 @@ def test_mjx_reset_uses_pre_step_model_for_observation(minimal_freejoint_xml):
     # The in-step reset path should also propagate the randomized model to observation creation.
     reset_state = env._mjx_reset_in_step(state)
     assert float(reset_state.observation[0]) == pytest.approx(env.UPDATED_MASS)
+
+
+def _make_numerics_test_env(env_class, model_path):
+    return env_class(
+        spec=model_path,
+        actuation_spec=[],
+        observation_spec=[ObservationType.FreeJointPos("q_free", xml_name="free")],
+        horizon=10,
+        reward_type="NoReward",
+        terminal_state_type="NoTerminalStateHandler",
+        domain_randomization_type="NoDomainRandomization",
+        terrain_type="StaticTerrain",
+        init_state_type="DefaultInitialStateHandler",
+        control_type="DefaultControl",
+    )
+
+
+def test_mjx_nonfinite_transition_is_finite_terminal_state(minimal_freejoint_xml):
+    env = _make_numerics_test_env(_NonfiniteTransitionEnv, minimal_freejoint_xml)
+    state = env.mjx_reset(jax.random.PRNGKey(0))
+
+    numerics_keys = (
+        "numerics_nonfinite_observation",
+        "numerics_nonfinite_qpos",
+        "numerics_nonfinite_qvel",
+        "numerics_nonfinite_reward",
+        "numerics_nonfinite_reward_info",
+        "numerics_nonfinite_transition",
+    )
+    for key in numerics_keys:
+        assert key in state.info
+        assert not bool(np.asarray(state.info[key]))
+
+    next_state = env.mjx_step(state, jnp.zeros((0,), dtype=jnp.float32))
+
+    assert bool(np.asarray(next_state.done))
+    assert bool(np.asarray(next_state.absorbing))
+    assert float(np.asarray(next_state.reward)) == 0.0
+    assert np.isfinite(np.asarray(next_state.observation)).all()
+    assert float(np.asarray(next_state.info["reward_nonfinite_component"])) == 0.0
+    assert float(np.asarray(next_state.info["reward_finite_component"])) == 2.0
+    for key in numerics_keys:
+        assert bool(np.asarray(next_state.info[key]))
+    for value in next_state.info.values():
+        if np.issubdtype(np.asarray(value).dtype, np.inexact):
+            assert np.isfinite(np.asarray(value)).all()
+
+
+def test_mjx_honors_presanitization_reward_marker(minimal_freejoint_xml):
+    env = _make_numerics_test_env(_MarkedNonfiniteRewardEnv, minimal_freejoint_xml)
+    state = env.mjx_reset(jax.random.PRNGKey(0))
+    next_state = env.mjx_step(state, jnp.zeros((0,), dtype=jnp.float32))
+
+    assert bool(np.asarray(next_state.done))
+    assert bool(np.asarray(next_state.absorbing))
+    assert float(np.asarray(next_state.reward)) == 0.0
+    assert bool(np.asarray(next_state.info["numerics_nonfinite_reward"]))
+    assert bool(np.asarray(next_state.info["numerics_nonfinite_transition"]))
+    assert not bool(np.asarray(next_state.info["numerics_nonfinite_observation"]))
+    assert not bool(np.asarray(next_state.info["numerics_nonfinite_qpos"]))
+    assert not bool(np.asarray(next_state.info["numerics_nonfinite_qvel"]))
+    assert not bool(np.asarray(next_state.info["numerics_nonfinite_reward_info"]))
+    assert np.isfinite(np.asarray(next_state.observation)).all()
+
+
+def test_mjx_nonfinite_transition_autoresets_to_finite_carry(minimal_freejoint_xml):
+    base_env = _make_numerics_test_env(_NonfiniteTransitionEnv, minimal_freejoint_xml)
+    env = AutoResetWrapper(VecEnv(base_env))
+    batch = 3
+    rng_keys = jax.random.split(jax.random.PRNGKey(0), batch)
+    _, state = env.reset(rng_keys)
+
+    next_obs, reward, absorbing, done, info, next_state = env.step(
+        state,
+        jnp.zeros((batch, 0), dtype=jnp.float32),
+    )
+
+    np.testing.assert_array_equal(np.asarray(done), np.ones((batch,), dtype=bool))
+    np.testing.assert_array_equal(np.asarray(absorbing), np.ones((batch,), dtype=bool))
+    np.testing.assert_allclose(np.asarray(reward), np.zeros((batch,)), atol=0.0, rtol=0.0)
+    assert np.isfinite(np.asarray(next_obs)).all()
+    assert np.isfinite(np.asarray(next_state.data.qpos)).all()
+    assert np.isfinite(np.asarray(next_state.data.qvel)).all()
+    for value in info.values():
+        if np.issubdtype(np.asarray(value).dtype, np.inexact):
+            assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(
+        np.asarray(info["numerics_nonfinite_transition"]),
+        np.ones((batch,), dtype=bool),
+    )
 
 
 def test_mjx_set_sim_state_from_traj_data_uses_init_offset(minimal_freejoint_xml):
@@ -539,6 +720,84 @@ class _AutoResetState:
     info: dict
 
 
+@struct.dataclass
+class _AutoResetRewardMemory:
+    last_qvel: jax.Array
+    imitation_error_total: jax.Array
+
+
+@struct.dataclass
+class _AutoResetRewardMemoryCarry:
+    autoreset_rng: jax.Array | None
+    reward_state: _AutoResetRewardMemory
+
+
+@struct.dataclass
+class _AutoResetRewardMemoryState:
+    data: jax.Array
+    observation: jax.Array
+    reward: jax.Array
+    absorbing: jax.Array
+    done: jax.Array
+    additional_carry: _AutoResetRewardMemoryCarry
+    info: dict
+
+
+class _AutoResetRewardMemoryEnv:
+    """Expose stateful reward memory so autoreset swapping is observable."""
+
+    def reset(self, rng_keys):
+        batch = int(rng_keys.shape[0])
+        encoded = _encode_keys_to_terrain(rng_keys)
+        observation = jnp.zeros((batch, 1), dtype=jnp.float32)
+        reward_state = _AutoResetRewardMemory(
+            last_qvel=encoded,
+            imitation_error_total=encoded[:, 0],
+        )
+        state = _AutoResetRewardMemoryState(
+            data=encoded,
+            observation=observation,
+            reward=jnp.zeros((batch,), dtype=jnp.float32),
+            absorbing=jnp.zeros((batch,), dtype=bool),
+            done=jnp.zeros((batch,), dtype=bool),
+            additional_carry=_AutoResetRewardMemoryCarry(
+                autoreset_rng=None,
+                reward_state=reward_state,
+            ),
+            info={},
+        )
+        return observation, state
+
+    def step(self, state, action):
+        del action
+        batch = int(state.observation.shape[0])
+        done = jnp.arange(batch) == 0
+        reward_state = state.additional_carry.reward_state.replace(
+            last_qvel=state.additional_carry.reward_state.last_qvel + 100.0,
+            imitation_error_total=jnp.where(
+                done,
+                jnp.nan,
+                state.additional_carry.reward_state.imitation_error_total + 100.0,
+            ),
+        )
+        next_state = state.replace(
+            data=state.data + 100.0,
+            observation=state.observation + 1.0,
+            reward=jnp.ones((batch,), dtype=jnp.float32),
+            absorbing=done,
+            done=done,
+            additional_carry=state.additional_carry.replace(reward_state=reward_state),
+        )
+        return (
+            next_state.observation,
+            next_state.reward,
+            next_state.absorbing,
+            next_state.done,
+            next_state.info,
+            next_state,
+        )
+
+
 def _encode_keys_to_terrain(keys: jax.Array) -> jax.Array:
     return (jnp.sum(keys.astype(jnp.uint32), axis=-1) % 1024).astype(jnp.float32).reshape(keys.shape[0], 1)
 
@@ -571,6 +830,53 @@ class _AutoResetMinimalState:
     done: jax.Array
     additional_carry: _AutoResetMinimalCarry
     info: dict
+
+
+@struct.dataclass
+class _LocoTerminalCarry:
+    final_observation: jax.Array
+    autoreset_rng: jax.Array | None
+
+
+@struct.dataclass
+class _LocoTerminalState:
+    data: jax.Array
+    observation: jax.Array
+    reward: jax.Array
+    absorbing: jax.Array
+    done: jax.Array
+    additional_carry: _LocoTerminalCarry
+    info: dict
+
+
+class _LocoTerminalObservationEnv:
+    """Bare MJX-like env whose stale final_observation must not be returned."""
+
+    def mjx_reset(self, _rng_key):
+        observation = jnp.zeros((2,), dtype=jnp.float32)
+        state = _LocoTerminalState(
+            data=observation,
+            observation=observation,
+            reward=jnp.array(0.0, dtype=jnp.float32),
+            absorbing=jnp.array(False),
+            done=jnp.array(False),
+            additional_carry=_LocoTerminalCarry(
+                final_observation=jnp.zeros_like(observation),
+                autoreset_rng=None,
+            ),
+            info={},
+        )
+        return state
+
+    def mjx_step(self, state, _action):
+        terminal_observation = jnp.array([7.0, 8.0], dtype=jnp.float32)
+        return state.replace(
+            data=terminal_observation,
+            observation=terminal_observation,
+            reward=jnp.array(1.0, dtype=jnp.float32),
+            absorbing=jnp.array(False),
+            done=jnp.array(True),
+        )
 
 
 @struct.dataclass
@@ -1410,6 +1716,47 @@ def test_autoreset_wrapper_done_count_and_reward_absorbing_passthrough():
     )
 
 
+def test_autoreset_wrapper_resets_reward_state_and_sanitizes_terminal_metric():
+    env = AutoResetWrapper(_AutoResetRewardMemoryEnv())
+    batch = 3
+    rng_keys = jax.random.split(jax.random.PRNGKey(0), batch)
+    _, state = env.reset(rng_keys)
+
+    _, _, _, done, info, next_state = env.step(
+        state,
+        action=jnp.zeros((batch, 1), dtype=jnp.float32),
+    )
+
+    expected_done = np.array([True, False, False])
+    reset_keys = jax.vmap(jax.random.split)(rng_keys)[:, 1]
+    expected_reset_memory = np.asarray(_encode_keys_to_terrain(reset_keys))
+    expected_stepped_memory = np.asarray(_encode_keys_to_terrain(rng_keys) + 100.0)
+    actual_memory = np.asarray(next_state.additional_carry.reward_state.last_qvel)
+
+    np.testing.assert_array_equal(np.asarray(done), expected_done)
+    _assert_done_swaps(
+        actual_memory,
+        expected_reset_memory,
+        expected_stepped_memory,
+        expected_done,
+    )
+    assert np.isfinite(np.asarray(info["imitation_error_total"])).all()
+    assert np.isfinite(
+        np.asarray(next_state.additional_carry.reward_state.imitation_error_total)
+    ).all()
+    expected_terminal_error = np.where(
+        expected_done,
+        0.0,
+        np.asarray(_encode_keys_to_terrain(rng_keys))[:, 0] + 100.0,
+    )
+    np.testing.assert_allclose(
+        np.asarray(info["imitation_error_total"]),
+        expected_terminal_error,
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
 def test_autoreset_wrapper_rng_chain_uses_reset_keys():
     base_env = _AutoResetTerrainSwapEnv()
     env = AutoResetWrapper(base_env)
@@ -1636,6 +1983,31 @@ def test_autoreset_wrapper_step_with_transition_keeps_prereset_state():
     np.testing.assert_array_equal(np.asarray(next_state.done), np.zeros((batch,), dtype=bool))
 
 
+def test_loco_autoreset_transition_uses_real_terminal_observation():
+    env = AutoResetWrapper(LogWrapper(VecEnv(LocoMjxWrapper(_LocoTerminalObservationEnv()))))
+    batch = 3
+    rng_keys = jax.random.split(jax.random.PRNGKey(0), batch)
+    _, state = env.reset(rng_keys)
+
+    next_obs, _, absorbing, done, _, next_state, transition_state, transition_obs = env.step_with_transition(
+        state,
+        action=jnp.zeros((batch, 1), dtype=jnp.float32),
+    )
+
+    expected_terminal_obs = jnp.tile(jnp.array([[7.0, 8.0]], dtype=jnp.float32), (batch, 1))
+    np.testing.assert_allclose(np.asarray(transition_obs), np.asarray(expected_terminal_obs), atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(
+        np.asarray(transition_state.observation),
+        np.asarray(expected_terminal_obs),
+        atol=0.0,
+        rtol=0.0,
+    )
+    np.testing.assert_allclose(np.asarray(next_obs), np.zeros((batch, 2)), atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(np.asarray(next_state.observation), np.zeros((batch, 2)), atol=0.0, rtol=0.0)
+    np.testing.assert_array_equal(np.asarray(absorbing), np.zeros((batch,), dtype=bool))
+    np.testing.assert_array_equal(np.asarray(done), np.ones((batch,), dtype=bool))
+
+
 def test_normalize_vec_reward_step_with_transition_preserves_inner_prereset_state():
     base_env = _AutoResetTerrainSwapEnv()
     env = NormalizeVecReward(AutoResetWrapper(base_env), gamma=0.99)
@@ -1850,6 +2222,38 @@ def test_autoreset_wrapper_single_key_caches_rng():
         np.asarray(state.info["AutoResetWrapper_done_count"]),
         np.zeros((batch,), dtype=np.int32),
     )
+
+
+def test_autoreset_wrapper_reset_to_initializes_rng_and_steps_under_jit():
+    batch = 4
+    env = AutoResetWrapper(LogWrapper(VecEnv(_VecEnvBaseEnv())))
+    rng_keys = jax.random.split(jax.random.PRNGKey(0), batch)
+    trajectory_indices = jnp.arange(batch, dtype=jnp.int32)
+
+    observations, state = env.reset_to(rng_keys, trajectory_indices)
+
+    np.testing.assert_array_equal(
+        np.asarray(state.additional_carry.autoreset_rng),
+        np.asarray(rng_keys),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(state.info["AutoResetWrapper_done_count"]),
+        np.zeros((batch,), dtype=np.int32),
+    )
+
+    step = jax.jit(
+        lambda current_state: env.step_with_transition(
+            current_state,
+            jnp.zeros((batch, 1), dtype=jnp.float32),
+        )
+    )
+    next_observations, _reward, _absorbing, done, _info, next_state, _transition_state, _transition_obs = (
+        step(state)
+    )
+
+    assert observations.shape == next_observations.shape == (batch, 1)
+    assert done.shape == (batch,)
+    assert next_state.additional_carry.autoreset_rng.shape == rng_keys.shape
 
 
 def test_autoreset_wrapper_swaps_rich_carry_fields_and_keeps_unbatched_data():

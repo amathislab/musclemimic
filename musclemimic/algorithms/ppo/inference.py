@@ -12,6 +12,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from musclemimic.algorithms.common.env_utils import wrap_env
+from musclemimic.algorithms.common.inference import (
+    initialize_policy_state as initialize_agent_policy_state,
+)
+from musclemimic.algorithms.common.inference import (
+    make_policy_action_fn as make_agent_policy_action_fn,
+)
 
 if TYPE_CHECKING:
     from musclemimic.algorithms.ppo.config import PPOAgentConf, PPOAgentState
@@ -89,6 +95,7 @@ def play_policy(
     do_wrap_env: bool = True,
     train_state_seed: int | None = None,
     sequential_mjx: bool = False,
+    stop_after_first_episode: bool = False,
 ) -> None:
     """
     Run policy in environment for visualization or evaluation.
@@ -107,6 +114,7 @@ def play_policy(
         do_wrap_env: apply standard wrappers
         train_state_seed: seed index for multi-seed checkpoints
         sequential_mjx: use sequential mjx mode (single env, manual resets)
+        stop_after_first_episode: stop after recording the first terminal frame
     """
     if sequential_mjx:
         n_envs = 1
@@ -157,9 +165,6 @@ def play_policy(
     config = agent_conf.config.experiment
     train_state = agent_state.train_state
 
-    if deterministic:
-        train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
-
     if config.n_seeds > 1:
         assert train_state_seed is not None, "loaded train state has multiple seeds; specify train_state_seed"
         train_state = jax.tree.map(lambda x: x[train_state_seed], train_state)
@@ -182,18 +187,7 @@ def play_policy(
     keys = jax.random.split(rng, n_envs + 1)
     rng, env_keys = keys[0], keys[1:]
 
-    def sample_actions(ts, obs, _rng):
-        obs_b = jnp.atleast_2d(obs) if hasattr(obs, "ndim") and obs.ndim == 1 else obs
-        vars_in = {"params": ts.params, "run_stats": ts.run_stats}
-        y, updates = agent_conf.network.apply(vars_in, obs_b, mutable=["run_stats"])
-        pi, _ = y
-        ts_out = ts.replace(run_stats=updates["run_stats"])
-        a = pi.sample(seed=_rng)
-        if hasattr(a, "ndim") and a.ndim > 1 and a.shape[0] == 1:
-            a = a[0]
-        return a, ts_out
-
-    policy_fn = jax.jit(sample_actions)
+    policy_fn = make_agent_policy_action_fn(agent_conf, deterministic=deterministic)
 
     # reset environment
     if use_mujoco and not sequential_mjx:
@@ -209,6 +203,7 @@ def play_policy(
     else:
         obs, env_state = env.reset(env_keys)
 
+    policy_state, policy_reset = initialize_agent_policy_state(agent_conf, obs)
     if n_steps is None:
         n_steps = np.iinfo(np.int32).max
 
@@ -221,7 +216,7 @@ def play_policy(
 
     for _ in range(n_steps):
         rng, _rng = jax.random.split(rng)
-        action, train_state = policy_fn(train_state, obs, _rng)
+        action, train_state, policy_state = policy_fn(train_state, obs, _rng, policy_state, policy_reset)
         action = jnp.atleast_2d(action)
 
         # Initialize defaults for non-mujoco paths
@@ -335,21 +330,30 @@ def play_policy(
                         parts = [f"{k.removeprefix('err_')}={_info[k]:.4f}" for k in sorted(err_keys)]
                         print(f"  errors: {', '.join(parts)}")
 
+                if stop_after_first_episode:
+                    break
+
                 episode_step = 0
                 episode_reward = 0.0
                 if use_mujoco:
                     obs = env.reset()
                     if obs_buffer is not None:
                         obs = obs_buffer.reset(obs)
+                    policy_state, policy_reset = initialize_agent_policy_state(agent_conf, obs)
                 else:
                     rng, reset_key = jax.random.split(rng)
                     env_state = env.mjx_reset(reset_key)
                     obs = env_state.observation
                     if obs_buffer is not None:
                         obs = obs_buffer.reset(np.asarray(obs))
+                    policy_state, policy_reset = initialize_agent_policy_state(agent_conf, obs)
 
         # Update prev_done for next iteration
         prev_done = episode_done if (use_mujoco or sequential_mjx) else done
+        if not (use_mujoco or sequential_mjx):
+            policy_reset = jnp.asarray(done, dtype=bool)
+        elif not episode_done:
+            policy_reset = jnp.asarray([episode_done], dtype=bool)
 
     env.stop()
 

@@ -1,0 +1,36 @@
+# MyoFullBody finetuning with terrain randomization
+# Inherits from conf_fullbody.yaml
+#
+# Usage: python fullbody/experiment.py --config-name=conf_fullbody_finetune_terrain_rand
+defaults:
+  - conf_fullbody
+  - _self_
+
+wandb:
+  tags: ["fullbody", "finetune", "terrain_rand"]
+
+experiment:
+  env_params:
+    # Terrain randomization
+    terrain_type: RoughTerrain
+    terrain_params:
+      inner_platform_size_in_meters: 1.5
+      random_min_height: -0.03
+      random_max_height: 0.03
+      random_step: 0.005
+      random_downsampled_scale: 0.4
+
+  # Network architecture (for reference - must match checkpoint)
+  actor_hidden_layers: [1024, 1024, 1024, 1024, 1024]
+  critic_hidden_layers: [1024, 1024, 1024, 1024, 1024]
+
+  # Tighter clipping for finetuning
+  clip_eps: 0.01
+  clip_eps_vf: 0.01
+
+  # Finetuning settings
+  resume_from: null
+  reset_logging_timestep: false
+
+  validation:
+    num: 5000

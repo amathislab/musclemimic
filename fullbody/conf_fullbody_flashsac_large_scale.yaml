@@ -1,0 +1,41 @@
+defaults:
+  - conf_fullbody_flashsac
+  - _self_
+
+wandb:
+  tags: ["fullbody", "gmr", "flashsac", "large-scale"]
+
+experiment:
+  env_params:
+    num_envs: 2048
+  total_timesteps: 100000000
+  matmul_precision: tensorfloat32
+
+  flashsac_config:
+    # Preserve the baseline's 2,048-interaction replay history and
+    # 256-interaction uniform-random warm-up.
+    buffer_capacity: 4194304
+    min_buffer_size: 524288
+
+    # Two 4,096-sample updates for 2,048 new transitions preserve the
+    # baseline's sampled/new transition ratio of four.
+    sample_batch_size: 4096
+    updates_per_interaction: 2
+
+    actor_hidden_dim: 512
+    actor_num_blocks: 8
+    critic_hidden_dim: 512
+    critic_num_blocks: 8
+
+    warmup_updates: 2000
+
+  # Replay is part of a complete FlashSAC checkpoint, so save periodically
+  # instead of writing a multi-GB checkpoint at every validation.
+  checkpoints_on_validation: false
+  checkpoint_interval: 1024
+  max_checkpoints_to_keep: 3
+  async_checkpointing: true
+
+  validation:
+    num: 50
+    video_frequency: 10

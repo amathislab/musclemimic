@@ -11,7 +11,11 @@ import jax.numpy as jnp
 from omegaconf import OmegaConf, open_dict
 
 from loco_mujoco.task_factories import TaskFactory
-from musclemimic.algorithms.common.checkpoint_hooks import create_jax_checkpoint_host_callback
+from musclemimic.algorithms.common.base_algorithm import JaxTrainingInvocation
+from musclemimic.algorithms.common.checkpoint_hooks import (
+    create_jax_checkpoint_host_callback,
+    create_jax_pytree_checkpoint_host_callback,
+)
 from musclemimic.utils.logging import setup_logger
 from musclemimic.utils.metrics import MetricsHandler
 
@@ -26,6 +30,25 @@ from .checkpointing import (
 from .logging import ExperimentHooks
 
 logger = setup_logger(__name__)
+
+
+def validate_training_backend(config) -> None:
+    """Enforce an experiment's declared simulator contract before construction."""
+    backend = config.experiment.get("training_backend", None)
+    if backend is None:
+        return
+    if backend != "mjx_warp":
+        raise ValueError(f"Unsupported training_backend: {backend!r}")
+
+    env_params = config.experiment.env_params
+    env_name = str(env_params.get("env_name", ""))
+    mjx_backend = str(env_params.get("mjx_backend", ""))
+    if not env_name.startswith("Mjx") or mjx_backend != "warp":
+        raise ValueError(
+            "training_backend='mjx_warp' requires an MJX environment and "
+            "experiment.env_params.mjx_backend='warp'; got "
+            f"env_name={env_name!r}, mjx_backend={mjx_backend!r}"
+        )
 
 
 def setup_jax_cache() -> None:
@@ -48,6 +71,10 @@ def setup_wandb(config) -> tuple[bool, Any]:
     params = {"project": config.wandb.project, "config": config_dict}
     if "tags" in config.wandb and config.wandb.tags:
         params["tags"] = config.wandb.tags
+    wandb_run_id = str(config.experiment.get("wandb_run_id", "") or "").strip()
+    if wandb_run_id:
+        params["id"] = wandb_run_id
+        params["resume"] = "allow"
     run = wandb.init(**params)
     return True, run
 
@@ -105,7 +132,19 @@ def _maybe_share_validation_trajectory(env, val_env, config) -> None:
 
     # val_env.th is None when we skipped loading - create handler using shared trajectory
     if getattr(val_env, "th", None) is None:
-        val_env.load_trajectory(traj=env.th.traj, warn=False)
+        traj = env.th.traj
+        data = traj.data
+        has_sparse_cache = all(
+            field.size > 0
+            for field in (data.site_xpos, data.site_xmat, data.cvel_parent, data.subtree_com_root)
+        )
+        has_full_cache = all(
+            field.size > 0
+            for field in (data.xpos, data.xquat, data.cvel, data.subtree_com, data.site_xpos, data.site_xmat)
+        )
+        cache_type = "sparse" if has_sparse_cache else "full" if has_full_cache else "none"
+        site_names = traj.info.site_names if has_sparse_cache else None
+        val_env.load_trajectory(traj=traj, warn=False, cache_type=cache_type, site_names=site_names)
         # Convert to JAX if training env's trajectory is in JAX
         if getattr(env, "mjx_enabled", False) and not env.th.is_numpy and val_env.th.is_numpy:
             val_env.th.to_jax()
@@ -124,6 +163,7 @@ def _maybe_share_validation_trajectory(env, val_env, config) -> None:
 
 
 def instantiate_env(config) -> Any:
+    validate_training_backend(config)
     factory = TaskFactory.get_factory_cls(config.experiment.task_factory.name)
     env = factory.make(**config.experiment.env_params, **config.experiment.task_factory.params)
 
@@ -131,7 +171,7 @@ def instantiate_env(config) -> Any:
     # because mjx_reset() runs inside JIT-traced functions. Calling to_jax()
     # inside JIT triggers TracerBoolConversionError due to Python control flow
     # in TrajectoryInfo.__post_init__.
-    if getattr(env, "mjx_enabled", False) and getattr(env, "th", None) is not None and env.th.is_numpy:
+    if getattr(env, "mjx_enabled", False) and getattr(env, "th", None) is not None:
         env.th.to_jax()
 
     return env
@@ -147,11 +187,16 @@ def instantiate_validation_env(config, share_trajectory: bool = False) -> Any:
     if not config.experiment.get("validation", {}).get("active", False):
         return None
 
+    validate_training_backend(config)
+
     # Get validation terminal state type, default to NoTerminalStateHandler
     val_terminal_state_type = config.experiment.validation.get("terminal_state_type", "NoTerminalStateHandler")
 
     # Create a copy of env_params with validation-specific settings
     val_env_params = OmegaConf.to_container(config.experiment.env_params, resolve=True)
+    validation_env_overrides = config.experiment.validation.get("env_params", None)
+    if validation_env_overrides is not None:
+        val_env_params.update(OmegaConf.to_container(validation_env_overrides, resolve=True))
 
     # Override terminal state handler for validation
     val_env_params["terminal_state_type"] = val_terminal_state_type
@@ -205,18 +250,20 @@ def instantiate_validation_env(config, share_trajectory: bool = False) -> Any:
     val_env = factory.make(**val_env_params, **task_factory_params)
 
     # Convert trajectory to JAX before JIT (see instantiate_env for details)
-    if getattr(val_env, "mjx_enabled", False) and getattr(val_env, "th", None) is not None and val_env.th.is_numpy:
+    if getattr(val_env, "mjx_enabled", False) and getattr(val_env, "th", None) is not None:
         val_env.th.to_jax()
 
     return val_env
 
 
 def pick_algorithm(config) -> Any:
-    from musclemimic.algorithms import PPOJax
+    from musclemimic.algorithms import FlashSACJax, PPOJax
 
     algorithm_name = config.experiment.get("algorithm", "PPOJax")
     if algorithm_name == "PPOJax":
         return PPOJax
+    if algorithm_name == "FlashSACJax":
+        return FlashSACJax
     raise ValueError(f"Unknown algorithm: {algorithm_name}")
 
 
@@ -229,10 +276,17 @@ def build_metrics_handler(config, env):
     return MetricsHandler(config, env) if active else None
 
 
-def build_logging_callback(env, config, agent_conf, use_wandb, hooks: ExperimentHooks):
+def build_logging_callback(
+    env,
+    config,
+    agent_conf,
+    use_wandb,
+    hooks: ExperimentHooks,
+    algorithm_cls=None,
+):
     import wandb as _wandb
 
-    algorithm_name = config.experiment.get("algorithm", "PPOJax")
+    algorithm_cls = algorithm_cls or pick_algorithm(config)
 
     def _cb(metrics_dict: dict[str, Any]):
         if metrics_dict.get("_log_only", False):
@@ -272,7 +326,7 @@ def build_logging_callback(env, config, agent_conf, use_wandb, hooks: Experiment
 
         # Pass through all prefixed metrics (ppo/, reward/, adaptive/, etc.)
         # Define display names for metric prefixes
-        prefix_display = {"ppo": "PPO"}
+        prefix_display = {"ppo": "PPO", "flashsac": "FlashSAC"}
         for k, v in metrics_dict.items():
             if "/" in k:
                 prefix, suffix = k.split("/", 1)
@@ -311,24 +365,9 @@ def build_logging_callback(env, config, agent_conf, use_wandb, hooks: Experiment
             _wandb.log(log_dict, step=current_timestep)
 
         # Trigger validation video recording.
-        if (
-            algorithm_name == "PPOJax"
-            and metrics_dict.get("has_validation_update", False)
-            and "_train_params" in metrics_dict
-        ):
-            # Build a temporary agent state from the current params.
-            from musclemimic.algorithms import PPOJax, TrainState
-
+        if metrics_dict.get("has_validation_update", False) and "_train_params" in metrics_dict:
             cur = metrics_dict["_train_params"]
-            temp_state = TrainState(
-                apply_fn=agent_conf.network.apply,
-                tx=agent_conf.tx,
-                params=cur["params"],
-                run_stats=cur["run_stats"],
-                opt_state=None,
-                step=0,
-            )
-            temp_agent_state = PPOJax._agent_state(train_state=temp_state)
+            temp_agent_state = algorithm_cls.build_inference_state(cur, agent_conf)
             recorder = getattr(hooks, "_video_recorder", None)
             if recorder is not None:
                 try:
@@ -337,6 +376,7 @@ def build_logging_callback(env, config, agent_conf, use_wandb, hooks: Experiment
                         agent_state=temp_agent_state,
                         validation_number=getattr(hooks, "_validation_counter", 0) + 1,
                         timestep=current_timestep,
+                        algorithm_cls=algorithm_cls,
                     )
                     hooks._validation_counter = getattr(hooks, "_validation_counter", 0) + 1
                     if video_path:
@@ -373,13 +413,30 @@ def build_train_fn(algorithm_cls, env, agent_conf, mh, logging_cb, logging_inter
 
 
 def run_training(train_fn, rngs):
+    dynamic_args = ()
+    donate_argnums = ()
+    if isinstance(train_fn, JaxTrainingInvocation):
+        dynamic_args = train_fn.dynamic_args
+        donate_argnums = train_fn.donate_argnums
+        train_fn = train_fn.train_fn
+
     # vmap if multiple seeds
     if hasattr(rngs, "ndim") and rngs.ndim > 1:  # jnp array
-        train_fn = jax.jit(jax.vmap(train_fn))
+        train_fn = jax.jit(
+            jax.vmap(
+                train_fn,
+                in_axes=(0, *(None for _ in dynamic_args)),
+            ),
+            donate_argnums=donate_argnums,
+        )
     else:
-        train_fn = jax.jit(train_fn)
+        train_fn = jax.jit(train_fn, donate_argnums=donate_argnums)
     logger.info("Starting training...")
-    return train_fn(rngs)
+    result = train_fn(rngs, *dynamic_args)
+    # JAX dispatches accelerator work asynchronously. Synchronize before the
+    # caller closes checkpoint/W&B resources so device failures propagate to
+    # the process and the workload cannot be reported as a successful exit.
+    return jax.block_until_ready(result)
 
 
 def _generate_run_suffix() -> str:
@@ -392,6 +449,18 @@ def _generate_run_suffix() -> str:
 
 
 def run_experiment(config, hooks: ExperimentHooks):
+    if str(config.experiment.get("algorithm", "PPOJax")) == "FlashSACJax":
+        from musclemimic.runner.flashsac_experiment import run_flashsac_experiment
+
+        return run_flashsac_experiment(config, hooks)
+
+    if str(config.experiment.get("algorithm", "PPOJax")) == "PPOJax" and config.experiment.get(
+        "distributed"
+    ) is not None:
+        from musclemimic.runner.ppo_experiment import run_ppo_experiment
+
+        return run_ppo_experiment(config, hooks)
+
     # XLA flags
     os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True "
 
@@ -444,7 +513,14 @@ def run_experiment(config, hooks: ExperimentHooks):
     hooks._video_recorder = recorder
 
     # Logging callback
-    logging_cb = build_logging_callback(env, config, agent_conf, use_wandb, hooks)
+    logging_cb = build_logging_callback(
+        env,
+        config,
+        agent_conf,
+        use_wandb,
+        hooks,
+        algorithm_cls=algorithm_cls,
+    )
 
     # Checkpoint resume or fresh with auto-resume support
     explicit_resume = getattr(config.experiment, "resume_from", None)
@@ -520,11 +596,15 @@ def run_experiment(config, hooks: ExperimentHooks):
     run_training(train_fn, rngs)
 
     # Close any cached checkpoint manager created during training (host-side cleanup)
-    cache_entry = getattr(create_jax_checkpoint_host_callback, "__cached_instance__", None)
-    if cache_entry is not None:
-        ckpt_manager = cache_entry[2]  # (cache_key, ckpt_cb, ckpt_mgr)
-        ckpt_manager.close()
-        delattr(create_jax_checkpoint_host_callback, "__cached_instance__")
+    for callback_factory in (
+        create_jax_checkpoint_host_callback,
+        create_jax_pytree_checkpoint_host_callback,
+    ):
+        cache_entry = getattr(callback_factory, "__cached_instance__", None)
+        if cache_entry is not None:
+            checkpoint_manager = cache_entry[2]
+            checkpoint_manager.close()
+            delattr(callback_factory, "__cached_instance__")
 
     if use_wandb and run is not None:
         import wandb as _wandb

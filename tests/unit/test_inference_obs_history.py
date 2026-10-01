@@ -22,7 +22,7 @@ class FakeNetwork:
 
     def apply(self, vars_in, obs_b, mutable=None):
         self.seen_obs.append(np.array(obs_b))
-        return (FakePolicy(self.action_dim), None), {"run_stats": vars_in["run_stats"]}
+        return FakePolicy(self.action_dim), {"run_stats": vars_in["run_stats"]}
 
 
 class FakeTrainState:
@@ -106,6 +106,51 @@ def test_play_policy_mujoco_stacks_history(monkeypatch):
         network.seen_obs[1].reshape(-1),
         np.array([0.0, 0.0, 1.0, 2.0, 2.0, 3.0], dtype=np.float32),
     )
+
+
+def test_play_policy_can_stop_after_one_mujoco_episode(monkeypatch):
+    monkeypatch.setattr(inference.jax, "jit", lambda f: f)
+
+    class OneEpisodeEnv(FakeEnv):
+        def __init__(self):
+            super().__init__()
+            self.reset_count = 0
+            self.step_count = 0
+
+        def reset(self):
+            self.reset_count += 1
+            return super().reset()
+
+        def step(self, action):
+            self.step_count += 1
+            self._obs = self._obs + 1.0
+            done = self.step_count == 2
+            return self._obs.copy(), 0.0, False, done, {"truncated": done}
+
+    env = OneEpisodeEnv()
+    network = FakeNetwork(action_dim=2)
+    agent_conf = SimpleNamespace(
+        config=OmegaConf.create({"experiment": {"len_obs_history": 1, "n_seeds": 1}}),
+        network=network,
+    )
+    agent_state = SimpleNamespace(train_state=FakeTrainState())
+
+    inference.play_policy(
+        env,
+        agent_conf,
+        agent_state,
+        n_envs=1,
+        n_steps=10,
+        render=False,
+        record=False,
+        use_mujoco=True,
+        do_wrap_env=False,
+        stop_after_first_episode=True,
+    )
+
+    assert env.step_count == 2
+    assert env.reset_count == 1
+    assert len(network.seen_obs) == 2
 
 
 def test_observation_history_buffer_split_goal_reset():

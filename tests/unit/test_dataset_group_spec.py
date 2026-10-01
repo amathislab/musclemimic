@@ -8,7 +8,6 @@ from loco_mujoco.task_factories.dataset_confs import (
     get_amass_dataset_groups,
 )
 
-
 # --- expand_amass_dataset_group_spec ---
 
 class TestExpandAmassDatasetGroupSpec:
@@ -93,6 +92,10 @@ class TestGetAmassDatasetGroups:
         for name, paths in groups.items():
             assert isinstance(paths, list), f"{name} should be a list"
             assert len(paths) > 0, f"{name} should not be empty"
+
+    def test_locomotion_group_contains_no_beam_motions(self):
+        motions = get_amass_dataset_groups()["AMASS_LOCOMOTION_DATASETS"]
+        assert all("beam" not in motion.casefold() for motion in motions)
 
     def test_cached_returns_same_object(self):
         a = get_amass_dataset_groups()

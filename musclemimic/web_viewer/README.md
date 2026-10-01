@@ -113,7 +113,7 @@ Fit C3D, retarget it with default GMR, and view it in the browser:
 uv run --extra c3d --extra smpl --extra gmr python -m musclemimic.web_viewer.run \
   --c3d-file path/to/file.c3d \
   --c3d-model-path /path/to/smplx/models \
-  --c3d-dataset-name MyStudy/Subject01/Trial01
+  --c3d-dataset-name MyStudy/Subject01/Trial05
 ```
 
 Directly visualize or record the retargeted C3D motion in MuJoCo:
@@ -135,13 +135,13 @@ uv run --extra c3d --extra smpl --extra gmr --extra cuda python -m musclemimic.w
   --c3d-model-path /path/to/smplx/models
 ```
 
-Example with an explicit researcher-facing dataset name:
+Example with the checked-in EMG_Boo path convention:
 
 ```bash
 uv run --extra c3d --extra smpl --extra gmr --extra cuda python -m musclemimic.web_viewer.run \
-  --c3d-file path/to/walk_trial_01.c3d \
+  --c3d-file test_data/EMG_Boo/S002/MotionCapture/LevelWalking/TRC/Trial05/AllSteps.c3d \
   --c3d-model-path /path/to/c3d-fitting/smplx \
-  --c3d-dataset-name ExampleStudy/Subject01/Walking/Trial01/WalkTrial01
+  --c3d-dataset-name EMG_Boo/S002/LevelWalking/Trial05/AllSteps
 ```
 
 Use the direct SMPL retargeting backend only when both model paths are explicit:
@@ -234,7 +234,7 @@ Training configs can load these trajectories with `c3d_dataset_conf`:
 ```bash
 uv run fullbody/experiment.py --config-name=conf_fullbody_gmr \
   experiment.task_factory.params.amass_dataset_conf=null \
-  +experiment.task_factory.params.c3d_dataset_conf.rel_dataset_path='["ExampleStudy/Subject01/Walking/Trial01/WalkTrial01"]'
+  +experiment.task_factory.params.c3d_dataset_conf.rel_dataset_path='["EMG_Boo/S002/LevelWalking/Trial05/AllSteps"]'
 ```
 
 ## Pipeline

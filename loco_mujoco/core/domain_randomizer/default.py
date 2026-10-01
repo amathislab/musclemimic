@@ -31,6 +31,7 @@ class DefaultRandomizerState:
     joint_friction_loss: Union[np.ndarray, jax.Array]
     joint_damping: Union[np.ndarray, jax.Array]
     joint_armature: Union[np.ndarray, jax.Array]
+    next_push_step: Union[int, np.ndarray, jax.Array]
 
 
 class DefaultRandomizer(DomainRandomizer):
@@ -54,6 +55,10 @@ class DefaultRandomizer(DomainRandomizer):
         info_props = env._get_all_info_properties()
         root_body_name = info_props["root_body_name"]
         self._root_body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, root_body_name)
+        root_joint_name = info_props["root_free_joint_xml_name"]
+        root_joint_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, root_joint_name)
+        root_dof_adr = int(env.model.jnt_dofadr[root_joint_id])
+        self._root_qvel_ids = np.arange(root_dof_adr, root_dof_adr + 6, dtype=np.int32)
 
         self._other_body_masks = np.ones(env.model.nbody, dtype=bool)
         self._other_body_masks[0] = False # exclude worldbody
@@ -96,6 +101,7 @@ class DefaultRandomizer(DomainRandomizer):
                                       joint_friction_loss=backend.array([0.0] * (model.nv-6)), #exclude freejoint 6 dofs
                                       joint_damping=backend.array([0.0] * (model.nv-6)), #exclude freejoint 6 dofs
                                       joint_armature=backend.array([0.0] * (model.nv-6)), #exclude freejoint 6 dofs
+                                      next_push_step=backend.asarray(np.iinfo(np.int32).max, dtype=backend.int32),
                                       )
 
     def reset(self,
@@ -142,6 +148,7 @@ class DefaultRandomizer(DomainRandomizer):
         joint_friction_loss, carry = self._sample_joint_friction_loss(model, carry, backend)
         joint_damping, carry = self._sample_joint_damping(model, carry, backend)
         joint_armature, carry = self._sample_joint_armature(model, carry, backend)
+        next_push_step, carry = self._sample_next_push_step(env, carry, backend, from_step=0)
 
         if isinstance(env._control_func, PDControl):
             control_func_state = carry.control_func_state
@@ -165,6 +172,7 @@ class DefaultRandomizer(DomainRandomizer):
                                                                                       joint_friction_loss=joint_friction_loss,
                                                                                       joint_damping=joint_damping,
                                                                                       joint_armature=joint_armature,
+                                                                                      next_push_step=next_push_step,
                                                                                       ))
 
         return data, carry
@@ -247,7 +255,76 @@ class DefaultRandomizer(DomainRandomizer):
         if self.rand_conf["randomize_joint_armature"]:
             model = self._set_attribute_in_model(model, "dof_armature", dof_armature, backend)
 
+        data, carry = self._apply_velocity_push(env, data, carry, backend)
+
         return model, data, carry
+
+    def _push_interval_steps(self, env: Any) -> tuple[int, int]:
+        interval = self.rand_conf.get("push_interval_range_s", [1.0, 3.0])
+        if len(interval) != 2 or interval[0] <= 0.0 or interval[1] < interval[0]:
+            raise ValueError("push_interval_range_s must be [positive_min, max].")
+        min_steps = max(1, int(np.ceil(float(interval[0]) / float(env.dt))))
+        max_steps = max(min_steps, int(np.ceil(float(interval[1]) / float(env.dt))))
+        return min_steps, max_steps
+
+    def _sample_next_push_step(
+        self,
+        env: Any,
+        carry: Any,
+        backend: ModuleType,
+        from_step: Any,
+    ) -> tuple[Any, Any]:
+        if not self.rand_conf.get("apply_velocity_pushes", False):
+            return backend.asarray(np.iinfo(np.int32).max, dtype=backend.int32), carry
+        min_steps, max_steps = self._push_interval_steps(env)
+        if backend == jnp:
+            key, sample_key = jax.random.split(carry.key)
+            interval = jax.random.randint(
+                sample_key, shape=(), minval=min_steps, maxval=max_steps + 1, dtype=jnp.int32
+            )
+            return backend.asarray(from_step, dtype=backend.int32) + interval, carry.replace(key=key)
+        interval = np.random.randint(min_steps, max_steps + 1)
+        return np.asarray(int(from_step) + interval, dtype=np.int32), carry
+
+    def _apply_velocity_push(
+        self,
+        env: Any,
+        data: Union[MjData, Data],
+        carry: Any,
+        backend: ModuleType,
+    ) -> tuple[Union[MjData, Data], Any]:
+        if not self.rand_conf.get("apply_velocity_pushes", False):
+            return data, carry
+
+        state = carry.domain_randomizer_state
+        current_step = carry.cur_step_in_episode
+        linear_max = np.asarray(self.rand_conf.get("push_linear_velocity_max", [0.2, 0.2, 0.1]), dtype=float)
+        angular_max = np.asarray(self.rand_conf.get("push_angular_velocity_max", [0.2, 0.2, 0.3]), dtype=float)
+        if linear_max.shape != (3,) or angular_max.shape != (3,):
+            raise ValueError("push velocity maxima must contain three components.")
+        velocity_max = backend.asarray(np.concatenate([linear_max, angular_max]))
+
+        if backend == jnp:
+            key, push_key = jax.random.split(carry.key)
+            push_velocity = jax.random.uniform(
+                push_key, shape=(6,), minval=-velocity_max, maxval=velocity_max
+            )
+            should_push = current_step >= state.next_push_step
+            pushed_qvel = data.qvel.at[self._root_qvel_ids].add(push_velocity)
+            qvel = backend.where(should_push, pushed_qvel, data.qvel)
+            next_step, carry = self._sample_next_push_step(env, carry.replace(key=key), backend, current_step)
+            next_push_step = backend.where(should_push, next_step, state.next_push_step)
+            data = data.replace(qvel=qvel)
+        else:
+            should_push = int(current_step) >= int(state.next_push_step)
+            next_push_step = state.next_push_step
+            if should_push:
+                push_velocity = np.random.uniform(-velocity_max, velocity_max)
+                data.qvel[self._root_qvel_ids] += push_velocity
+                next_push_step, carry = self._sample_next_push_step(env, carry, backend, current_step)
+
+        state = state.replace(next_push_step=next_push_step)
+        return data, carry.replace(domain_randomizer_state=state)
 
     def update_observation(self,
                            env: Any,

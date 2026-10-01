@@ -1,13 +1,34 @@
-import os
-from pathlib import Path
-import argparse
-import time
-import multiprocessing as mp
-from typing import Dict, List, Tuple
-from collections import defaultdict
-import pandas as pd
-from musclemimic.utils.retarget.msk_metrics import compute_msk_metrics, _get_base_and_gmr_dirs
+"""Dataset-wide retargeting comparison across an arbitrary set of methods.
 
+Reports the core benchmark metric suite -- joint-limit violations, ground penetration,
+floating, tendon jump, RMSE and speed -- for every motion in a dataset group, per method.
+
+Originally hardcoded to compare exactly two methods (`gmr` against `mimic`, the mocap-body
+pipeline). It is now driven by `--methods`, so adding OmniRetarget is a flag rather than an
+edit; method names resolve through `msk_metrics.METHOD_DIRS`.
+
+The columns here are only the core benchmark's. The standalone TERRA repository's
+`scripts/terra/evaluate_subset.py` reports the
+same numbers plus the source-referenced ones (coupler residual, foot slip, opening
+transient, consistent tracking error), which need the SMPL body model and OmniRetarget on
+the path and so cannot be a dependency of this module.
+"""
+
+import argparse
+import multiprocessing as mp
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import pandas as pd
+
+from musclemimic.utils.retarget.msk_metrics import (
+    METHOD_DIRS,
+    _get_base_and_gmr_dirs,
+    compute_msk_metrics,
+    method_cache_path,
+)
 
 # ================== THRESHOLDS ==================
 TH_JOINT = 0.5     # %
@@ -15,36 +36,50 @@ TH_PEN_PCT = 1      # % frames
 TH_PEN_MAX = 0.005    # meters (5 mm)
 TH_FLOAT = 0.025   # meters (2.5 cm), the radius of the foot collision capsule is already 2cm
 TH_TEND  = 0.05   # %
-FAIL_SUMMARY = defaultdict(lambda: defaultdict(set))
+
+# Per-method metric columns, in report order. The `{m}_` prefix is filled per method.
+METRIC_COLS = [
+    "joint_pct",
+    "pen_pct",
+    "pen_max_depth_m",
+    "float_height",
+    "tendon_max_jump_%",
+    "pos_rmse",
+    "sec_per_frame",
+]
+
+# Columns whose mean is taken over non-zero entries only: a zero means "no such event in
+# this motion", and averaging those in reports the event rate a second time instead of the
+# severity when it happens.
+NONZERO_MEAN = ["pen_max_depth_m", "tendon_max_jump_%"]
+
 
 def _record_fail(summary, method: str, category: str, motion_rel: str):
-    if method not in summary:
-        summary[method] = {}
-    if category not in summary[method]:
-        summary[method][category] = set()
-    summary[method][category].add(motion_rel)
+    summary.setdefault(method, {}).setdefault(category, set()).add(motion_rel)
+
 
 def _update_fail_summary_from_result(summary, method: str, motion_rel: str, r: Dict):
     # Only count a motion for a category if it crosses the threshold
-    if r.get(f"{method}_joint_pct") is not None and r[f"{method}_joint_pct"] > TH_JOINT:
-        _record_fail(summary, method.upper(), "joint violation", motion_rel)
+    checks = [
+        (f"{method}_joint_pct", TH_JOINT, "joint violation"),
+        (f"{method}_pen_max_depth_m", TH_PEN_MAX, "penetration max depth"),
+        (f"{method}_float_height", TH_FLOAT, "floating"),
+        (f"{method}_tendon_max_jump_%", TH_TEND, "tendon jump"),
+    ]
+    for key, threshold, category in checks:
+        if r.get(key) is not None and r[key] > threshold:
+            _record_fail(summary, method.upper(), category, motion_rel)
 
-    if r.get(f"{method}_pen_max_depth_m") is not None and r[f"{method}_pen_max_depth_m"] > TH_PEN_MAX:
-        _record_fail(summary, method.upper(), "penetration max depth", motion_rel)
-
-    if r.get(f"{method}_float_height") is not None and r[f"{method}_float_height"] > TH_FLOAT:
-        _record_fail(summary, method.upper(), "floating", motion_rel)
-
-    if r.get(f"{method}_tendon_max_jump_%") is not None and r[f"{method}_tendon_max_jump_%"] > TH_TEND:
-        _record_fail(summary, method.upper(), "tendon jump", motion_rel)
 
 def new_fail_summary():
     return {}
+
 
 def merge_fail_summaries(dst, src):
     for method, cats in src.items():
         for cat, motions in cats.items():
             dst[method][cat].update(motions)
+
 
 def print_fail_summary(summary):
     print("\n" + "=" * 60)
@@ -55,6 +90,7 @@ def print_fail_summary(summary):
         for cat in sorted(summary[method].keys()):
             print(f"  {cat}: {len(summary[method][cat])}")
     print("=" * 60 + "\n")
+
 
 def collect_dataset_files(dataset_name: str) -> List[Path]:
     """
@@ -72,93 +108,64 @@ def collect_dataset_files(dataset_name: str) -> List[Path]:
 
     return files
 
-def violates_gmr(r: Dict) -> bool:
+
+def violates(r: Dict, method: str) -> bool:
+    """Whether this motion crosses any quality threshold under `method`."""
     return (
-        (r["gmr_joint_pct"] is not None and r["gmr_joint_pct"] > TH_JOINT)
-        or (r["gmr_pen_max_depth_m"] is not None and r["gmr_pen_max_depth_m"] > TH_PEN_MAX)
-        or (r["gmr_float_height"] is not None and r["gmr_float_height"] > TH_FLOAT)
-        or (r["gmr_tendon_max_jump_%"] is not None and r["gmr_tendon_max_jump_%"] > TH_TEND)
+        (r.get(f"{method}_joint_pct") is not None and r[f"{method}_joint_pct"] > TH_JOINT)
+        or (r.get(f"{method}_pen_max_depth_m") is not None and r[f"{method}_pen_max_depth_m"] > TH_PEN_MAX)
+        or (r.get(f"{method}_float_height") is not None and r[f"{method}_float_height"] > TH_FLOAT)
+        or (r.get(f"{method}_tendon_max_jump_%") is not None and r[f"{method}_tendon_max_jump_%"] > TH_TEND)
     )
 
 
-def violates_mimic(r: Dict) -> bool:
-    return (
-        (r["mimic_joint_pct"] is not None and r["mimic_joint_pct"] > TH_JOINT)
-        or (r["mimic_pen_max_depth_m"] is not None and r["mimic_pen_max_depth_m"] > TH_PEN_MAX)
-        or (r["mimic_float_height"] is not None and r["mimic_float_height"] > TH_FLOAT)
-        or (r["mimic_tendon_max_jump_%"] is not None and r["mimic_tendon_max_jump_%"] > TH_TEND)
-    )
-
-def worker_process(args: Tuple[int, List[Path]]) -> Tuple[
-    int, int, List[Dict], List[Dict], List[Dict], List[str], List[str], Dict
-]:
-    worker_id, batch = args
+def worker_process(args: Tuple[int, List[Path], List[str]]):
+    worker_id, batch, methods = args
     print(f"Worker {worker_id}: {len(batch)} motions")
     local_fail_summary = {}
 
-    base, gmr_dir = _get_base_and_gmr_dirs()
+    base, _ = _get_base_and_gmr_dirs()
 
     success = 0
     missing = 0
     all_records: List[Dict] = []
-    gmr_bad: List[Dict] = []
-    mimic_bad: List[Dict] = []
+    bad: Dict[str, List[Dict]] = {m: [] for m in methods}
     errors: List[str] = []
     missing_files: List[str] = []
 
     for i, f in enumerate(batch):
         rel = f.relative_to(base)
-        gmr_file = gmr_dir / rel
 
-        if not f.exists() or not gmr_file.exists():
-            print(f"Worker {worker_id}: Missing files for {rel}, skipping")
+        absent = [m for m in methods if not method_cache_path(m, rel).exists()]
+        if absent:
+            print(f"Worker {worker_id}: Missing {absent} cache for {rel}, skipping")
             missing += 1
-            missing_files.append(str(rel))
+            missing_files.append(f"{rel} (missing: {','.join(absent)})")
             continue
 
         try:
-            print(f"Worker {worker_id}: [{i+1}/{len(batch)}] {rel}")
+            print(f"Worker {worker_id}: [{i + 1}/{len(batch)}] {rel}")
 
-            metrics = compute_msk_metrics(rel)
+            metrics = compute_msk_metrics(rel, methods=methods)
 
-            result = {
-                "file": str(rel),
-
-                "gmr_joint_pct": metrics["gmr"].get("joint_pct"),
-                "gmr_pen_pct": metrics["gmr"].get("pen_pct"),
-                "gmr_pen_max_depth_m": metrics["gmr"].get("pen_max_depth_m"),
-                "gmr_float_height": metrics["gmr"].get("float_height"),
-                "gmr_tendon_max_jump_%": metrics["gmr"].get("tendon_max_jump_%"),
-                "gmr_sec_per_frame": metrics["gmr"].get("sec_per_frame"),
-                "gmr_pos_rmse": metrics["gmr"].get("pos_rmse"),
-
-                "mimic_joint_pct": metrics["mimic"].get("joint_pct"),
-                "mimic_pen_pct": metrics["mimic"].get("pen_pct"),
-                "mimic_pen_max_depth_m": metrics["mimic"].get("pen_max_depth_m"),
-                "mimic_float_height": metrics["mimic"].get("float_height"),
-                "mimic_tendon_max_jump_%": metrics["mimic"].get("tendon_max_jump_%"),
-                "mimic_sec_per_frame": metrics["mimic"].get("sec_per_frame"),
-                "mimic_pos_rmse": metrics["mimic"].get("pos_rmse"),
-            }
+            result = {"file": str(rel)}
+            for m in methods:
+                for c in METRIC_COLS:
+                    result[f"{m}_{c}"] = metrics[m].get(c)
 
             success += 1
             all_records.append(result)
 
             motion_rel = str(rel)
-
-            # populate per-category failure summary (by motion)
-            _update_fail_summary_from_result(local_fail_summary, "gmr", motion_rel, result)
-            _update_fail_summary_from_result(local_fail_summary, "mimic", motion_rel, result)
-
-            if violates_gmr(result):
-                gmr_bad.append(result)
-            if violates_mimic(result):
-                mimic_bad.append(result)
+            for m in methods:
+                _update_fail_summary_from_result(local_fail_summary, m, motion_rel, result)
+                if violates(result, m):
+                    bad[m].append(result)
 
         except Exception as e:
             errors.append(f"{rel}: {e!r}")
 
-    return success, missing, all_records, gmr_bad, mimic_bad, errors, missing_files, local_fail_summary
+    return success, missing, all_records, bad, errors, missing_files, local_fail_summary
 
 
 def distribute(lst: List[Path], num_workers: int) -> List[List[Path]]:
@@ -166,6 +173,7 @@ def distribute(lst: List[Path], num_workers: int) -> List[List[Path]]:
     for i, item in enumerate(lst):
         batches[i % num_workers].append(item)
     return batches
+
 
 def get_motion_dataset(dataset_name: str) -> List[str]:
     """Load the specified motion dataset."""
@@ -177,12 +185,18 @@ def get_motion_dataset(dataset_name: str) -> List[str]:
         else:
             raise ValueError(f"Dataset '{dataset_name}' not found in loco_mujoco.smpl.const")
     except ImportError as e:
-        raise ImportError(f"Failed to import dataset {dataset_name}: {e}")
+        raise ImportError(f"Failed to import dataset {dataset_name}: {e}") from e
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--out_dir", type=Path, default=Path("output"))
+    parser.add_argument(
+        "--methods",
+        default="gmr,mimic",
+        help=f"comma-separated retargeting methods to compare; known: {sorted(METHOD_DIRS)}",
+    )
     parser.add_argument(
         "--dataset",
         choices=[
@@ -203,8 +217,14 @@ def parse_args():
 def main() -> int:
     args = parse_args()
 
+    methods = [m.strip() for m in args.methods.split(",") if m.strip()]
+    unknown = set(methods) - set(METHOD_DIRS)
+    if unknown:
+        raise SystemExit(f"unknown methods {sorted(unknown)}; known: {sorted(METHOD_DIRS)}")
+
     motion_files = collect_dataset_files(args.dataset)
     print(f"Dataset: {args.dataset}")
+    print(f"Methods: {methods}")
     print(f"Found {len(motion_files)} motions")
 
     if not motion_files:
@@ -215,7 +235,7 @@ def main() -> int:
     print(f"Using {num_workers} workers")
 
     batches = distribute(motion_files, num_workers)
-    worker_args = list(enumerate(batches))
+    worker_args = [(i, b, methods) for i, b in enumerate(batches)]
 
     start = time.time()
 
@@ -227,15 +247,14 @@ def main() -> int:
     total_success = sum(r[0] for r in results)
     total_missing = sum(r[1] for r in results)
     all_records   = [item for r in results for item in r[2]]
-    gmr_failed    = [item for r in results for item in r[3]]
-    mimic_failed  = [item for r in results for item in r[4]]
-    all_errors    = [msg  for r in results for msg in r[5]]
-    missing_files = [p for r in results for p in r[6]]
+    failed        = {m: [item for r in results for item in r[3][m]] for m in methods}
+    all_errors    = [msg  for r in results for msg in r[4]]
+    missing_files = [p for r in results for p in r[5]]
 
-    print(f"\n=== RESULTS (PRE-SAVE) ===")
+    print("\n=== RESULTS (PRE-SAVE) ===")
     print(f"Total discovered: {len(motion_files)}")
     print(f"Processed OK:     {total_success}")
-    print(f"Missing pairs:    {total_missing}")
+    print(f"Missing caches:   {total_missing}")
     print(f"Errors:           {len(all_errors)}")
     print(f"Time: {elapsed:.2f}s")
 
@@ -254,121 +273,46 @@ def main() -> int:
 
     # ================== WRITE OUTPUTS ==================
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    dataset_tag = args.dataset.lower()
 
-    gmr_cols = [
-        "file",
-        "gmr_joint_pct",
-        "gmr_pen_pct",
-        "gmr_pen_max_depth_m",
-        "gmr_float_height",
-        "gmr_tendon_max_jump_%",
-        "gmr_sec_per_frame",
-        "gmr_pos_rmse",
-    ]
-
-    mimic_cols = [
-        "file",
-        "mimic_joint_pct",
-        "mimic_pen_pct",
-        "mimic_pen_max_depth_m",
-        "mimic_float_height",
-        "mimic_tendon_max_jump_%",
-        "mimic_sec_per_frame",
-        "mimic_pos_rmse",
-    ]
-
-    all_cols = [
-        "file",
-        "gmr_joint_pct",
-        "gmr_pen_pct",
-        "gmr_pen_max_depth_m",
-        "gmr_float_height",
-        "gmr_tendon_max_jump_%",
-        "gmr_pos_rmse",
-        "gmr_sec_per_frame",
-        "mimic_joint_pct",
-        "mimic_pen_pct",
-        "mimic_pen_max_depth_m",
-        "mimic_float_height",
-        "mimic_tendon_max_jump_%",
-        "mimic_sec_per_frame",   
-        "mimic_pos_rmse",
-    ]
-
-    df_gmr = pd.DataFrame(gmr_failed, columns=gmr_cols)
-    df_mimic = pd.DataFrame(mimic_failed, columns=mimic_cols)
+    all_cols = ["file"] + [f"{m}_{c}" for m in methods for c in METRIC_COLS]
     df_all = pd.DataFrame(all_records, columns=all_cols)
+
+    all_path = args.out_dir / f"all_motions_{dataset_tag}.csv"
+    df_all.to_csv(all_path, index=False, float_format="%.5f")
+    print(f"Saved {all_path.name}")
+
+    for m in methods:
+        cols = ["file"] + [f"{m}_{c}" for c in METRIC_COLS]
+        path = args.out_dir / f"failed_motions_{m}_{dataset_tag}.csv"
+        pd.DataFrame(failed[m], columns=cols).to_csv(path, index=False, float_format="%.5f")
+        print(f"Saved {path.name}")
 
     missing_counts = df_all.isna().sum().sort_values(ascending=False)
     print("\n=== MISSING COUNTS PER COLUMN ===")
     print(missing_counts[missing_counts > 0])
 
-    gmr_tendon_motion_pct = 100.0 * (df_all["gmr_tendon_max_jump_%"] > TH_TEND).mean()
-    mimic_tendon_motion_pct = 100.0 * (df_all["mimic_tendon_max_jump_%"] > TH_TEND).mean()
-
     mean_vals = df_all.mean(numeric_only=True)
+    for m in methods:
+        for c in NONZERO_MEAN:
+            col = f"{m}_{c}"
+            if col in df_all.columns:
+                s = pd.to_numeric(df_all[col], errors="coerce")
+                nz = s.abs() > 0.0
+                mean_vals[col] = s[nz].mean() if nz.any() else 0.0
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    dataset_tag = args.dataset.lower()
-
-    all_path   = args.out_dir / f"all_motions_{dataset_tag}.csv"
-    gmr_path   = args.out_dir / f"failed_motions_gmr_{dataset_tag}.csv"
-    mimic_path = args.out_dir / f"failed_motions_mimic_{dataset_tag}.csv"
-
-    df_all.to_csv(all_path, index=False, float_format="%.5f")
-    df_gmr.to_csv(gmr_path, index=False, float_format="%.5f")
-    df_mimic.to_csv(mimic_path, index=False, float_format="%.5f")
-
-    mean_vals = df_all.mean(numeric_only=True)
-
-    print(f"Saved {all_path.name}")
-    print(f"Saved {gmr_path.name}")
-    print(f"Saved {mimic_path.name}")
-
-    # For "max" metrics, compute mean over NON-ZERO entries only (zeros usually mean "no event")
-    eps = 0.0  # set to e.g. 1e-12 if you have tiny numerical noise instead of exact zeros
-    nonzero_mean_cols = [
-        "gmr_pen_max_depth_m",
-        "mimic_pen_max_depth_m",
-        "gmr_tendon_max_jump_%",
-        "mimic_tendon_max_jump_%",
-    ]
-
-    for c in nonzero_mean_cols:
-        if c in df_all.columns:
-            s = pd.to_numeric(df_all[c], errors="coerce")
-            nz = s.abs() > eps
-            mean_vals[c] = s[nz].mean() if nz.any() else 0.0
-
-    print(
-        "\n=== SUMMARY (MEAN OVER ALL MOTIONS) ===\n"
-        f"GMR:  joint={mean_vals['gmr_joint_pct']:.5f}%  "
-        f"pen={mean_vals['gmr_pen_pct']:.5f}%  "
-        f"pen_max={mean_vals['gmr_pen_max_depth_m']:.5f}m  "
-        f"float={mean_vals['gmr_float_height']:.5f}m  "
-        f"tendon_max_change_mean={mean_vals['gmr_tendon_max_jump_%']:.5f}%  "
-        f"tendon_motion_pct={gmr_tendon_motion_pct:.2f}%  "
-        f"spf={mean_vals['gmr_sec_per_frame']:.5f}s "
-        f"rmse={mean_vals['gmr_pos_rmse']:.5f}m \n"
-        f"MIMIC: joint={mean_vals['mimic_joint_pct']:.5f}%  "
-        f"pen={mean_vals['mimic_pen_pct']:.5f}%  "
-        f"pen_max={mean_vals['mimic_pen_max_depth_m']:.5f}m  "
-        f"float={mean_vals['mimic_float_height']:.5f}m  "
-        f"tendon_max_change_mean={mean_vals['mimic_tendon_max_jump_%']:.5f}%  "
-        f"tendon_motion_pct={mimic_tendon_motion_pct:.2f}%  "
-        f"spf={mean_vals['mimic_sec_per_frame']:.5f}s "
-        f"rmse={mean_vals['mimic_pos_rmse']:.5f}m  "
-    )
-
-    fail_summaries = [r[7] for r in results]
+    print("\n=== SUMMARY (MEAN OVER ALL MOTIONS) ===")
+    for m in methods:
+        tendon_motion_pct = 100.0 * (df_all[f"{m}_tendon_max_jump_%"] > TH_TEND).mean()
+        parts = [f"{c}={mean_vals.get(f'{m}_{c}', float('nan')):.5f}" for c in METRIC_COLS]
+        print(f"{m.upper():6s} " + "  ".join(parts) + f"  tendon_motion_pct={tendon_motion_pct:.2f}%")
 
     merged_fail_summary = defaultdict(lambda: defaultdict(set))
-    for fs in fail_summaries:
+    for fs in (r[6] for r in results):
         merge_fail_summaries(merged_fail_summary, fs)
-    
+
     print_fail_summary(merged_fail_summary)
-    
+
     return 0
 
 

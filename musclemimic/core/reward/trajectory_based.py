@@ -182,12 +182,14 @@ class MimicReward(TrajectoryBasedReward):
         self._qpos_w_exp = kwargs.get("qpos_w_exp", 10.0)
         self._qvel_w_exp = kwargs.get("qvel_w_exp", 2.0)
         self._root_pos_w_exp = kwargs.get("root_pos_w_exp", 10.0)
+        self._root_quat_w_exp = kwargs.get("root_quat_w_exp", 10.0)
         self._rpos_w_exp = kwargs.get("rpos_w_exp", 100.0)
         self._rquat_w_exp = kwargs.get("rquat_w_exp", 10.0)
         self._rvel_w_exp = kwargs.get("rvel_w_exp", 0.1)
         self._qpos_w_sum = kwargs.get("qpos_w_sum", 0.0)
         self._qvel_w_sum = kwargs.get("qvel_w_sum", 0.0)
         self._root_pos_w_sum = kwargs.get("root_pos_w_sum", 0.0)
+        self._root_quat_w_sum = kwargs.get("root_quat_w_sum", 0.0)
         self._rpos_w_sum = kwargs.get("rpos_w_sum", 0.5)
         self._rquat_w_sum = kwargs.get("rquat_w_sum", 0.3)
         self._rvel_w_sum = kwargs.get("rvel_w_sum", 0.0)
@@ -199,6 +201,11 @@ class MimicReward(TrajectoryBasedReward):
         # Root velocity tracking: [vx_local, vy_local, yaw_rate]
         self._root_vel_w_exp = kwargs.get("root_vel_w_exp", 10.0)
         self._root_vel_w_sum = kwargs.get("root_vel_w_sum", 0.2)
+        self._global_root_tracking = bool(kwargs.get("global_root_tracking", False))
+        self._joint_only_qpos_qvel = bool(kwargs.get("joint_only_qpos_qvel", False))
+        self._root_velocity_frame = kwargs.get("root_velocity_frame", "local")
+        if self._root_velocity_frame not in {"local", "global"}:
+            raise ValueError("root_velocity_frame must be 'local' or 'global'.")
 
         # Parallel environment reward calculation mode
         # True: use mean(exp(-beta * dist)) - better for parallel environments  
@@ -375,24 +382,42 @@ class MimicReward(TrajectoryBasedReward):
         # get trajectory data
         # get all quantities from trajectory
         traj_data_single = env.th.get_current_traj_data(carry, backend)
-        qpos_traj, qvel_traj = traj_data_single.qpos[self._qpos_ind], traj_data_single.qvel[self._qvel_ind]
+        qpos_traj_full = traj_data_single.qpos[self._qpos_ind]
+        qvel_traj_full = traj_data_single.qvel[self._qvel_ind]
 
         # Subtract init XY offset from trajectory qpos to compare in local frame
         xy_offset = None
-        if self._root_qpos_ids_xy is not None and hasattr(carry.traj_state, "subtraj_step_no_init"):
+        if (
+            not self._global_root_tracking
+            and self._root_qpos_ids_xy is not None
+            and hasattr(carry.traj_state, "subtraj_step_no_init")
+        ):
             init_data = env.th.get_traj_data_at(
                 carry.traj_state.traj_no, carry.traj_state.subtraj_step_no_init, carry, backend
             )
             xy_offset = init_data.qpos[self._root_qpos_ids_xy]
             if self._root_xy_in_qpos_ind is not None:
                 if backend == np:
-                    qpos_traj = qpos_traj.copy()
-                    qpos_traj[self._root_xy_in_qpos_ind] -= xy_offset
+                    qpos_traj_full = qpos_traj_full.copy()
+                    qpos_traj_full[self._root_xy_in_qpos_ind] -= xy_offset
                 else:
-                    qpos_traj = qpos_traj.at[self._root_xy_in_qpos_ind].add(-xy_offset)
+                    qpos_traj_full = qpos_traj_full.at[self._root_xy_in_qpos_ind].add(-xy_offset)
+
+        qpos_full = data.qpos[self._qpos_ind]
+        qvel_full = data.qvel[self._qvel_ind]
+        if self._joint_only_qpos_qvel:
+            qpos = qpos_full[self._joint_qpos_mask]
+            qpos_traj = qpos_traj_full[self._joint_qpos_mask]
+            qvel = qvel_full[self._joint_qvel_mask]
+            qvel_traj = qvel_traj_full[self._joint_qvel_mask]
+            quat_in_qpos = self._quat_in_qpos[self._joint_qpos_mask]
+        else:
+            qpos, qpos_traj = qpos_full, qpos_traj_full
+            qvel, qvel_traj = qvel_full, qvel_traj_full
+            quat_in_qpos = self._quat_in_qpos
 
         # Handle quaternion joints if they exist
-        qpos_quat_traj = qpos_traj[self._quat_in_qpos]
+        qpos_quat_traj = qpos_traj[quat_in_qpos]
         if qpos_quat_traj.size > 0:
             qpos_quat_traj = qpos_quat_traj.reshape(-1, 4)
         
@@ -408,11 +433,8 @@ class MimicReward(TrajectoryBasedReward):
                                                 self._rel_body_ids, model.body_rootid, backend,
                                                 trajectory_site_indices=traj_site_indices)
 
-        # get all quantities from the current data
-        qpos, qvel = data.qpos[self._qpos_ind], data.qvel[self._qvel_ind]
-        
         # Handle quaternion joints if they exist
-        qpos_quat = qpos[self._quat_in_qpos]
+        qpos_quat = qpos[quat_in_qpos]
         if qpos_quat.size > 0:
             qpos_quat = qpos_quat.reshape(-1, 4)
         
@@ -426,7 +448,7 @@ class MimicReward(TrajectoryBasedReward):
         if self._use_mean_exp_reward:
             # Better for parallel environments: mean(exp(-beta * dist))
             # Apply exp first, then mean across joint/site dimensions
-            qpos_dists = backend.square(qpos[~self._quat_in_qpos] - qpos_traj[~self._quat_in_qpos])
+            qpos_dists = backend.square(qpos[~quat_in_qpos] - qpos_traj[~quat_in_qpos])
             
             # Add quaternion distance to maintain same structure as original  
             if qpos_quat.size > 0:
@@ -463,7 +485,7 @@ class MimicReward(TrajectoryBasedReward):
                 raw_rpos_dist = raw_rangles_dist = raw_rvel_rot_dist = raw_rvel_lin_dist = 0.0
         else:
             # Backward compatible: exp(-beta * mean(dist)) - original structure
-            qpos_dist = backend.mean(backend.square(qpos[~self._quat_in_qpos] - qpos_traj[~self._quat_in_qpos]))
+            qpos_dist = backend.mean(backend.square(qpos[~quat_in_qpos] - qpos_traj[~quat_in_qpos]))
             
             # Add quaternion distance only if quaternion joints exist
             if qpos_quat.size > 0:
@@ -498,7 +520,9 @@ class MimicReward(TrajectoryBasedReward):
 
         # Root position tracking reward.
         root_pos_reward = 0.0
+        root_quat_reward = 0.0
         raw_root_pos_dist = 0.0
+        raw_root_quat_dist = 0.0
         offset_xyz = None
         if self._free_joint_qpos_ind is not None:
             root_xyz = data.qpos[self._free_joint_qpos_ind[:3]]
@@ -508,12 +532,22 @@ class MimicReward(TrajectoryBasedReward):
                 traj_root_xyz = traj_root_xyz - offset_xyz
             raw_root_pos_dist = backend.mean(backend.square(root_xyz - traj_root_xyz))
             root_pos_reward = backend.exp(-self._root_pos_w_exp * raw_root_pos_dist)
+            root_quat = data.qpos[self._free_joint_qpos_ind[3:7]]
+            traj_root_quat = traj_data_single.qpos[self._free_joint_qpos_ind[3:7]]
+            root_angle_error = quaternion_angular_distance(
+                quat_scalarfirst2scalarlast(root_quat)[None, :],
+                quat_scalarfirst2scalarlast(traj_root_quat)[None, :],
+                backend,
+            )
+            raw_root_quat_dist = backend.mean(backend.square(root_angle_error))
+            root_quat_reward = backend.exp(-self._root_quat_w_exp * raw_root_quat_dist)
 
         # Compute total raw imitation error for adaptive sampling (weighted sum of raw distances)
         imitation_error_total = (
             self._qpos_w_sum * raw_qpos_dist +
             qvel_w_sum * raw_qvel_dist +
             self._root_pos_w_sum * raw_root_pos_dist +
+            self._root_quat_w_sum * raw_root_quat_dist +
             self._rpos_w_sum * raw_rpos_dist +
             self._rquat_w_sum * raw_rangles_dist +
             self._rvel_w_sum * raw_rvel_rot_dist +
@@ -529,17 +563,19 @@ class MimicReward(TrajectoryBasedReward):
             else:
                 R = jnp_R
 
-            def calc_root_local_vel(_d):
+            def calc_root_vel(_d):
                 lin_vel_global = _d.qvel[self._free_joint_qvel_ind][:3]
                 ang_vel_global = _d.qvel[self._free_joint_qvel_ind][3:]
+                if self._root_velocity_frame == "global":
+                    return backend.concatenate([lin_vel_global, ang_vel_global])
                 root_quat = R.from_quat(quat_scalarfirst2scalarlast(_d.qpos[self._free_joint_qpos_ind][3:7]))
                 lin_vel_local = root_quat.as_matrix().T @ lin_vel_global
                 # Include all 6 DOF: XYZ linear velocity + XYZ angular velocity
                 return backend.concatenate([lin_vel_local, ang_vel_global])
 
-            vel_local = calc_root_local_vel(data)
-            traj_vel_local = calc_root_local_vel(traj_data_single)
-            root_vel_dist = backend.mean(backend.square(vel_local - traj_vel_local))
+            root_vel = calc_root_vel(data)
+            traj_root_vel = calc_root_vel(traj_data_single)
+            root_vel_dist = backend.mean(backend.square(root_vel - traj_root_vel))
             root_vel_reward = backend.exp(-self._root_vel_w_exp * root_vel_dist)
 
         # calculate costs
@@ -591,6 +627,7 @@ class MimicReward(TrajectoryBasedReward):
         # calculate total reward
         total_reward = (self._qpos_w_sum * qpos_reward + qvel_w_sum * qvel_reward
                         + self._root_pos_w_sum * root_pos_reward
+                        + self._root_quat_w_sum * root_quat_reward
                         + root_vel_w_sum * root_vel_reward)
         if len(self._rel_site_ids) > 1:
             total_reward = (total_reward
@@ -626,10 +663,10 @@ class MimicReward(TrajectoryBasedReward):
         # Joint errors
         if np.any(self._joint_qpos_mask):
             err_joint_pos = backend.sqrt(backend.mean(backend.square(
-                qpos[self._joint_qpos_mask] - qpos_traj[self._joint_qpos_mask])))
+                qpos_full[self._joint_qpos_mask] - qpos_traj_full[self._joint_qpos_mask])))
         if np.any(self._joint_qvel_mask):
             err_joint_vel = backend.sqrt(backend.mean(backend.square(
-                qvel[self._joint_qvel_mask] - qvel_traj[self._joint_qvel_mask])))
+                qvel_full[self._joint_qvel_mask] - qvel_traj_full[self._joint_qvel_mask])))
         # Absolute site deviation (like terminal handler)
         if len(self._rel_site_ids) > 1:
             site_mapping = self._rel_site_ids
@@ -652,6 +689,7 @@ class MimicReward(TrajectoryBasedReward):
             "reward_qpos": qpos_reward,
             "reward_qvel": qvel_reward,
             "reward_root_pos": root_pos_reward,
+            "reward_root_quat": root_quat_reward,
             "reward_root_vel": root_vel_reward,
             "penalty_total": total_penalities,
             "penalty_activation_energy": self._activation_energy_coeff * activation_energy_penalty,
@@ -670,5 +708,16 @@ class MimicReward(TrajectoryBasedReward):
 
         return total_reward, carry, reward_info
 
+
+class TerraMimicReward(MimicReward):
+    """TERRA tracking reward with a global root and root-relative body targets."""
+
+    def __init__(self, env: Any, **kwargs):
+        kwargs.setdefault("global_root_tracking", True)
+        kwargs.setdefault("joint_only_qpos_qvel", True)
+        kwargs.setdefault("root_velocity_frame", "global")
+        super().__init__(env, **kwargs)
+
 TargetVelocityTrajReward.register()
 MimicReward.register()
+TerraMimicReward.register()

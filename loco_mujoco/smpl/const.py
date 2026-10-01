@@ -11794,7 +11794,6 @@ AMASS_LOCOMOTION_DATASETS = [
     "KIT/183/walking_fast10_poses",
     "KIT/317/run03_poses",
     "ACCAD/ACCAD/Male2Walking_c3d/B21 -  put down box to walk_poses",
-    "KIT/675/walk_with_handrail_beam_right07_poses",
     "KIT/359/walking_fast02_poses",
     "KIT/8/WalkInCounterClockwiseCircle02_poses",
     "ACCAD/ACCAD/Male2Running_c3d/C15 - run turn right 45_poses",
@@ -17044,3 +17043,205 @@ AMASS_RANDOM_TRAINING_MOTIONS_2K = [
     'MOYO/train/220923/03596/220923_yogi_body_hands_03596_Bridge_Pose_or_Setu_Bandha_Sarvangasana_-d_stageii',
     'PosePrior/MPI_Limits/03101/ulr3_poses',
     ]
+
+BOO_MOTIONS_WITH_EMG = [
+    "EMG_Boo/S001/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S001/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S001/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S001/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S001/LevelWalking/TRC/Trial05/AllSteps_stageii",
+    "EMG_Boo/S002/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S002/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S002/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S002/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S002/LevelWalking/TRC/Trial05/AllSteps_stageii",
+    "EMG_Boo/S003/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S003/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S003/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S003/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S003/LevelWalking/TRC/Trial05/AllSteps_stageii",
+    "EMG_Boo/S004/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S004/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S004/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S004/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S004/LevelWalking/TRC/Trial05/AllSteps_stageii",
+    "EMG_Boo/S005/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S005/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S005/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S005/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S005/LevelWalking/TRC/Trial05/AllSteps_stageii",
+    "EMG_Boo/S006/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S006/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S006/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S006/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S006/LevelWalking/TRC/Trial05/AllSteps_stageii",
+    "EMG_Boo/S007/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S007/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S007/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S007/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S007/LevelWalking/TRC/Trial05/AllSteps_stageii",
+    "EMG_Boo/S008/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S008/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S008/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S008/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S008/LevelWalking/TRC/Trial05/AllSteps_stageii",
+    "EMG_Boo/S009/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S009/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S009/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S009/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S009/LevelWalking/TRC/Trial05/AllSteps_stageii",
+    "EMG_Boo/S010/LevelWalking/TRC/Trial01/AllSteps_stageii",
+    "EMG_Boo/S010/LevelWalking/TRC/Trial02/AllSteps_stageii",
+    "EMG_Boo/S010/LevelWalking/TRC/Trial03/AllSteps_stageii",
+    "EMG_Boo/S010/LevelWalking/TRC/Trial04/AllSteps_stageii",
+    "EMG_Boo/S010/LevelWalking/TRC/Trial05/AllSteps_stageii",
+
+]
+
+def _gait120_motions(subjects, trials):
+    """Build Gait120 motion IDs (5 trials per subject) for the given subject numbers.
+
+    Path layout (relative to the AMASS dataset root):
+        Gait120_EMG/<group>/S<NNN>/LevelWalking/TRC/Trial<TT>/AllSteps_stageii
+    where <group> is the 10-subject block, e.g. ``Gait120_001_to_010``.
+    """
+    motions = []
+    for s in subjects:
+        block = (s - 1) // 10 * 10
+        group = f"Gait120_{block + 1:03d}_to_{block + 10:03d}"
+        for t in trials:
+            motions.append(
+                f"Gait120_EMG/{group}/S{s:03d}/LevelWalking/TRC/Trial{t:02d}/AllSteps_stageii"
+            )
+    return motions
+
+
+# Subject split: train on 1-50 and 61-110, test on 51-60 and 111-120.
+GAIT120_TRAINING_SUBJECTS = _gait120_motions(subjects= [*range(1, 51), *range(61, 111)], trials=[*range(1, 6)])
+
+GAIT120_TESTING_SUBJECTS = _gait120_motions(subjects=[*range(51, 61), *range(111, 121)], trials=[*range(1, 6)])
+
+GAIT120_TRAINING_TRIALS = _gait120_motions(subjects=[*range(1, 121)], trials=[*range(1, 5)])
+
+GAIT120_TESTING_TRIALS = _gait120_motions(subjects=[*range(1, 121)], trials=[*range(5, 6)])
+
+# COMMON test set
+# TRIAL 5, test subjects
+GAIT120_TESTING = _gait120_motions(subjects=[*range(51, 61), *range(111, 121)], trials=[*range(5, 6)])
+
+# for policy trial variability bound
+# TRIALS 1-4, test subjects
+GAIT120_TESTING_SUBJECTS_TRIALS0104= _gait120_motions(subjects=[*range(51, 61), *range(111, 121)], trials=[*range(1, 5)])
+
+# Non-flat locomotion: stairs, beams, stepping stones and a low step, drawn from AMASS by
+# the standalone TERRA repository's `scripts/terra/select_terrain_subset.py` (seed 0), stratified over eight terrain classes,
+# and 16 subjects. Every motion is admitted on *both* its name and evidence: the terrain
+# reconstruction in the standalone `terra.terrain` package was run over all 16,113 motions in the
+# archive and found a raised support surface, at least 5 cm high, carrying at least three
+# footfalls, in a clip whose pelvis travels at least a metre.
+#
+# Ramps, seesaws, handrail-assisted walking and gaps in the floor are deliberately absent -
+# none has a representation in `TerrainSpec` (a flat floor plus yawed boxes). Use
+# `--emit-const` on the selection script to regenerate this list.
+AMASS_NONFLAT_MOTIONS = [
+    "EKUT/EKUT/125/WSD2_poses",
+    "EKUT/EKUT/125/WSD3_poses",
+    "EKUT/EKUT/125/WSU4_poses",
+    "EKUT/EKUT/125/WSUF3_poses",
+    "EKUT/EKUT/125/WSUF5_poses",
+    "EKUT/EKUT/234/BEAM02_poses",
+    "EKUT/EKUT/234/BEAM05_poses",
+    "EKUT/EKUT/234/SS1D104_poses",
+    "EKUT/EKUT/234/SS2D103_poses",
+    "EKUT/EKUT/234/WSDF01_poses",
+    "EKUT/EKUT/234/WSDF02_poses",
+    "EKUT/EKUT/234/WSUF03_poses",
+    "EKUT/EKUT/234/WSUF04_poses",
+    "EKUT/EKUT/234/WSUF05_poses",
+    "EKUT/EKUT/265/BEAM01_poses",
+    "EKUT/EKUT/265/BEAMN04_poses",
+    "EKUT/EKUT/265/SS1D108_poses",
+    "EKUT/EKUT/265/SS2D102_poses",
+    "EKUT/EKUT/265/WSDF03_poses",
+    "EKUT/EKUT/265/WSDF04_poses",
+    "EKUT/EKUT/265/WSDF05_poses",
+    "EKUT/EKUT/265/WSUF01_poses",
+    "EKUT/EKUT/265/WSUF03_poses",
+    "KIT/167/downstairs01_poses",
+    "KIT/167/downstairs08_poses",
+    "KIT/167/go_over_beam01_poses",
+    "KIT/167/go_over_beam02_poses",
+    "KIT/167/go_over_beam09_poses",
+    "KIT/167/upstairs01_poses",
+    "KIT/167/upstairs09_poses",
+    "KIT/167/upstairs10_poses",
+    "KIT/167/upstairs_downstairs02_poses",
+    "KIT/167/upstairs_downstairs03_poses",
+    "KIT/183/downstairs02_poses",
+    "KIT/183/downstairs03_poses",
+    "KIT/183/go_over_beam_n01_poses",
+    "KIT/183/go_over_beam_n09_poses",
+    "KIT/183/upstairs01_poses",
+    "KIT/183/upstairs05_poses",
+    "KIT/3/downstairs_backwards02_poses",
+    "KIT/3/downstaris09_poses",
+    "KIT/3/go_over_beam04_poses",
+    "KIT/3/go_over_beam07_poses",
+    "KIT/3/step_stones01_poses",
+    "KIT/3/step_stones06_poses",
+    "KIT/3/upstairs01_poses",
+    "KIT/3/upstairs_downstairs03_poses",
+    "KIT/3/walking_upstairs01_poses",
+    "KIT/3/walking_upstairs04_poses",
+    "KIT/314/go_over_beam02_poses",
+    "KIT/314/go_over_beam06_poses",
+    "KIT/317/go_over_beam02_poses",
+    "KIT/317/go_over_beam03_poses",
+    "KIT/348/go_over_beam04_poses",
+    "KIT/348/go_over_beam09_poses",
+    "KIT/359/downstairs04_poses",
+    "KIT/359/downstairs09_poses",
+    "KIT/359/go_over_beam05_poses",
+    "KIT/359/go_over_beam10_poses",
+    "KIT/359/upstairs02_poses",
+    "KIT/359/upstairs06_poses",
+    "KIT/359/upstairs_downstairs02_poses",
+    "KIT/423/downstairs02_poses",
+    "KIT/423/downstairs03_poses",
+    "KIT/423/downstairs08_poses",
+    "KIT/423/go_over_beam01_poses",
+    "KIT/423/go_over_beam09_poses",
+    "KIT/423/go_over_beam10_poses",
+    "KIT/423/upstairs01_poses",
+    "KIT/423/upstairs05_poses",
+    "KIT/423/upstairs_downstairs02_poses",
+    "KIT/423/upstairs_downstairs05_poses",
+    "KIT/424/downstairs03_poses",
+    "KIT/424/downstairs08_poses",
+    "KIT/424/step_stones08_poses",
+    "KIT/424/step_stones10_poses",
+    "KIT/424/upstairs03_poses",
+    "KIT/424/upstairs09_poses",
+    "KIT/424/upstairs_downstairs02_poses",
+    "KIT/425/downstairs_01_poses",
+    "KIT/425/downstairs_11_poses",
+    "KIT/425/go_over_beam03_poses",
+    "KIT/425/go_over_beam05_poses",
+    "KIT/425/upstairs_06_poses",
+    "KIT/425/upstairs_07_poses",
+    "KIT/513/balance_on_beam02_poses",
+    "KIT/513/balance_on_beam09_poses",
+    "KIT/513/balance_on_beam10_poses",
+    "KIT/513/balance_on_beam11_poses",
+    "KIT/513/downstairs04_poses",
+    "KIT/513/downstairs06_poses",
+    "KIT/513/downstairs_b03_poses",
+    "KIT/513/step_stones02_poses",
+    "KIT/513/step_stones08_poses",
+    "KIT/513/upstairs02_poses",
+    "KIT/513/upstairs03_poses",
+    "KIT/513/upstairs_downstairs01_poses",
+    "KIT/513/upstairs_downstairs02_poses",
+    "SFU/SFU/0012/0012_JumpAndRoll001_poses",
+    "SFU/SFU/0017/0017_JumpingOnBench001_poses",
+]

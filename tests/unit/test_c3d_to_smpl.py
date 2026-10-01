@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -161,6 +162,38 @@ def test_stage_weight_formulas_match_moshpp_defaults() -> None:
     assert stage2.velo == pytest.approx(2.5)
 
 
+def test_marker_and_smpl_torso_frames_share_one_geometric_definition() -> None:
+    torch = pytest.importorskip("torch")
+
+    labels = c3d_to_smpl._TORSO_FRAME_MARKERS
+    observed = torch.zeros(1, len(labels), 3)
+    index = {name: labels.index(name) for name in labels}
+    for name in ("LBWT", "LFWT"):
+        observed[0, index[name]] = torch.tensor([0.0, 0.1, 0.0])
+    for name in ("RBWT", "RFWT"):
+        observed[0, index[name]] = torch.tensor([0.0, -0.1, 0.0])
+    observed[0, index["LSHO"]] = torch.tensor([0.0, 0.2, 1.0])
+    observed[0, index["RSHO"]] = torch.tensor([0.0, -0.2, 1.0])
+    observed_frame, valid = c3d_to_smpl._observed_torso_frames(
+        observed,
+        torch.ones(1, len(labels), dtype=torch.bool),
+        labels,
+    )
+
+    joints = torch.zeros(1, 18, 3, requires_grad=True)
+    with torch.no_grad():
+        joints[0, 1] = torch.tensor([0.0, 0.1, 0.0])
+        joints[0, 2] = torch.tensor([0.0, -0.1, 0.0])
+        joints[0, c3d_to_smpl._SMPL_LEFT_SHOULDER] = torch.tensor([0.0, 0.2, 1.0])
+        joints[0, c3d_to_smpl._SMPL_RIGHT_SHOULDER] = torch.tensor([0.0, -0.2, 1.0])
+    fitted_frame = c3d_to_smpl._fitted_torso_frames(joints)
+
+    assert valid.tolist() == [True]
+    torch.testing.assert_close(fitted_frame, observed_frame)
+    fitted_frame.sum().backward()
+    assert torch.isfinite(joints.grad).all()
+
+
 def test_pose_freeze_hook_matches_moshpp_default_free_vars() -> None:
     torch = pytest.importorskip("torch")
 
@@ -175,6 +208,27 @@ def test_pose_freeze_hook_matches_moshpp_default_free_vars() -> None:
     toes_enabled = c3d_to_smpl._make_pose_freeze_hook(66, optimize_toes=True)(grad)
     assert torch.all(toes_enabled[:, 30:36] == 1.0)
     assert torch.all(toes_enabled[:, 66:] == 0.0)
+
+
+def test_pose_freeze_hook_can_enforce_physiological_knee_hinges() -> None:
+    torch = pytest.importorskip("torch")
+
+    grad = torch.ones(2, 156)
+    frozen = c3d_to_smpl._make_pose_freeze_hook(
+        66,
+        optimize_toes=True,
+        enforce_knee_hinge=True,
+    )(grad)
+
+    assert torch.all(frozen[:, [13, 14, 16, 17]] == 0.0)
+    assert torch.all(frozen[:, [12, 15]] == 1.0)
+    free = c3d_to_smpl._stagei_free_pose_indices(
+        66,
+        optimize_toes=True,
+        enforce_knee_hinge=True,
+    )
+    assert {13, 14, 16, 17}.isdisjoint(free)
+    assert {12, 15}.issubset(free)
 
 
 def test_load_stagei_head_marker_correlation_matches_moshpp_activation(tmp_path) -> None:
@@ -459,6 +513,7 @@ def test_fit_smpl_to_c3d_cached_uses_existing_cache(tmp_path) -> None:
         betas=np.arange(10, dtype=np.float32),
         fps=np.array(120.0, dtype=np.float32),
         gender=np.array("neutral"),
+        debug_json=np.array('{"marker_error":{"mean_mm":12.5}}'),
     )
 
     result = c3d_to_smpl.fit_smpl_to_c3d_cached("sample.c3d", "smpl_dir", cache_dir=str(cache_dir))
@@ -469,6 +524,55 @@ def test_fit_smpl_to_c3d_cached_uses_existing_cache(tmp_path) -> None:
     np.testing.assert_array_equal(result["betas"], np.arange(10, dtype=np.float32))
     assert result["fps"] == 120.0
     assert result["gender"] == "neutral"
+    assert result["debug"] == {"marker_error": {"mean_mm": 12.5}}
+
+
+def test_stage2_marker_weights_are_explicit_and_validated() -> None:
+    weights = c3d_to_smpl._resolve_stage2_marker_weights(
+        ["C7", "LHEE", "LTOE"], {"LHEE": 3.0, "LTOE": 2.0}
+    )
+    np.testing.assert_allclose(weights, [1.0, 3.0, 2.0])
+
+    with pytest.raises(ValueError, match="unavailable canonical labels"):
+        c3d_to_smpl._resolve_stage2_marker_weights(["C7"], {"LHEE": 3.0})
+    with pytest.raises(ValueError, match="finite and positive"):
+        c3d_to_smpl._resolve_stage2_marker_weights(["LHEE"], {"LHEE": 0.0})
+
+
+def test_stage2_marker_weights_change_fit_cache_key() -> None:
+    base = c3d_to_smpl._cache_suffix_for_fit("smpl_dir", {})
+    weighted = c3d_to_smpl._cache_suffix_for_fit(
+        "smpl_dir", {"stage2_marker_weight_overrides": {"LHEE": 3.0}}
+    )
+    assert weighted != base
+
+
+def test_fit_cache_key_tracks_source_content_and_torso_weight(tmp_path) -> None:
+    source = tmp_path / "sample.c3d"
+    source.write_bytes(b"first capture")
+    first = c3d_to_smpl._cache_suffix_for_fit("smpl_dir", {}, c3d_path=source)
+    weighted = c3d_to_smpl._cache_suffix_for_fit(
+        "smpl_dir",
+        {"stage2_torso_frame_weight": 2.0},
+        c3d_path=source,
+    )
+    source.write_bytes(b"changed capture")
+    changed = c3d_to_smpl._cache_suffix_for_fit("smpl_dir", {}, c3d_path=source)
+
+    assert weighted != first
+    assert changed != first
+
+
+def test_c3d_fit_reports_unavailable_cuda_before_loading_markers(tmp_path, monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="cannot access CUDA"):
+        c3d_to_smpl.fit_smpl_to_c3d(
+            str(tmp_path / "missing.c3d"),
+            str(tmp_path / "models"),
+            device="cuda",
+        )
 
 
 def test_fit_smpl_to_c3d_cached_clear_cache_refits_existing_cache(tmp_path, monkeypatch) -> None:
@@ -497,6 +601,7 @@ def test_fit_smpl_to_c3d_cached_clear_cache_refits_existing_cache(tmp_path, monk
             "betas": np.zeros(10, dtype=np.float32),
             "fps": 30.0,
             "gender": "male",
+            "debug": {"marker_error": {"mean_mm": 4.0}},
         }
 
     monkeypatch.setattr(c3d_to_smpl, "fit_smpl_to_c3d", fit_smpl_to_c3d)
@@ -514,6 +619,7 @@ def test_fit_smpl_to_c3d_cached_clear_cache_refits_existing_cache(tmp_path, monk
     np.testing.assert_array_equal(written["pose_aa"], np.zeros((1, 72), dtype=np.float32))
     assert float(written["fps"]) == 30.0
     assert str(written["gender"]) == "male"
+    assert json.loads(str(written["debug_json"])) == {"marker_error": {"mean_mm": 4.0}}
 
 
 def test_mosh_gmm_pose_prior_matches_single_gaussian_cost(tmp_path) -> None:
@@ -584,6 +690,43 @@ def test_resolve_smplx_model_file_checks_smplx_subdirectory(tmp_path) -> None:
 
     assert resolved == model_file
     assert ext == "npz"
+
+
+def test_resolve_smplh_model_file_checks_smplh_subdirectory(tmp_path) -> None:
+    model_dir = tmp_path / "smplh"
+    model_dir.mkdir()
+    model_file = model_dir / "SMPLH_NEUTRAL.npz"
+    model_file.write_bytes(b"placeholder")
+
+    resolved, ext = c3d_to_smpl._resolve_smplh_model_file(tmp_path, "neutral")
+
+    assert resolved == model_file
+    assert ext == "npz"
+
+
+def test_resolve_smplh_model_file_reports_expected_gender_assets(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match=r"No male SMPL-H model.*SMPLH_MALE\.pkl"):
+        c3d_to_smpl._resolve_smplh_model_file(tmp_path, "male")
+
+
+def test_resolve_smplh_model_file_reports_missing_explicit_file(tmp_path) -> None:
+    model_file = tmp_path / "SMPLH_NEUTRAL.pkl"
+
+    with pytest.raises(FileNotFoundError, match="SMPL-H model file not found"):
+        c3d_to_smpl._resolve_smplh_model_file(model_file, "neutral")
+
+
+def test_make_surface_model_rejects_plain_smpl_npz_as_smplh(tmp_path) -> None:
+    model_file = tmp_path / "SMPLH_NEUTRAL.npz"
+    np.savez(model_file, v_template=np.zeros((10, 3)))
+
+    with pytest.raises(ValueError, match="missing required hand parameters"):
+        c3d_to_smpl._make_surface_model(
+            surface_model_type="smplh",
+            smpl_model_path=str(model_file),
+            gender="neutral",
+            device="cpu",
+        )
 
 
 def test_point_to_triangle_distance_handles_face_and_edge_regions() -> None:

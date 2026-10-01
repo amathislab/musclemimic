@@ -70,9 +70,7 @@ def expand_obs_indices_for_history(
 
         dtype = obs_ind_np.dtype
         if state_positions.size:
-            state_expanded = np.concatenate(
-                [state_positions + i * state_dim for i in range(n_steps)]
-            ).astype(dtype)
+            state_expanded = np.concatenate([state_positions + i * state_dim for i in range(n_steps)]).astype(dtype)
         else:
             state_expanded = np.array([], dtype=dtype)
 
@@ -88,7 +86,13 @@ def expand_obs_indices_for_history(
         return jnp.concatenate([obs_ind + i * obs_len for i in range(n_steps)])
 
 
-def wrap_env(env: Any, config: DictConfig) -> Any:
+def wrap_env(
+    env: Any,
+    config: DictConfig,
+    *,
+    axis_name: str | None = None,
+    normalize_reward: bool | None = None,
+) -> Any:
     """
     Apply standard wrappers for RL training.
 
@@ -98,6 +102,7 @@ def wrap_env(env: Any, config: DictConfig) -> Any:
     Args:
         env: base environment
         config: experiment config with normalize_env, gamma, len_obs_history
+        axis_name: pmap axis used to aggregate reward statistics globally
 
     Returns:
         wrapped environment
@@ -114,7 +119,8 @@ def wrap_env(env: Any, config: DictConfig) -> Any:
         env = LogWrapper(env)
         env = VecEnv(env)
 
-    if config.normalize_env:
-        env = NormalizeVecReward(env, config.gamma)
+    should_normalize_reward = bool(config.normalize_env) if normalize_reward is None else normalize_reward
+    if should_normalize_reward:
+        env = NormalizeVecReward(env, config.gamma, axis_name=axis_name)
 
     return env

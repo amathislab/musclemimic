@@ -581,6 +581,48 @@ def load_c3d_markers(path: str) -> tuple[np.ndarray, list[str], float]:
     return points, labels, fps
 
 
+def load_marker_archive(path: str | Path) -> tuple[np.ndarray, list[str], float]:
+    """Load a portable marker trajectory archive.
+
+    Marker archives are a small interchange format for sources such as TRC that
+    do not need to be round-tripped through C3D.  Coordinates must already be in
+    metres in the same Z-up world frame expected by :func:`load_c3d_markers`.
+    Additional provenance arrays may be stored alongside the three required
+    fields and are deliberately ignored here.
+    """
+
+    archive_path = Path(path)
+    with np.load(archive_path, allow_pickle=False) as data:
+        required = {"positions", "labels", "fps"}
+        missing = sorted(required - set(data.files))
+        if missing:
+            raise ValueError(f"Marker archive {archive_path} is missing: {', '.join(missing)}")
+        positions = np.asarray(data["positions"], dtype=np.float32)
+        labels = [str(label) for label in np.asarray(data["labels"]).reshape(-1)]
+        fps = float(np.asarray(data["fps"]).reshape(()))
+
+    if positions.ndim != 3 or positions.shape[-1] != 3:
+        raise ValueError(f"Expected marker positions with shape (T, N, 3), got {positions.shape}")
+    if positions.shape[1] != len(labels):
+        raise ValueError(
+            f"Marker archive {archive_path} has {positions.shape[1]} marker columns but {len(labels)} labels"
+        )
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError(f"Marker archive {archive_path} has invalid fps={fps!r}")
+    return positions, labels, fps
+
+
+def load_marker_trajectory(path: str | Path) -> tuple[np.ndarray, list[str], float]:
+    """Load a C3D file or a portable ``.npz`` marker archive."""
+
+    marker_path = Path(path)
+    if marker_path.suffix.lower() == ".c3d":
+        return load_c3d_markers(str(marker_path))
+    if marker_path.suffix.lower() == ".npz":
+        return load_marker_archive(marker_path)
+    raise ValueError(f"Unsupported marker trajectory {marker_path}; expected a .c3d or marker .npz file")
+
+
 def _nanmean_with_all_nan(values: np.ndarray, axis: int) -> np.ndarray:
     values = np.asarray(values, dtype=np.float32)
     valid = ~np.isnan(values)

@@ -1,5 +1,6 @@
 import glob
 import hashlib
+import json
 import logging
 import os
 import time
@@ -97,7 +98,6 @@ from loco_mujoco.datasets.data_generation.utils import add_mocap_bodies
 from loco_mujoco.smpl import SMPLH_BONE_ORDER_NAMES
 from loco_mujoco.smpl.utils.smoothing import gaussian_filter_1d_batch
 from loco_mujoco.trajectory import (
-    LoadedTrajectorySet,
     Trajectory,
     TrajectoryCacheType,
     TrajectoryData,
@@ -110,6 +110,104 @@ from musclemimic.utils.gmr_cache import try_download_gmr_cache
 
 OPTIMIZED_SHAPE_FILE_NAME = "shape_optimized.pkl"
 BIMANUAL_ENV_NAME = "MyoBimanualArm"
+
+# TERRA and OmniRetarget share low-level adapter code, but they are distinct methods with
+# distinct cache namespaces and provenance records.
+TERRA_ADAPTER_METHODS = frozenset({"terra", "omniretarget"})
+RETARGETING_CACHE_DIRS = {
+    "smpl": "smpl",
+    "gmr": "gmr",
+    "terra": "terra",
+    "omniretarget": "omniretarget",
+}
+
+
+def _scalar_joint_velocity_limits(model: mujoco.MjModel, limit: float) -> dict[str, float]:
+    """Return Mink-compatible limits for the model's scalar joint coordinates.
+
+    GMR's generic implementation assumes actuator names are also MuJoCo joint names.
+    That holds for position-controlled robots, but not for MyoFullBody: its actuators are
+    muscles (for example ``Ps_L1_VB_r``), while Mink's ``VelocityLimit`` resolves
+    dictionary keys as joints. Constrain named hinge and slide joints directly and leave
+    the free root unconstrained, matching GMR's per-articulated-coordinate intent.
+    """
+    value = float(limit)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"joint velocity limit must be positive and finite, got {limit!r}")
+    scalar_types = {mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE}
+    limits: dict[str, float] = {}
+    for joint_id in range(model.njnt):
+        if model.jnt_type[joint_id] not in scalar_types:
+            continue
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        if not name:
+            raise ValueError(f"scalar MuJoCo joint {joint_id} has no name")
+        limits[name] = value
+    if not limits:
+        raise ValueError("model has no named hinge or slide joints for velocity limiting")
+    return limits
+
+
+def _file_sha256(path: str | os.PathLike) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_terra():
+    """Import the optional standalone TERRA package with an actionable error."""
+    try:
+        import terra
+    except ImportError as exc:
+        raise ImportError(
+            "retargeting_method='terra' and 'omniretarget' require the standalone "
+            "terra-retargeting package"
+        ) from exc
+    return terra
+
+
+def _resolve_terra_adapter_config(retargeting_method: str | None, terra_config: dict | None) -> dict | None:
+    """Bind a TERRA-adapter method to the matching immutable method profile."""
+    if retargeting_method not in TERRA_ADAPTER_METHODS:
+        return terra_config
+    resolved = dict(terra_config or {})
+    configured_profile = resolved.get("method_profile")
+    if configured_profile not in {None, retargeting_method}:
+        raise ValueError(
+            f"retargeting_method={retargeting_method!r} conflicts with "
+            f"method_profile={configured_profile!r}; select the method explicitly"
+        )
+    resolved["method_profile"] = retargeting_method
+    return resolved
+
+
+def retargeting_cache_subdir(retargeting_method: str | None, output_cache_subdir: str | None = None) -> str:
+    """Return a validated cache namespace for a retargeting algorithm.
+
+    The returned value is always one relative path component.  Rejecting traversal here
+    makes every caller inherit the benchmark's non-overlap guarantee.
+    """
+    method = retargeting_method or "smpl"
+    if method not in RETARGETING_CACHE_DIRS:
+        raise ValueError(f"Unknown retargeting method {method!r}; known: {sorted(RETARGETING_CACHE_DIRS)}")
+    subdir = RETARGETING_CACHE_DIRS[method] if output_cache_subdir is None else output_cache_subdir
+    path = Path(str(subdir))
+    if not str(subdir) or path.is_absolute() or len(path.parts) != 1 or path.parts[0] in {".", ".."}:
+        raise ValueError(f"output cache subdirectory must be one relative path component, got {subdir!r}")
+    return path.parts[0]
+
+
+def retargeting_cache_dir(
+    cache_root: str | os.PathLike,
+    env_name: str,
+    retargeting_method: str | None,
+    output_cache_subdir: str | None = None,
+) -> Path:
+    """Directory containing one method's trajectories."""
+    cache_env_name = env_name.replace("Mjx", "")
+    return Path(cache_root) / cache_env_name / retargeting_cache_subdir(retargeting_method, output_cache_subdir)
 
 
 def _fps_after_frame_skip(source_fps, skip: int) -> float:
@@ -196,6 +294,46 @@ def _record_site_kinematics(
         site_xpos[frame_idx] = data.site_xpos[site_ids]
         site_xmat[frame_idx] = data.site_xmat[site_ids]
     return site_xpos, site_xmat
+
+
+def _resolve_gmr_terrain(value):
+    """Resolve GMR's optional terrain configuration to a ``TerrainSpec``.
+
+    GMR itself only exposes a scalar ground offset.  The local wrapper accepts the same
+    serialisable terrain description used by TERRA so its per-frame grounding can target
+    the surface under the point GMR selected instead of the hard-coded ``z=0`` plane.
+    """
+    if value is None:
+        return None
+
+    from loco_mujoco.core.terrain import TerrainSpec
+
+    if isinstance(value, TerrainSpec):
+        return value
+    if isinstance(value, dict):
+        return TerrainSpec.from_dict(value)
+    return TerrainSpec.load(value)
+
+
+def _gmr_terrain_ground_height(terrain, grounded_human_data: dict) -> float:
+    """Return the walkable terrain height under GMR's grounding reference point.
+
+    Upstream GMR selects the lowest transformed human body and translates that point to
+    zero.  ``grounded_human_data`` is the exact transformed dictionary retained by GMR
+    after that operation.  Selecting its lowest entry therefore mirrors upstream's datum;
+    only the target height changes.  Seats are deliberately excluded because they are
+    obstacles, not ground a foot should be placed on.
+    """
+    if terrain is None or terrain.is_flat:
+        return 0.0
+    if not grounded_human_data:
+        raise ValueError("GMR produced no transformed human bodies for terrain grounding")
+
+    positions = np.asarray([value[0] for value in grounded_human_data.values()], dtype=float)
+    if positions.ndim != 2 or positions.shape[1] != 3 or not np.isfinite(positions).all():
+        raise ValueError(f"invalid GMR transformed body positions: shape={positions.shape}")
+    reference = positions[int(np.argmin(positions[:, 2]))]
+    return float(terrain.walkable.height_at(reference[0], reference[1]))
 
 
 def ensure_pytorch_precision_consistency():
@@ -602,6 +740,10 @@ def fit_smpl_motion(
         "pos_error": dist_array,
         "retarget_fps": retarget_fps,
         "site_names": sites_for_mimic,
+        "native_fps": fps,
+        "native_frame_count": len(qpos),
+        "trim_start_frames": 1,
+        "trim_end_frames": 1,
     }
 
     return Trajectory(traj_info, traj_data), analysis
@@ -674,10 +816,21 @@ def ensure_gmr_fitted_shape(
     fitted_path = get_gmr_fitted_shape_path(env_name, gmr_robot)
     metadata_path = fitted_path.replace("_shape.pkl", "_shape_metadata.json")
 
-    # Check if fitted shape already exists
+    # A pre-existing pair still has to be loadable; existence alone is not a readiness
+    # signal after an interrupted or manually copied fit.
     if os.path.exists(fitted_path) and os.path.exists(metadata_path):
-        logger.info(f"Found existing fitted shape: {fitted_path}")
-        return fitted_path
+        try:
+            cached = joblib.load(fitted_path)
+            json.loads(Path(metadata_path).read_text())
+            if cached is None:
+                raise ValueError("empty fitted shape")
+            logger.info(
+                f"Found validated fitted shape: {fitted_path} "
+                f"(sha256={_file_sha256(fitted_path)})"
+            )
+            return fitted_path
+        except Exception as exc:
+            logger.warning(f"Existing GMR fitted shape is invalid and will be replaced: {exc}")
 
     # Need to run shape fitting
     logger.info(f"Fitted shape not found for '{gmr_robot}', running shape fitting...")
@@ -732,22 +885,62 @@ def ensure_gmr_fitted_shape(
         robot_type=gmr_robot,
     )
 
-    # Save fitted shape
-    save_fitted_shape(
-        shape=shape,
-        scale=scale,
-        smpl2robot_pos=smpl2robot_pos,
-        smpl2robot_rot_mat=smpl2robot_rot_mat,
-        offset_z=offset_z,
-        height_scale=height_scale,
-        metrics=metrics,
-        save_path=fitted_path,
-        human_joint_names=human_joint_names,
-        local_offsets=local_offsets,
-    )
+    # Publish both files only after a complete, loadable fit.  Motion workers use the shape
+    # file as their readiness signal, so it is atomically renamed last.
+    nonce = f"{os.getpid()}_{time.time_ns()}"
+    temp_path = str(Path(fitted_path).with_name(f".gmr_{nonce}_shape.pkl"))
+    temp_metadata = temp_path.replace("_shape.pkl", "_shape_metadata.json")
+    try:
+        save_fitted_shape(
+            shape=shape,
+            scale=scale,
+            smpl2robot_pos=smpl2robot_pos,
+            smpl2robot_rot_mat=smpl2robot_rot_mat,
+            offset_z=offset_z,
+            height_scale=height_scale,
+            metrics=metrics,
+            save_path=temp_path,
+            human_joint_names=human_joint_names,
+            local_offsets=local_offsets,
+        )
+        loaded = joblib.load(temp_path)
+        if loaded is None or not Path(temp_metadata).exists():
+            raise RuntimeError("GMR fitted-shape staging files failed validation")
+        os.replace(temp_metadata, metadata_path)
+        os.replace(temp_path, fitted_path)
+    finally:
+        for staged in (temp_path, temp_metadata):
+            try:
+                os.unlink(staged)
+            except FileNotFoundError:
+                pass
 
-    logger.info(f"Saved fitted shape to: {fitted_path}")
+    logger.info(
+        f"Saved fitted shape atomically to: {fitted_path} "
+        f"(sha256={_file_sha256(fitted_path)})"
+    )
     return fitted_path
+
+
+def prepare_gmr_fitted_shape(env_name: str = "MyoFullBody", iterations: int = 500) -> str:
+    """Fit and validate the benchmark GMR shape before any motion pool starts."""
+    if not _GMR_SHAPE_FITTING_INSTALLED:
+        raise ImportError("GMR shape fitting is unavailable; install the 'gmr' and 'smpl' extras")
+    base_env_name = env_name.replace("Mjx", "")
+    if base_env_name != "MyoFullBody":
+        raise ValueError("the baseline GMR shape stage currently supports MyoFullBody only")
+    logger = setup_logger("gmr-shape", identifier="[GMR benchmark shape]")
+    robot_xml = get_xml_path("myofullbody")
+    ik_config = Path(__file__).parent / "gmr_configs" / "smplh_to_myofullbody.json"
+    return ensure_gmr_fitted_shape(
+        env_name=env_name,
+        gmr_robot="myofullbody",
+        robot_xml_path=str(robot_xml),
+        ik_config_path=str(ik_config),
+        smpl_model_path=get_smpl_model_path(),
+        logger=logger,
+        iterations=iterations,
+    )
 
 
 def fit_gmr_motion(
@@ -768,17 +961,18 @@ def fit_gmr_motion(
         motion_data: AMASS file path (str)
         logger: Logger instance
         gmr_config: GMR configuration dict (optional)
-            offset_to_ground: If True, finds lowest foot and offsets body to ground.
+            offset_to_ground: If True, finds the lowest transformed body and offsets it to ground.
+            terrain: Optional ``TerrainSpec``, terrain dict, or JSON path. When supplied,
+                the grounding reference is placed at the local walkable surface height.
 
     Returns:
         tuple[Trajectory, dict]: Trajectory at GMR's native fps (~30Hz) and analysis data
             containing pos_error and retarget_fps. Use extend_motion() to get model-aligned source data.
 
     Note:
-        The GMR package's offset_human_data_to_ground method uses a hardcoded ground_offset.
-        For feet-on-ground behavior matching LocoMuJoCo, modify the installed package:
-        .venv/lib/.../general_motion_retargeting/motion_retarget.py line ~289:
-        Change: we find lowest body parts and reset the frame during ground_offset calculations
+        Upstream GMR's ``offset_human_data_to_ground`` uses a hard-coded ``z=0`` target.
+        This wrapper preserves its selected reference point and, when ``terrain`` is
+        supplied, translates the solved robot to the terrain height under that point.
     """
     if not _GMR_INSTALLED:
         raise ImportError(
@@ -800,6 +994,13 @@ def fit_gmr_motion(
     verbose = gmr_config.get("verbose", False)
     use_fitted_shape = gmr_config.get("use_fitted_shape", True)  # Default to True
     shape_fitting_iterations = gmr_config.get("shape_fitting_iterations", 500)
+    terrain = _resolve_gmr_terrain(gmr_config.get("terrain"))
+    on_terrain = terrain is not None and not terrain.is_flat
+    if on_terrain and not offset_to_ground:
+        logger.warning(
+            "GMR terrain was supplied with offset_to_ground disabled; preserving the "
+            "source vertical trajectory instead of adding a second terrain offset"
+        )
 
     # Map environment to GMR robot name
     env_to_gmr_robot = {
@@ -812,7 +1013,7 @@ def fit_gmr_motion(
     gmr_robot = env_to_gmr_robot[base_env_name]
 
     # Get smpl model path
-    smpl_model_path = get_smpl_model_path()
+    smpl_model_path = gmr_config.get("smpl_model_path") or get_smpl_model_path()
     if not os.path.exists(smpl_model_path):
         raise FileNotFoundError(
             f"SMPL-H models not found at {smpl_model_path}\nPlease download SMPL-H models to this location."
@@ -871,13 +1072,17 @@ def fit_gmr_motion(
 
     # Initialize GMR
     logger.info(f"GMR init: robot={gmr_robot}, solver={solver}, use_fitted_shape={use_fitted_shape}")
+    # Upstream GMR builds its velocity dictionary from actuator names. MyoFullBody
+    # actuators are muscles rather than joints, so defer this limit until after the
+    # finger-disabled environment model has been installed below.
+    deferred_velocity_limit = use_velocity_limit and gmr_robot == "myofullbody"
     retarget = GeneralMotionRetargeting(
         actual_human_height=actual_human_height,
         src_human=src_human,
         tgt_robot=gmr_robot,
         solver=solver,
         damping=damping,
-        use_velocity_limit=use_velocity_limit,
+        use_velocity_limit=use_velocity_limit and not deferred_velocity_limit,
         verbose=verbose,
         use_fitted_shape=use_fitted_shape,
         fitted_shape_path=fitted_shape_path,
@@ -908,8 +1113,9 @@ def fit_gmr_motion(
         retarget.setup_retarget_configuration()
         retarget.ik_limits = [mink.ConfigurationLimit(retarget.model)]
         if use_velocity_limit:
-            velocity_limits = dict.fromkeys(retarget.robot_motor_names.keys(), 3 * np.pi)
+            velocity_limits = _scalar_joint_velocity_limits(retarget.model, 3 * np.pi)
             retarget.ik_limits.append(mink.VelocityLimit(retarget.model, velocity_limits))
+            logger.info("Velocity limits enabled on %d scalar joint(s)", len(velocity_limits))
         logger.info("Model replaced and GMR reconfigured")
 
     if gmr_robot == "myofullbody":
@@ -956,6 +1162,7 @@ def fit_gmr_motion(
     qpos_list = []
     dist_list = []
     lowest_z_list = []
+    terrain_height_list = []
     model = retarget.configuration.model
     data = retarget.configuration.data
     traj_site_names = getattr(env, "sites_for_mimic", None)
@@ -973,6 +1180,14 @@ def fit_gmr_motion(
             logger.info(f"  {i}/{len(smplh_frames)} frames")
         qpos_frame, dist = retarget.retarget(frame, offset_to_ground=offset_to_ground)
 
+        # Upstream GMR has just translated its lowest transformed body to z=0. Put that
+        # same reference point on the actual walkable surface. Querying the transformed
+        # dictionary (rather than raw AMASS coordinates) keeps this in GMR's scaled world
+        # frame and exactly matches the reference point its correction selected.
+        terrain_height = (
+            _gmr_terrain_ground_height(terrain, retarget.scaled_human_data) if on_terrain and offset_to_ground else 0.0
+        )
+
         data.qpos[:] = qpos_frame
         mujoco.mj_forward(model, data)
 
@@ -981,6 +1196,7 @@ def fit_gmr_motion(
         qpos_list.append(qpos_frame.copy())
         dist_list.append(dist.copy())
         lowest_z_list.append(lowest_z)
+        terrain_height_list.append(terrain_height)
 
     t_total = time.perf_counter() - t_start
     retarget_fps = len(smplh_frames) / t_total if t_total > 0 else float("inf")
@@ -999,11 +1215,42 @@ def fit_gmr_motion(
     if global_lowest_geom_z > 0.0:
         qpos[:, 2] -= global_lowest_geom_z
 
-    for i in range(len(qpos)):
-        data.qpos[:] = qpos[i]
-        mujoco.mj_forward(model, data)
+    if on_terrain and offset_to_ground:
+        terrain_heights = np.asarray(terrain_height_list, dtype=float)
+        qpos[:, 2] += terrain_heights
+        logger.info(
+            f"Terrain-aware GMR grounding: target height {terrain_heights.min():.3f}..{terrain_heights.max():.3f} m"
+        )
 
-        pen, _geom_id, _floor_id = max_penetration_with_floor(model, data)
+    alignment_model, alignment_data = model, data
+    environment_geom_ids = None
+    if on_terrain:
+        # GMR solves against its ordinary robot model. Use a second, nq-compatible model
+        # containing the authoritative terrain solely for the same post-hoc penetration
+        # lift the flat path performs against the floor.
+        from musclemimic.environments.humanoids.myofullbody import MyoFullBody
+        from musclemimic.retargeting import scene_geom_ids
+
+        alignment_kwargs = dict(robot_conf.env_params)
+        alignment_kwargs.update(terrain_type="BoxTerrain", terrain_params=terrain.to_env_params())
+        alignment_env = MyoFullBody(**alignment_kwargs)
+        alignment_model, alignment_data = alignment_env._model, alignment_env._data
+        if alignment_model.nq != model.nq:
+            raise ValueError(
+                "GMR terrain alignment model is not qpos-compatible with the solver model: "
+                f"{alignment_model.nq} != {model.nq}"
+            )
+        environment_geom_ids = scene_geom_ids(alignment_model)
+        from musclemimic.retargeting import max_penetration_with_geoms
+
+    for i in range(len(qpos)):
+        alignment_data.qpos[:] = qpos[i]
+        mujoco.mj_forward(alignment_model, alignment_data)
+
+        if environment_geom_ids is None:
+            pen, _geom_id, _floor_id = max_penetration_with_floor(alignment_model, alignment_data)
+        else:
+            pen = max_penetration_with_geoms(alignment_model, alignment_data, environment_geom_ids)
 
         if pen < 0.0:
             qpos[i, 2] -= pen
@@ -1067,7 +1314,20 @@ def fit_gmr_motion(
         "pos_error": dist_array,
         "retarget_fps": retarget_fps,
         "site_names": getattr(env, "sites_for_mimic", None),
+        "native_fps": aligned_fps,
+        "native_frame_count": len(qpos),
+        "trim_start_frames": 1,
+        "trim_end_frames": 1,
+        "smpl_model_path": str(Path(smpl_model_path).expanduser().resolve()),
     }
+    if fitted_shape_path is not None:
+        analysis.update(
+            fitted_shape_path=str(Path(fitted_shape_path).expanduser().resolve()),
+            fitted_shape_sha256=_file_sha256(fitted_shape_path),
+        )
+    if on_terrain:
+        analysis["terrain"] = terrain.to_dict()
+        analysis["terrain_ground_height"] = np.asarray(terrain_height_list, dtype=np.float32)[1:-1]
 
     return Trajectory(traj_info, traj_data), analysis
 
@@ -1543,7 +1803,12 @@ def motion_transfer_robot_to_robot(
 
 
 def extend_motion(
-    env_name: str, env_params: DictConfig, traj: Trajectory, logger: logging.Logger | None = None
+    env_name: str,
+    env_params: DictConfig,
+    traj: Trajectory,
+    logger: logging.Logger | None = None,
+    *,
+    clip_trajectory_to_joint_ranges: bool = False,
 ) -> Trajectory:
     """
     Extend a motion trajectory to include more model-specific entities
@@ -1578,7 +1843,14 @@ def extend_motion(
         env_name = env_name.replace("Mjx", "")
 
     env_cls = Mujoco.registered_envs[env_name]
-    env = env_cls(**env_params, th_params={"random_start": False, "fixed_start_conf": (0, 0)})
+    env = env_cls(
+        **env_params,
+        th_params={
+            "random_start": False,
+            "fixed_start_conf": (0, 0),
+            "clip_trajectory_to_joint_ranges": clip_trajectory_to_joint_ranges,
+        },
+    )
 
     original_frequency = traj.info.frequency
     target_frequency = 1.0 / env.dt
@@ -1622,7 +1894,12 @@ def _prepare_gmr_cache_path(
     cache_root: str,
     clear_cache: bool,
     logger,
+    allow_download: bool = True,
 ) -> str:
+    if not allow_download:
+        # Local-only means the exact configured namespace. Resolving first could silently
+        # substitute a published demo-cache file, which is just another download cache.
+        return cache_path
     resolved_cache_path = _resolve_cache_path(cache_path)
     if clear_cache or os.path.exists(resolved_cache_path):
         return resolved_cache_path
@@ -1639,6 +1916,169 @@ def _prepare_gmr_cache_path(
     return _resolve_cache_path(str(downloaded_path))
 
 
+def _jsonable_config(value):
+    """Convert run configuration values to deterministic JSON-compatible objects."""
+    if isinstance(value, dict):
+        return {str(k): _jsonable_config(v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_config(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "to_dict"):
+        return _jsonable_config(value.to_dict())
+    return repr(value)
+
+
+def _benchmark_analysis_metadata(
+    *,
+    motion_name: str,
+    trajectory: Trajectory,
+    analysis: dict,
+    retargeting_method: str,
+    output_cache_subdir: str,
+    config: dict | None,
+    allow_cache_download: bool,
+) -> dict:
+    """Metadata needed to audit and align one locally generated benchmark cache."""
+    import subprocess
+    from importlib.metadata import PackageNotFoundError, version
+
+    from musclemimic.utils.retarget.benchmark_timeline import central_difference_timeline
+
+    source = load_amass_data(motion_name)
+    source_frames = len(source["pose_aa"])
+    source_fps = float(np.asarray(source["fps"]).squeeze())
+    native_frames = int(analysis["native_frame_count"])
+    native_fps = float(analysis["native_fps"])
+    output_frames = int(np.asarray(trajectory.data.qpos).shape[0])
+    output_fps = float(trajectory.info.frequency)
+    timeline = central_difference_timeline(
+        source_frame_count=source_frames,
+        source_fps=source_fps,
+        native_frame_count=native_frames,
+        native_fps=native_fps,
+        output_frame_count=output_frames,
+        output_fps=output_fps,
+    )
+
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        commit = "unknown"
+    revisions = {}
+    for package in ("musclemimic", "loco-mujoco", "holosoma-retargeting", "general-motion-retargeting"):
+        try:
+            revisions[package] = version(package)
+        except PackageNotFoundError:
+            revisions[package] = "not-installed"
+
+    if analysis.get("resolved_config_json"):
+        resolved = json.loads(str(analysis["resolved_config_json"]))
+    else:
+        resolved = _jsonable_config(config or {})
+    metadata = timeline.to_analysis() | {
+        "retargeting_method": retargeting_method,
+        "output_cache_subdir": output_cache_subdir,
+        "local_retargeting": True,
+        "cache_download_allowed": bool(allow_cache_download),
+        "resolved_config_json": json.dumps(resolved, sort_keys=True, separators=(",", ":")),
+        "source_git_commit": commit,
+        "dependency_revisions_json": json.dumps(revisions, sort_keys=True),
+    }
+    projection_metadata = trajectory.info.metadata or {}
+    for key in (
+        "joint_range_projection_frame_count",
+        "joint_range_projection_value_count",
+        "joint_range_projection_max_abs",
+        "joint_range_projection_angular_frame_count",
+        "joint_range_projection_angular_value_count",
+        "joint_range_projection_angular_max_abs",
+        "joint_range_projection_material_angular_threshold",
+        "joint_range_projection_material_angular_frame_count",
+        "joint_range_projection_material_angular_value_count",
+        "joint_range_projection_by_joint_json",
+        "joint_range_interpolation_rescue_frame_count",
+        "joint_range_interpolation_rescue_value_count",
+        "joint_range_interpolation_rescue_max_abs",
+        "joint_range_interpolation_rescue_angular_frame_count",
+        "joint_range_interpolation_rescue_angular_value_count",
+        "joint_range_interpolation_rescue_angular_max_abs",
+        "joint_range_interpolation_rescue_material_angular_threshold",
+        "joint_range_interpolation_rescue_material_angular_frame_count",
+        "joint_range_interpolation_rescue_material_angular_value_count",
+    ):
+        if key in projection_metadata:
+            metadata[key] = projection_metadata[key]
+    if "joint_range_projection_frames" in projection_metadata:
+        metadata["joint_range_projection_frames"] = np.asarray(
+            projection_metadata["joint_range_projection_frames"], dtype=int
+        )
+    for key in (
+        "joint_range_projection_angular_frames",
+        "joint_range_projection_material_angular_frames",
+        "joint_range_interpolation_rescue_frames",
+        "joint_range_interpolation_rescue_angular_frames",
+        "joint_range_interpolation_rescue_material_angular_frames",
+    ):
+        if key in projection_metadata:
+            metadata[key] = np.asarray(projection_metadata[key], dtype=int)
+    if "joint_range_projection_frame_count" in projection_metadata:
+        metadata["joint_range_projection_frame_pct"] = (
+            100.0 * int(projection_metadata["joint_range_projection_frame_count"]) / max(output_frames, 1)
+        )
+    if "joint_range_interpolation_rescue_frame_count" in projection_metadata:
+        metadata["joint_range_interpolation_rescue_frame_pct"] = (
+            100.0 * int(projection_metadata["joint_range_interpolation_rescue_frame_count"]) / max(output_frames, 1)
+        )
+    for count_key, pct_key in (
+        (
+            "joint_range_interpolation_rescue_angular_frame_count",
+            "joint_range_interpolation_rescue_angular_frame_pct",
+        ),
+        (
+            "joint_range_interpolation_rescue_material_angular_frame_count",
+            "joint_range_interpolation_rescue_material_angular_frame_pct",
+        ),
+    ):
+        if count_key in projection_metadata:
+            metadata[pct_key] = 100.0 * int(projection_metadata[count_key]) / max(output_frames, 1)
+    for count_key, pct_key in (
+        (
+            "joint_range_projection_angular_frame_count",
+            "joint_range_projection_angular_frame_pct",
+        ),
+        (
+            "joint_range_projection_material_angular_frame_count",
+            "joint_range_projection_material_angular_frame_pct",
+        ),
+    ):
+        if count_key in projection_metadata:
+            metadata[pct_key] = 100.0 * int(projection_metadata[count_key]) / max(output_frames, 1)
+    if "terrain_sha256" in resolved:
+        metadata["terrain_sha256"] = resolved.get("terrain_sha256", "")
+    if retargeting_method in TERRA_ADAPTER_METHODS:
+        terra = _require_terra()
+
+        metadata["method_profile"] = resolved.get("method_profile", "terra")
+        terrain = resolved.get("terrain")
+        on_terrain = bool(terrain and terrain.get("boxes")) if isinstance(terrain, dict) else terrain is not None
+        metadata["active_qp_terms_json"] = json.dumps(terra.all_active_qp_terms(resolved, on_terrain=on_terrain))
+        metadata["terra_specific_qp_terms_json"] = json.dumps(terra.active_qp_terms(resolved, on_terrain=on_terrain))
+    return metadata
+
+
 def _load_trajectories_individually(
     env_name: str,
     dataset_list: list[str],
@@ -1646,21 +2086,31 @@ def _load_trajectories_individually(
     logger,
     retargeting_method: str | None = None,
     gmr_config: dict | None = None,
+    terra_config: dict | None = None,
     clear_cache: bool = False,
-) -> LoadedTrajectorySet:
-    """Load motions independently and keep source names aligned."""
-    path_to_converted_amass_datasets = get_converted_amass_dataset_path()
-    # MJX and MuJoCo share retargeted motion caches.
+    output_cache_subdir: str | None = None,
+    allow_cache_download: bool = True,
+    cache_root: str | os.PathLike | None = None,
+) -> Trajectory:
+    """
+    Process each dataset individually and concatenate only final trajectories.
+    This avoids dimensional incompatibilities during intermediate concatenation.
+    """
+    path_to_converted_amass_datasets = get_converted_amass_dataset_path() if cache_root is None else str(cache_root)
+    # Normalize environment name for cache consistency (MJX and non-MJX share same cache)
     cache_env_name = env_name.replace("Mjx", "") if "Mjx" in env_name else env_name
 
-    # Retargeting methods use separate cache namespaces.
-    if retargeting_method == "gmr":
-        path_robot_smpl_data = os.path.join(path_to_converted_amass_datasets, cache_env_name, "gmr")
-    else:
-        path_robot_smpl_data = os.path.join(path_to_converted_amass_datasets, cache_env_name)
+    path_robot_smpl_data = str(
+        retargeting_cache_dir(
+            path_to_converted_amass_datasets,
+            cache_env_name,
+            retargeting_method,
+            output_cache_subdir,
+        )
+    )
     os.makedirs(path_robot_smpl_data, exist_ok=True)
 
-    loaded_sets = []
+    final_trajectories = []
 
     for i, single_dataset in enumerate(dataset_list):
         cache_path = os.path.join(path_robot_smpl_data, f"{single_dataset}.npz")
@@ -1672,17 +2122,18 @@ def _load_trajectories_individually(
                 cache_root=path_to_converted_amass_datasets,
                 clear_cache=clear_cache,
                 logger=logger,
+                allow_download=allow_cache_download,
             )
-        else:
+        elif not clear_cache and allow_cache_download:
             cache_path = _resolve_cache_path(cache_path)
 
         if os.path.exists(cache_path) and not clear_cache:
             logger.info(
-                f"Dataset {i + 1}/{len(dataset_list)}: Found existing retargeted motion file at {cache_path}. Loading ..."
+                f"Dataset {i + 1}/{len(dataset_list)}: Found existing retargeted motion "
+                f"file at {cache_path}. Loading ..."
             )
-            # Keep cached arrays on the host while combining motions.
-            trajectory = Trajectory.load(cache_path, backend=np)
-            loaded_sets.append(LoadedTrajectorySet(trajectory, (single_dataset,)))
+            # Use NumPy to avoid GPU OOM; to_jax() called later in instantiate_env()
+            final_trajectories.append(Trajectory.load(cache_path, backend=np))
             continue
 
         method_name = retargeting_method.upper() if retargeting_method else "SMPL"
@@ -1690,58 +2141,67 @@ def _load_trajectories_individually(
         logger.info(f"Dataset {i + 1}/{len(dataset_list)}: {action} AMASS motion file using {method_name} ...")
 
         try:
-            loaded = load_retargeted_amass_trajectory_set(
+            single_trajectory = load_retargeted_amass_trajectory(
                 env_name,
                 single_dataset,
                 robot_conf,
                 retargeting_method=retargeting_method,
                 gmr_config=gmr_config,
+                terra_config=terra_config,
                 clear_cache=clear_cache,
+                output_cache_subdir=output_cache_subdir,
+                allow_cache_download=allow_cache_download,
+                cache_root=path_to_converted_amass_datasets,
             )
-            loaded_sets.append(loaded)
+            final_trajectories.append(single_trajectory)
         except Exception as e:
             logger.error(f"Skipping dataset '{single_dataset}' due to failure during retargeting: {e}")
             continue
 
-    if not loaded_sets:
-        raise RuntimeError(f"Retargeting produced no valid {env_name} trajectories.")
-    if len(loaded_sets) == 1:
-        return loaded_sets[0]
+    # Concatenate final trajectories
+    if len(final_trajectories) == 1:
+        result_trajectory = final_trajectories[0]
+    else:
+        logger.info(f"Concatenating {len(final_trajectories)} final {env_name} trajectories ...")
+        result_trajectory = Trajectory.concatenate(final_trajectories, backend=np)
+        logger.info("Final concatenation successful!")
 
-    logger.info(f"Concatenating {len(loaded_sets)} final {env_name} trajectories ...")
-    loaded = LoadedTrajectorySet.concatenate(loaded_sets, backend=np)
-    logger.info("Final concatenation successful!")
-    return loaded
+    return result_trajectory
 
 
 def load_retargeted_amass_trajectory(
     env_name: str,
-    dataset_name: str | list[str] | tuple[str, ...],
+    dataset_name: str | list[str],
     robot_conf: DictConfig = None,
     retargeting_method: str | None = None,
     gmr_config: dict | None = None,
+    terra_config: dict | None = None,
     clear_cache: bool = False,
+    output_cache_subdir: str | None = None,
+    allow_cache_download: bool = True,
+    cache_root: str | os.PathLike | None = None,
 ) -> Trajectory:
-    """Load retargeted AMASS trajectory data."""
-    return load_retargeted_amass_trajectory_set(
-        env_name=env_name,
-        dataset_name=dataset_name,
-        robot_conf=robot_conf,
-        retargeting_method=retargeting_method,
-        gmr_config=gmr_config,
-        clear_cache=clear_cache,
-    ).trajectory
+    """
+    Load a retargeted AMASS trajectory for a specific environment.
 
+    Args:
+        env_name: Name of the environment.
+        dataset_name: Dataset name(s) to process.
+        robot_conf: Robot configuration (optional).
+        retargeting_method: ``"smpl"``, ``"gmr"``, ``"terra"``, or
+            ``"omniretarget"`` (optional, overrides robot_conf).
+        gmr_config: GMR configuration dict (optional, overrides robot_conf).
+        terra_config: TERRA adapter configuration (optional, overrides robot_conf).
+        clear_cache: If True, overwrite existing cached files instead of loading them.
+        output_cache_subdir: Cache namespace independent of ``retargeting_method``.
+        allow_cache_download: Whether a missing GMR trajectory may be fetched. Benchmark
+            runs set this false so every GMR sidecar proves a local solve.
+        cache_root: Optional converted-AMASS cache root override.
 
-def load_retargeted_amass_trajectory_set(
-    env_name: str,
-    dataset_name: str | list[str] | tuple[str, ...],
-    robot_conf: DictConfig = None,
-    retargeting_method: str | None = None,
-    gmr_config: dict | None = None,
-    clear_cache: bool = False,
-) -> LoadedTrajectorySet:
-    """Load retargeted AMASS trajectories with their source names."""
+    Returns:
+        Trajectory: The retargeted trajectories.
+
+    """
     logger = setup_logger("amass", identifier="[MuscleMimic AMASS Retargeting Pipeline]")
 
     # if robot_conf is not provided, load default one it from the YAML file
@@ -1753,6 +2213,9 @@ def load_retargeted_amass_trajectory_set(
         retargeting_method = robot_conf.get("retargeting_method", "smpl")
     if gmr_config is None:
         gmr_config = robot_conf.get("gmr_config", None)
+    if terra_config is None:
+        terra_config = robot_conf.get("terra_config", None)
+    terra_config = _resolve_terra_adapter_config(retargeting_method, terra_config)
 
     # Process datasets individually to avoid trajectory concatenation with different traj info
     if isinstance(dataset_name, list | tuple) and len(dataset_name) > 1:
@@ -1763,19 +2226,26 @@ def load_retargeted_amass_trajectory_set(
             logger,
             retargeting_method=retargeting_method,
             gmr_config=gmr_config,
+            terra_config=terra_config,
             clear_cache=clear_cache,
+            output_cache_subdir=output_cache_subdir,
+            allow_cache_download=allow_cache_download,
+            cache_root=cache_root,
         )
 
-    path_to_converted_amass_datasets = get_converted_amass_dataset_path()
+    path_to_converted_amass_datasets = get_converted_amass_dataset_path() if cache_root is None else str(cache_root)
 
     # Normalize environment name for cache consistency (MJX and non-MJX share same cache)
     cache_env_name = env_name.replace("Mjx", "") if "Mjx" in env_name else env_name
 
-    # Use separate cache directories for different retargeting methods
-    if retargeting_method == "gmr":
-        path_robot_smpl_data = os.path.join(path_to_converted_amass_datasets, cache_env_name, "gmr")
-    else:
-        path_robot_smpl_data = os.path.join(path_to_converted_amass_datasets, cache_env_name)
+    path_robot_smpl_data = str(
+        retargeting_cache_dir(
+            path_to_converted_amass_datasets,
+            cache_env_name,
+            retargeting_method,
+            output_cache_subdir,
+        )
+    )
 
     if not os.path.exists(path_robot_smpl_data):
         os.makedirs(path_robot_smpl_data, exist_ok=True)
@@ -1784,7 +2254,7 @@ def load_retargeted_amass_trajectory_set(
     if isinstance(dataset_name, str):
         dataset_name = [dataset_name]
 
-    loaded_sets = []
+    all_trajectories = []
     for i, d_name in enumerate(dataset_name):
         d_path = os.path.join(path_robot_smpl_data, f"{d_name}.npz")
         if retargeting_method == "gmr":
@@ -1795,8 +2265,9 @@ def load_retargeted_amass_trajectory_set(
                 cache_root=path_to_converted_amass_datasets,
                 clear_cache=clear_cache,
                 logger=logger,
+                allow_download=allow_cache_download,
             )
-        else:
+        elif not clear_cache and allow_cache_download:
             d_path = _resolve_cache_path(d_path)
         cache_exists = os.path.exists(d_path)
         if not cache_exists or clear_cache:
@@ -1863,6 +2334,13 @@ def load_retargeted_amass_trajectory_set(
                 logger.info(f"Dataset {i + 1}/{len(dataset_name)}: {action} AMASS motion file using GMR ...")
                 amass_file_path = os.path.join(get_amass_dataset_path(), f"{d_name}.npz")
                 trajectory, analysis = fit_gmr_motion(env_name, robot_conf, amass_file_path, logger, gmr_config)
+            elif retargeting_method in TERRA_ADAPTER_METHODS:
+                method_label = "TERRA" if retargeting_method == "terra" else "OmniRetarget"
+                logger.info(f"Dataset {i + 1}/{len(dataset_name)}: {action} AMASS motion file using {method_label} ...")
+                terra = _require_terra()
+
+                motion_data = load_amass_data(d_name)
+                trajectory, analysis = terra.fit_terra_motion(env_name, robot_conf, motion_data, logger, terra_config)
             else:
                 logger.info(
                     f"Dataset {i + 1}/{len(dataset_name)}: {action} AMASS motion file using optimized body shape ..."
@@ -1882,30 +2360,71 @@ def load_retargeted_amass_trajectory_set(
                 )
 
             logger.info("Using Mujoco to calculate other model-specific entities ...")
-            trajectory = extend_motion(env_name, robot_conf.env_params, trajectory, logger)
+            trajectory = extend_motion(
+                env_name,
+                robot_conf.env_params,
+                trajectory,
+                logger,
+                # The TERRA adapter constrains these exact ranges in every QP. Cubic
+                # materialization and float32 storage can overshoot them slightly, so use
+                # the trajectory handler's intended final projection path before it
+                # recomputes velocities and kinematic caches.
+                clip_trajectory_to_joint_ranges=retargeting_method in TERRA_ADAPTER_METHODS,
+            )
+            selected_config = (
+                gmr_config
+                if retargeting_method == "gmr"
+                else terra_config
+                if retargeting_method in TERRA_ADAPTER_METHODS
+                else {"skip_frames": int(robot_conf.optimization_params.skip_frames)}
+            )
+            analysis.update(
+                _benchmark_analysis_metadata(
+                    motion_name=d_name,
+                    trajectory=trajectory,
+                    analysis=analysis,
+                    retargeting_method=retargeting_method,
+                    output_cache_subdir=retargeting_cache_subdir(retargeting_method, output_cache_subdir),
+                    config=selected_config,
+                    allow_cache_download=allow_cache_download,
+                )
+            )
             trajectory.save(d_path)
+
+            # The terrain travels as its own JSON sidecar rather than inside the analysis
+            # archive: it is the one part of the analysis that something else has to *load*
+            # - the environment a policy runs in has to be built from it - and an
+            # `np.savez` object array needs `allow_pickle` to read back.
+            if "terrain" in analysis:
+                terrain_path = d_path.replace(".npz", "_terrain.json")
+                with open(terrain_path, "w") as f:
+                    json.dump(analysis.pop("terrain"), f, indent=2)
+                logger.info(f"Saved terrain to {terrain_path}")
 
             # Save analysis data to file
             analysis_path = d_path.replace(".npz", "_analysis.npz")
             np.savez(analysis_path, **analysis)
             logger.info(f"Saved analysis to {analysis_path}")
-            loaded_sets.append(LoadedTrajectorySet(trajectory, (d_name,)))
+            all_trajectories.append(trajectory)
         else:
             logger.info(
                 f"Dataset {i + 1}/{len(dataset_name)}: Found existing retargeted motion file at {d_path}. Loading ..."
             )
-            trajectory = Trajectory.load(d_path, backend=np)
-            loaded_sets.append(LoadedTrajectorySet(trajectory, (d_name,)))
+            trajectory = Trajectory.load(d_path)
+            all_trajectories.append(trajectory)
 
-    if len(loaded_sets) == 1:
-        loaded = loaded_sets[0]
+    if len(all_trajectories) == 1:
+        trajectory = all_trajectories[0]
     else:
         logger.info("Concatenating trajectories ...")
-        loaded = LoadedTrajectorySet.concatenate(loaded_sets, backend=np)
+        traj_datas = [t.data for t in all_trajectories]
+        traj_infos = [t.info for t in all_trajectories]
+        traj_data, traj_info = TrajectoryData.concatenate(traj_datas, traj_infos, backend=np)
+        trajectory = Trajectory(traj_info, traj_data)
 
     logger.info("Trajectory data loaded!")
 
-    return loaded
+    return trajectory
 
 
 def retarget_traj_from_robot_to_robot(
@@ -2172,33 +2691,31 @@ def retarget_trajectory_for_bimanual(traj: Trajectory) -> Trajectory:
 
 
 def retarget_smpl_to_bimanual_via_intermediate(
-    dataset_name: str | list[str] | tuple[str, ...],
+    dataset_name: str | list[str],
     robot_conf_skeleton: DictConfig = None,
     robot_conf_bimanual: DictConfig = None,
     retargeting_method: str | None = None,
     gmr_config: dict | None = None,
     clear_cache: bool = False,
 ) -> Trajectory:
-    """Retarget AMASS trajectory data for MyoBimanualArm."""
-    return retarget_smpl_to_bimanual_via_intermediate_set(
-        dataset_name=dataset_name,
-        robot_conf_skeleton=robot_conf_skeleton,
-        robot_conf_bimanual=robot_conf_bimanual,
-        retargeting_method=retargeting_method,
-        gmr_config=gmr_config,
-        clear_cache=clear_cache,
-    ).trajectory
+    """
+    Perform explicit three-stage retargeting: SMPL → MyoFullBody → MyoBimanualArm → SiteData.
 
+    This function processes each motion individually through the complete pipeline,
+    then concatenates the final MyoBimanualArm trajectories. This avoids dimensional
+    incompatibilities that occur when trying to concatenate intermediate trajectories.
 
-def retarget_smpl_to_bimanual_via_intermediate_set(
-    dataset_name: str | list[str] | tuple[str, ...],
-    robot_conf_skeleton: DictConfig = None,
-    robot_conf_bimanual: DictConfig = None,
-    retargeting_method: str | None = None,
-    gmr_config: dict | None = None,
-    clear_cache: bool = False,
-) -> LoadedTrajectorySet:
-    """Retarget AMASS motions for MyoBimanualArm with their source names."""
+    Args:
+        dataset_name: Name(s) of AMASS dataset(s) to retarget
+        robot_conf_skeleton: Configuration for the intermediate full-body skeleton retargeting stage
+        robot_conf_bimanual: Configuration for MyoBimanualArm (if None, loads default)
+        retargeting_method: "smpl" or "gmr" (if None, defaults to SMPL optimization-based)
+        gmr_config: GMR configuration dict (optional, only used if retargeting_method="gmr")
+        clear_cache: If True, overwrite existing cached files instead of loading them.
+
+    Returns:
+        Trajectory: Retargeted trajectory for MyoBimanualArm
+    """
     logger = setup_logger("bimanual_retargeting", identifier="[Three-Stage Retargeting Pipeline]")
 
     # Check for headless environment and setup EGL if needed
@@ -2224,14 +2741,16 @@ def retarget_smpl_to_bimanual_via_intermediate_set(
     path_robot_smpl_data_bimanual = os.path.join(path_to_converted_amass_datasets, BIMANUAL_ENV_NAME)
     os.makedirs(path_robot_smpl_data_bimanual, exist_ok=True)
 
-    # One cache per motion keeps names aligned with trajectory indices.
-    loaded_sets = []
+    # Process each motion individually through the complete three-stage pipeline,
+    # caching a single file per dataset (consistent with other models)
+    final_trajectories = []
     skipped = 0
     if retargeting_method == "gmr":
         path_robot_smpl_data_bimanual = os.path.join(path_to_converted_amass_datasets, BIMANUAL_ENV_NAME, "gmr")
     else:
         path_robot_smpl_data_bimanual = os.path.join(path_to_converted_amass_datasets, BIMANUAL_ENV_NAME)
 
+    # Now use it inside the loop
     for i, single_dataset in enumerate(tqdm(dataset_list, desc="Bimanual retargeting", unit="traj")):
         cache_path = os.path.join(path_robot_smpl_data_bimanual, f"{single_dataset}.npz")
         if retargeting_method == "gmr":
@@ -2249,10 +2768,10 @@ def retarget_smpl_to_bimanual_via_intermediate_set(
         cache_exists = os.path.exists(cache_path)
         if cache_exists and not clear_cache:
             logger.info(
-                f"Dataset {i + 1}/{len(dataset_list)}: Found existing cached MyoBimanualArm trajectory at {cache_path}. Loading ..."
+                f"Dataset {i + 1}/{len(dataset_list)}: Found existing cached "
+                f"MyoBimanualArm trajectory at {cache_path}. Loading ..."
             )
-            trajectory = Trajectory.load(cache_path, backend=np)
-            loaded_sets.append(LoadedTrajectorySet(trajectory, (single_dataset,)))
+            final_trajectories.append(Trajectory.load(cache_path))
             continue
 
         action = "Re-retargeting (clear_cache)" if clear_cache and cache_exists else "Retargeting"
@@ -2272,22 +2791,26 @@ def retarget_smpl_to_bimanual_via_intermediate_set(
             logger.info("Stage 2: Extending and retargeting to MyoBimanualArm via environment forward kinematics")
             bimanual_traj = extend_motion(BIMANUAL_ENV_NAME, robot_conf_bimanual.env_params, skeleton_traj, logger)
 
+            # Save per-dataset cache and collect
             bimanual_traj.save(cache_path)
             logger.info(f"Saved MyoBimanualArm trajectory cache to {cache_path}")
-            loaded_sets.append(LoadedTrajectorySet(bimanual_traj, (single_dataset,)))
+            final_trajectories.append(bimanual_traj)
         except Exception as e:
             skipped += 1
             logger.error(f"Skipping dataset '{single_dataset}' due to failure in three-stage retargeting: {e}")
             continue
 
-    if len(loaded_sets) == 1:
-        loaded = loaded_sets[0]
+    # Concatenate final trajectories in-memory for multi-dataset requests
+    if len(final_trajectories) == 1:
+        result_trajectory = final_trajectories[0]
     else:
-        if not loaded_sets:
+        if len(final_trajectories) == 0:
             raise RuntimeError(f"Three-stage retargeting produced no valid trajectories. Skipped {skipped} dataset(s).")
-        logger.info(f"Concatenating {len(loaded_sets)} final MyoBimanualArm trajectories (skipped {skipped}) ...")
-        loaded = LoadedTrajectorySet.concatenate(loaded_sets, backend=np)
+        logger.info(
+            f"Concatenating {len(final_trajectories)} final MyoBimanualArm trajectories (skipped {skipped}) ..."
+        )
+        result_trajectory = Trajectory.concatenate(final_trajectories, backend=np)
         logger.info("Final concatenation successful!")
 
     logger.info("Three-stage retargeting completed successfully")
-    return loaded
+    return result_trajectory

@@ -13,8 +13,8 @@ def detect_headless_environment() -> bool:
         True if headless rendering should be used, False otherwise.
     """
 
-    if sys.platform in ("darwin", "win32"):
-        return False
+    if sys.platform == "darwin":
+        return False 
 
     if "DISPLAY" not in os.environ:
         return True

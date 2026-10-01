@@ -1,0 +1,12 @@
+defaults:
+  - conf_fullbody_gmr_resnet  # Inherit from ResNet config
+
+# Override wandb tags
+wandb:
+  tags: ["fullbody", "gmr", "resnet", "unroll_long"]
+
+experiment:
+  resume_from: null
+  ppo_config:
+    num_steps: 50
+    num_minibatches: 32

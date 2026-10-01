@@ -1,0 +1,21 @@
+defaults:
+  - conf_fullbody_gmr_resnet  # Inherit from GMR config
+
+# Override wandb tags
+wandb:
+  tags: ["fullbody", "gmr", "resnet", "baseline", "Gait120", "finetuned", "training-trials"]
+
+# Enable residual network
+experiment:
+  task_factory:
+    params:
+      amass_dataset_conf:
+        dataset_group: "GAIT120_TRAINING_TRIALS"
+  
+  validation:
+    amass_dataset_conf:
+      dataset_group: "GAIT120_TESTING_TRIALS"
+
+  checkpoint_root: "checkpoints/fullbody/gmr_resnet_Gait120_tr-trials_finetuned"
+  resume_from: hf://amathislab/mm-fullbody-base
+  

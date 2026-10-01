@@ -109,6 +109,12 @@ experiment:
     profile_traj_batch: false
     profile_val_batch: false
     track_nacon: false
+    hardware_gate:
+      enabled: false
+      output_path: null         # Defaults to <checkpoint_dir>/hardware_gate_evidence.jsonl
+      stop_after_checkpoint_update: null  # Test-only clean stop after a synchronous checkpoint.
+      max_state_sample_values: 64
+      max_identity_values: 16
 
   # Optimizer configuration
   optimizer_type: "muon"
@@ -156,6 +162,8 @@ experiment:
   max_checkpoints_to_keep: 5
   checkpoints_on_validation: true
   resume_from: null
+  exact_resume: false           # Require and restore complete runtime state
+  save_runtime_state: false     # Write complete runtime state; exact_resume also implies this
   async_checkpointing: true
   reset_logging_timestep: false
   reset_lr_schedule_on_resume: false

@@ -1,0 +1,45 @@
+# Single-H100 FlashSAC profile for the bimanual task.
+#
+# Usage:
+#   python bimanual/experiment.py --config-name=conf_bimanual_flashsac_large_scale
+#
+# This inherits the conservative FlashSAC baseline and scales the environment
+# count, networks, replay, and update schedule as one coherent H100 profile.
+defaults:
+  - conf_bimanual_flashsac
+  - _self_
+
+wandb:
+  tags: ["bimanual", "gmr", "flashsac", "h100"]
+
+experiment:
+  env_params:
+    num_envs: 8192
+  total_timesteps: 100000000
+  matmul_precision: tensorfloat32
+
+  flashsac_config:
+    buffer_capacity: 1048576
+    min_buffer_size: 131072
+    sample_batch_size: 4096
+
+    # The baseline uses 2048 envs and one update per interaction. Four updates
+    # preserve that optimizer-update rate after scaling the task to 8192 envs.
+    updates_per_interaction: 4
+
+    # Each residual block expands 512 -> 2048 -> 512. Eight blocks provide 16
+    # dense transformations, comparable in total capacity to the GMR PPO model.
+    actor_hidden_dim: 512
+    actor_num_blocks: 8
+    critic_hidden_dim: 512
+    critic_num_blocks: 8
+    warmup_updates: 1000
+
+  checkpoints_on_validation: false
+  checkpoint_interval: 1024
+  max_checkpoints_to_keep: 3
+  async_checkpointing: true
+
+  validation:
+    num: 30
+    video_frequency: 10

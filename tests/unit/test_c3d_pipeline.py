@@ -29,6 +29,26 @@ class _FakeEnv:
     dt = 0.01
 
 
+def test_retarget_c3d_validates_environment_before_processing(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown MuscleMimic environment"):
+        c3d_pipeline.retarget_c3d_to_trajectory(
+            str(tmp_path / "missing.c3d"),
+            "NotARegisteredEnvironment",
+        )
+
+
+def test_c3d_analysis_round_trips_structured_metadata_without_pickle(tmp_path: Path) -> None:
+    path = tmp_path / "analysis.npz"
+    analysis = {
+        "terrain": {"boxes": [{"name": "ramp", "yaw": 0.25}]},
+        "active_terms": ["interaction_mesh", "direct_environment_nonpenetration"],
+    }
+
+    c3d_pipeline._save_analysis_npz(path, analysis)
+
+    assert c3d_pipeline._load_analysis_npz(path) == analysis
+
+
 def _install_fake_retargeting(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, calls: dict) -> None:
     default_model_path = tmp_path / "default_smplh"
     default_model_path.mkdir()
@@ -77,7 +97,7 @@ def test_retarget_c3d_splits_fit_and_smpl_retarget_model_paths(
     converted_c3d_path = tmp_path / "converted_c3d"
     monkeypatch.setenv("MUSCLEMIMIC_CONVERTED_C3D_PATH", str(converted_c3d_path))
 
-    c3d_file = tmp_path / "WalkTrial01.c3d"
+    c3d_file = tmp_path / "AllSteps.c3d"
     c3d_file.write_bytes(b"c3d")
     c3d_model_path = tmp_path / "soma_smplx"
     retarget_model_path = tmp_path / "retarget_smplh"
@@ -105,13 +125,18 @@ def test_retarget_c3d_splits_fit_and_smpl_retarget_model_paths(
         surface_model_type="smplx",
         c3d_fit_model_path=str(c3d_model_path),
         retarget_smpl_model_path=str(retarget_model_path),
-        converted_c3d_name="ExampleStudy/Subject01/Walking/Trial01/WalkTrial01",
+        converted_c3d_name="EMG_Boo/S002/LevelWalking/Trial05/AllSteps",
     )
 
     assert trajectory.name == "extended-raw-smpl"
     assert analysis["retarget"] == "smpl"
     assert analysis["source"] == "c3d"
-    assert analysis["converted_c3d_dataset"] == "ExampleStudy/Subject01/Walking/Trial01/WalkTrial01"
+    assert analysis["converted_c3d_dataset"] == "EMG_Boo/S002/LevelWalking/Trial05/AllSteps"
+    assert analysis["c3d_fit_model_path"] == str(c3d_model_path.resolve())
+    assert analysis["c3d_surface_model_type"] == "smplx"
+    assert analysis["c3d_gender"] == "male"
+    assert analysis["smpl_model_path"] == str(retarget_model_path.resolve())
+    assert len(analysis["fitted_shape_sha256"]) == 64
     assert calls["fit_model_path"] == str(c3d_model_path)
     assert calls["shape_model_path"] == str(retarget_model_path)
     assert calls["motion_model_path"] == str(retarget_model_path)
@@ -120,9 +145,9 @@ def test_retarget_c3d_splits_fit_and_smpl_retarget_model_paths(
     assert calls["extend_env_params"] == {}
 
     expected_motion_path = (
-        converted_c3d_path / "MyoFullBody" / "smpl" / "ExampleStudy" / "Subject01" / "Walking" / "Trial01" / "WalkTrial01.npz"
+        converted_c3d_path / "MyoFullBody" / "smpl" / "EMG_Boo" / "S002" / "LevelWalking" / "Trial05" / "AllSteps.npz"
     )
-    expected_analysis_path = expected_motion_path.with_name("WalkTrial01_analysis.npz")
+    expected_analysis_path = expected_motion_path.with_name("AllSteps_analysis.npz")
     assert calls["saved_trajectory_paths"] == [expected_motion_path]
     assert expected_motion_path.read_bytes() == b"trajectory:extended-raw-smpl"
     saved_analysis = np.load(expected_analysis_path)
@@ -137,7 +162,7 @@ def test_smpl_retargeting_rejects_reused_smplx_fit_model_path(
     calls: dict = {}
     _install_fake_retargeting(monkeypatch, tmp_path, calls)
 
-    c3d_file = tmp_path / "WalkTrial01.c3d"
+    c3d_file = tmp_path / "AllSteps.c3d"
     c3d_file.write_bytes(b"c3d")
     c3d_model_path = tmp_path / "soma_smplx"
     c3d_model_path.mkdir()
@@ -191,7 +216,10 @@ def test_retarget_c3d_saves_gmr_trajectory_under_converted_c3d_path(
     assert trajectory.name == "extended-raw-gmr"
     assert analysis["retarget"] == "gmr"
     assert analysis["converted_c3d_dataset"] == "Study_A/Subject_1/All_Steps"
-    assert Path(calls["gmr_motion_path"]).name == "All Steps_smplh_for_gmr.npz"
+    gmr_motion_path = Path(calls["gmr_motion_path"])
+    assert gmr_motion_path.name == "All Steps_smplh_for_gmr.npz"
+    assert converted_c3d_path in gmr_motion_path.parents
+    assert not (c3d_file.parent / ".smpl_cache").exists()
     assert calls["gmr_config"] == {"target_fps": 30}
 
     expected_motion_path = converted_c3d_path / "MyoFullBody" / "gmr" / "Study_A" / "Subject_1" / "All_Steps.npz"
@@ -199,6 +227,177 @@ def test_retarget_c3d_saves_gmr_trajectory_under_converted_c3d_path(
     assert calls["saved_trajectory_paths"] == [expected_motion_path]
     assert expected_motion_path.exists()
     assert expected_analysis_path.exists()
+
+
+def test_retarget_c3d_keeps_managed_fit_cache_under_cache_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict = {}
+    _install_fake_retargeting(monkeypatch, tmp_path, calls)
+    source_dir = tmp_path / "read_only_captures"
+    source_dir.mkdir()
+    c3d_file = source_dir / "Trial.c3d"
+    c3d_file.write_bytes(b"unique c3d capture")
+    c3d_model_path = tmp_path / "soma_smplx"
+    c3d_model_path.mkdir()
+    c3d_model_file = c3d_model_path / "SMPLX_NEUTRAL.pkl"
+    c3d_model_file.write_bytes(b"model parameters")
+    cache_root = tmp_path / "cache"
+    stage1_state = tmp_path / "subject_stage1.npz"
+    stage1_state.write_bytes(b"calibration")
+
+    def fit_smpl_to_c3d_cached(c3d_path, model_path, **kwargs):
+        calls["fit_kwargs"] = kwargs
+        return {
+            "pose_aa": np.zeros((1, 72), dtype=np.float32),
+            "trans": np.zeros((1, 3), dtype=np.float32),
+            "betas": np.zeros(16, dtype=np.float32),
+            "fps": 30.0,
+            "gender": "neutral",
+            "debug": {
+                "surface_model_type": "smplx",
+                "canonical_labels": ["LHEE", "RHEE"],
+                "fit_pose_dim": 165,
+                "stagei": {"reused": True, "state_path": str(stage1_state)},
+                "stage1_shape_solver": "joint_dogleg_jax",
+                "stage2_solver": "batched_lbfgs",
+                "enforce_knee_hinge": True,
+                "stage2_marker_weight_overrides": {"LHEE": 2.0},
+                "stage2_torso_frame_weight": 3.0,
+                "marker_error": {"mean_mm": np.float32(8.5), "max_mm": 20.0},
+            },
+        }
+
+    monkeypatch.setattr(c3d_to_smpl, "fit_smpl_to_c3d_cached", fit_smpl_to_c3d_cached)
+
+    _, analysis = c3d_pipeline.retarget_c3d_to_trajectory(
+        str(c3d_file),
+        "MyoFullBody",
+        c3d_fit_model_path=str(c3d_model_path),
+        cache_root=cache_root,
+        converted_c3d_name="Study/Trial",
+        device="cpu",
+        enforce_knee_hinge=True,
+        gender="neutral",
+        least_avail_markers=0.8,
+        n_ref_frames=16,
+        seed=7,
+        stage1_state_path=str(stage1_state),
+        stage2_marker_weight_overrides={"LHEE": 2.0},
+        stage2_solver="batched_lbfgs",
+        stage2_torso_frame_weight=3.0,
+        strict_frame_picking=False,
+        target_fps=50.0,
+        wrist_markers_on_stick=True,
+    )
+
+    source_hash = c3d_pipeline._file_sha256(c3d_file)
+    expected_fit_cache = cache_root.resolve() / ".c3d_smpl_cache" / source_hash
+    assert Path(calls["fit_kwargs"]["cache_dir"]) == expected_fit_cache
+    assert Path(calls["gmr_motion_path"]).parent == expected_fit_cache
+    assert analysis["c3d_fit_cache_dir"] == str(expected_fit_cache)
+    assert analysis["c3d_fit_model_file"] == str(c3d_model_file)
+    assert analysis["c3d_fit_model_sha256"] == c3d_pipeline._file_sha256(c3d_model_file)
+    assert analysis["c3d_fit_options"]["stage2_solver"] == "batched_lbfgs"
+    assert analysis["c3d_fit"]["marker_error"] == {"mean_mm": 8.5, "max_mm": 20.0}
+    assert analysis["c3d_fit"]["stage1"] == {
+        "reused": True,
+        "state_path": str(stage1_state),
+    }
+    assert calls["fit_kwargs"]["target_fps"] == 50.0
+    assert calls["fit_kwargs"]["stage1_state_path"] == str(stage1_state.resolve())
+    assert calls["fit_kwargs"]["stage2_marker_weight_overrides"] == {"LHEE": 2.0}
+    assert calls["fit_kwargs"]["stage2_torso_frame_weight"] == 3.0
+    assert not (source_dir / ".smpl_cache").exists()
+
+
+@pytest.mark.parametrize("method", ["terra", "omniretarget"])
+def test_retarget_c3d_dispatches_terra_adapter_methods_truthfully(
+    method: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict = {}
+    _install_fake_retargeting(monkeypatch, tmp_path, calls)
+    converted_c3d_path = tmp_path / "converted_c3d"
+    monkeypatch.setenv("MUSCLEMIMIC_CONVERTED_C3D_PATH", str(converted_c3d_path))
+
+    c3d_file = tmp_path / "ramp.c3d"
+    c3d_file.write_bytes(b"c3d")
+    c3d_model_path = tmp_path / "soma_smplx"
+    retarget_model_path = tmp_path / "retarget_smplh"
+    c3d_model_path.mkdir()
+    retarget_model_path.mkdir()
+    motion_data = {
+        "pose_aa": np.zeros((1, 72), dtype=np.float32),
+        "trans": np.zeros((1, 3), dtype=np.float32),
+        "betas": np.zeros(16, dtype=np.float32),
+        "fps": 30.0,
+        "gender": "male",
+    }
+    monkeypatch.setattr(c3d_to_smpl, "fit_smpl_to_c3d_cached", lambda *args, **kwargs: motion_data)
+
+    fake_terra = types.ModuleType("terra")
+
+    def resolve_method_profile(profile, config):
+        calls["profile"] = profile
+        return dict(config or {}) | {"method_profile": profile}
+
+    def fit_terra_motion(
+        model_name,
+        robot_conf,
+        fitted_motion,
+        log,
+        config,
+        *,
+        smpl_model_path,
+        fitted_shape_path,
+    ):
+        calls["terra"] = {
+            "model_name": model_name,
+            "robot_conf": robot_conf,
+            "motion_data": fitted_motion,
+            "config": config,
+            "smpl_model_path": smpl_model_path,
+            "fitted_shape_path": fitted_shape_path,
+        }
+        return _FakeTrajectory(f"raw-{method}", calls), {"retarget": method}
+
+    fake_terra.resolve_method_profile = resolve_method_profile
+    fake_terra.fit_terra_motion = fit_terra_motion
+    monkeypatch.setitem(sys.modules, "terra", fake_terra)
+
+    trajectory, analysis = c3d_pipeline.retarget_c3d_to_trajectory(
+        str(c3d_file),
+        "MyoFullBody",
+        retargeting_method=method,
+        terra_config={"terrain": "auto"},
+        surface_model_type="smplx",
+        c3d_fit_model_path=str(c3d_model_path),
+        retarget_smpl_model_path=str(retarget_model_path),
+        converted_c3d_name=f"Study/{method}/ramp",
+    )
+
+    assert trajectory.name == f"extended-raw-{method}"
+    assert analysis["retarget"] == method
+    assert analysis["retargeting_method"] == method
+    assert calls["profile"] == method
+    assert calls["terra"]["motion_data"] is motion_data
+    assert calls["terra"]["config"] == {"terrain": "auto", "method_profile": method}
+    assert calls["terra"]["smpl_model_path"] == str(retarget_model_path)
+    assert calls["terra"]["fitted_shape_path"].endswith("MyoFullBody/shape.npz")
+    assert calls["shape_model_path"] == str(retarget_model_path)
+    assert "motion_model_path" not in calls
+
+
+def test_retarget_c3d_rejects_unknown_method_before_fitting(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Unsupported C3D retargeting method"):
+        c3d_pipeline.retarget_c3d_to_trajectory(
+            str(tmp_path / "missing.c3d"),
+            "MyoFullBody",
+            retargeting_method="not-a-method",
+        )
 
 
 def test_retarget_c3d_loads_existing_converted_cache_without_refitting(
@@ -210,17 +409,24 @@ def test_retarget_c3d_loads_existing_converted_cache_without_refitting(
     converted_c3d_path = tmp_path / "converted_c3d"
     monkeypatch.setenv("MUSCLEMIMIC_CONVERTED_C3D_PATH", str(converted_c3d_path))
 
-    c3d_file = tmp_path / "WalkTrial01.c3d"
+    c3d_file = tmp_path / "AllSteps.c3d"
     c3d_file.write_bytes(b"c3d")
     missing_c3d_model_path = tmp_path / "missing_soma"
-    converted_name = "ExampleStudy/Subject01/Walking/Trial01/WalkTrial01"
+    converted_name = "EMG_Boo/S002/LevelWalking/Trial05/AllSteps"
     expected_motion_path = (
-        converted_c3d_path / "MyoFullBody" / "gmr" / "ExampleStudy" / "Subject01" / "Walking" / "Trial01" / "WalkTrial01.npz"
+        converted_c3d_path / "MyoFullBody" / "gmr" / "EMG_Boo" / "S002" / "LevelWalking" / "Trial05" / "AllSteps.npz"
     )
-    expected_analysis_path = expected_motion_path.with_name("WalkTrial01_analysis.npz")
+    expected_analysis_path = expected_motion_path.with_name("AllSteps_analysis.npz")
     expected_motion_path.parent.mkdir(parents=True)
     expected_motion_path.write_bytes(b"cached trajectory")
-    np.savez(expected_analysis_path, retarget=np.array("gmr"), source=np.array("stale"), frames=np.array(12))
+    monkeypatch.setattr(c3d_pipeline, "_c3d_cache_key", lambda *_args, **_kwargs: "expected key")
+    np.savez(
+        expected_analysis_path,
+        retarget=np.array("gmr"),
+        frames=np.array(12),
+        source_c3d_sha256=np.asarray(c3d_pipeline._file_sha256(c3d_file)),
+        c3d_cache_key_sha256=np.asarray(c3d_pipeline._cache_key_sha256("expected key")),
+    )
 
     loaded_trajectory = object()
 
@@ -254,6 +460,85 @@ def test_retarget_c3d_loads_existing_converted_cache_without_refitting(
     assert analysis["retargeting_method"] == "gmr"
 
 
+def test_retarget_c3d_rejects_cache_without_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict = {}
+    _install_fake_retargeting(monkeypatch, tmp_path, calls)
+    converted_root = tmp_path / "converted_c3d"
+    monkeypatch.setenv("MUSCLEMIMIC_CONVERTED_C3D_PATH", str(converted_root))
+    c3d_file = tmp_path / "AllSteps.c3d"
+    c3d_file.write_bytes(b"c3d")
+    motion_path = converted_root / "MyoFullBody" / "gmr" / "Study" / "Trial.npz"
+    motion_path.parent.mkdir(parents=True)
+    motion_path.write_bytes(b"legacy cache")
+
+    with pytest.raises(RuntimeError, match="no source checksum"):
+        c3d_pipeline.retarget_c3d_to_trajectory(
+            str(c3d_file),
+            "MyoFullBody",
+            c3d_fit_model_path=str(tmp_path / "missing_soma"),
+            converted_c3d_name="Study/Trial",
+        )
+
+
+def test_retarget_c3d_rejects_cache_from_changed_source_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict = {}
+    _install_fake_retargeting(monkeypatch, tmp_path, calls)
+    converted_c3d_path = tmp_path / "converted_c3d"
+    monkeypatch.setenv("MUSCLEMIMIC_CONVERTED_C3D_PATH", str(converted_c3d_path))
+
+    c3d_file = tmp_path / "AllSteps.c3d"
+    c3d_file.write_bytes(b"new source contents")
+    motion_path = converted_c3d_path / "MyoFullBody" / "gmr" / "Study" / "Trial.npz"
+    analysis_path = motion_path.with_name("Trial_analysis.npz")
+    motion_path.parent.mkdir(parents=True)
+    motion_path.write_bytes(b"cached trajectory")
+    np.savez(analysis_path, source_c3d_sha256=np.asarray("0" * 64))
+    monkeypatch.setattr(trajectory_module.Trajectory, "load", staticmethod(lambda *_args, **_kwargs: object()))
+
+    with pytest.raises(RuntimeError, match="different source contents"):
+        c3d_pipeline.retarget_c3d_to_trajectory(
+            str(c3d_file),
+            "MyoFullBody",
+            c3d_fit_model_path=str(tmp_path / "missing_soma"),
+            converted_c3d_name="Study/Trial",
+        )
+
+
+def test_retarget_c3d_rejects_cache_from_changed_fitting_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict = {}
+    _install_fake_retargeting(monkeypatch, tmp_path, calls)
+    converted_root = tmp_path / "converted_c3d"
+    monkeypatch.setenv("MUSCLEMIMIC_CONVERTED_C3D_PATH", str(converted_root))
+    c3d_file = tmp_path / "AllSteps.c3d"
+    c3d_file.write_bytes(b"same source")
+    motion_path = converted_root / "MyoFullBody" / "gmr" / "Study" / "Trial.npz"
+    analysis_path = motion_path.with_name("Trial_analysis.npz")
+    motion_path.parent.mkdir(parents=True)
+    motion_path.write_bytes(b"cached trajectory")
+    np.savez(
+        analysis_path,
+        source_c3d_sha256=np.asarray(c3d_pipeline._file_sha256(c3d_file)),
+        c3d_cache_key_sha256=np.asarray("0" * 64),
+    )
+
+    with pytest.raises(RuntimeError, match="different fitting or retargeting configuration"):
+        c3d_pipeline.retarget_c3d_to_trajectory(
+            str(c3d_file),
+            "MyoFullBody",
+            c3d_fit_model_path=str(tmp_path / "missing_soma"),
+            converted_c3d_name="Study/Trial",
+        )
+
+
 def test_retarget_c3d_reports_invalid_converted_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -263,11 +548,18 @@ def test_retarget_c3d_reports_invalid_converted_cache(
     converted_c3d_path = tmp_path / "converted_c3d"
     monkeypatch.setenv("MUSCLEMIMIC_CONVERTED_C3D_PATH", str(converted_c3d_path))
 
-    c3d_file = tmp_path / "WalkTrial01.c3d"
+    c3d_file = tmp_path / "AllSteps.c3d"
     c3d_file.write_bytes(b"c3d")
     motion_path = converted_c3d_path / "MyoFullBody" / "gmr" / "Study" / "Trial.npz"
+    analysis_path = motion_path.with_name("Trial_analysis.npz")
     motion_path.parent.mkdir(parents=True)
     motion_path.write_bytes(b"not a trajectory")
+    monkeypatch.setattr(c3d_pipeline, "_c3d_cache_key", lambda *_args, **_kwargs: "expected key")
+    np.savez(
+        analysis_path,
+        source_c3d_sha256=np.asarray(c3d_pipeline._file_sha256(c3d_file)),
+        c3d_cache_key_sha256=np.asarray(c3d_pipeline._cache_key_sha256("expected key")),
+    )
 
     def fail_load(*_args, **_kwargs):
         raise ValueError("invalid trajectory")
@@ -292,7 +584,7 @@ def test_retarget_c3d_clear_cache_forces_recompute(
     converted_c3d_path = tmp_path / "converted_c3d"
     monkeypatch.setenv("MUSCLEMIMIC_CONVERTED_C3D_PATH", str(converted_c3d_path))
 
-    c3d_file = tmp_path / "WalkTrial01.c3d"
+    c3d_file = tmp_path / "AllSteps.c3d"
     c3d_file.write_bytes(b"c3d")
     c3d_model_path = tmp_path / "soma_smplx"
     c3d_model_path.mkdir()
@@ -366,7 +658,7 @@ def test_c3d_dataset_conf_loads_from_converted_c3d_cache(
     trajectory_path.write_bytes(b"trajectory")
 
     calls: dict = {}
-    loaded_trajectory = types.SimpleNamespace(data=types.SimpleNamespace(n_trajectories=1))
+    loaded_trajectory = object()
 
     def fake_load(path, backend):
         calls["load_path"] = Path(path)
@@ -374,11 +666,6 @@ def test_c3d_dataset_conf_loads_from_converted_c3d_cache(
         return loaded_trajectory
 
     monkeypatch.setattr(imitation_factory_module.Trajectory, "load", staticmethod(fake_load))
-    monkeypatch.setattr(
-        imitation_factory_module.LoadedTrajectorySet,
-        "concatenate",
-        classmethod(lambda _cls, loaded_sets, backend: loaded_sets[0]),
-    )
 
     traj = ImitationFactory.get_c3d_traj(_FakeEnv(), C3DDatasetConf(rel_dataset_path="Study A/Subject 1/Trial 05"))
 

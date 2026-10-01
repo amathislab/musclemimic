@@ -1,0 +1,21 @@
+defaults:
+  - conf_fullbody_gmr  # Inherit from GMR config
+
+# Override wandb tags
+wandb:
+  tags: ["fullbody", "gmr", "resnet"]
+
+# Enable residual network
+experiment:
+  actor_hidden_layers: [2048, 4096, 4096, 4096, 4096, 4096, 2048, 1024, 512]
+  critic_hidden_layers: [2048, 4096, 4096, 4096, 4096, 4096, 2048, 1024, 512]
+  auto_resume: true
+  use_residual: true
+  residual_type: "gated"       # "gated" (learnable sigmoid gate) or "fixed" (constant scale)
+  residual_gate_init: -2.0     # Initial gate value (~0.12 after sigmoid)
+  
+  
+  env_params:
+    reward_params:
+      action_rate_coeff: 1e-4
+      activation_energy_coeff: 0.0
