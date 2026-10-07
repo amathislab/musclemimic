@@ -1,6 +1,4 @@
-"""
-Policy inference and visualization for PPO.
-"""
+"""Policy inference and visualization shared by JAX algorithms."""
 
 from __future__ import annotations
 
@@ -12,9 +10,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from musclemimic.algorithms.common.env_utils import wrap_env
+from musclemimic.algorithms.inference import make_policy_action_fn
 
 if TYPE_CHECKING:
-    from musclemimic.algorithms.ppo.config import PPOAgentConf, PPOAgentState
+    from musclemimic.algorithms.common.base_algorithm import AgentConfBase, AgentStateBase
 
 
 class ObservationHistoryBuffer:
@@ -33,7 +32,7 @@ class ObservationHistoryBuffer:
         split_goal: bool = False,
         state_indices: np.ndarray | None = None,
         goal_indices: np.ndarray | None = None,
-    ):
+    ) -> None:
         self.n_steps = n_steps
         self.split_goal = split_goal
         self.state_indices = None if state_indices is None else np.asarray(state_indices, dtype=int)
@@ -77,8 +76,8 @@ class ObservationHistoryBuffer:
 
 def play_policy(
     env: Any,
-    agent_conf: PPOAgentConf,
-    agent_state: PPOAgentState,
+    agent_conf: AgentConfBase,
+    agent_state: AgentStateBase,
     n_envs: int,
     n_steps: int | None = None,
     render: bool = True,
@@ -119,26 +118,20 @@ def play_policy(
     goal_indices = None
 
     if use_mujoco or sequential_mjx:
-        try:
-            exp_cfg = agent_conf.config.experiment
-            if hasattr(exp_cfg, "len_obs_history"):
-                len_obs_history = exp_cfg.len_obs_history
-            if hasattr(exp_cfg, "split_goal"):
-                split_goal = exp_cfg.split_goal
-            if split_goal:
-                if not hasattr(env, "obs_container"):
-                    raise ValueError("split_goal=True requires env.obs_container with goal group indices")
-                goal_indices = env.obs_container.get_obs_ind_by_group("goal")
-                if goal_indices.size == 0:
-                    raise ValueError("split_goal=True requires goal observations grouped as 'goal'")
-                raw_obs_dim = env.info.observation_space.shape[0]
-                goal_indices = np.asarray(goal_indices, dtype=int)
-                state_mask = np.ones(raw_obs_dim, dtype=bool)
-                state_mask[goal_indices] = False
-                state_indices = np.arange(raw_obs_dim, dtype=int)[state_mask]
-        except Exception:
-            print("Could not determine len_obs_history from config; defaulting to 1")
-            pass
+        experiment = agent_conf.config.experiment
+        len_obs_history = int(experiment.get("len_obs_history", 1))
+        split_goal = bool(experiment.get("split_goal", False))
+        if split_goal:
+            if not hasattr(env, "obs_container"):
+                raise ValueError("split_goal=True requires env.obs_container with goal group indices")
+            goal_indices = env.obs_container.get_obs_ind_by_group("goal")
+            if goal_indices.size == 0:
+                raise ValueError("split_goal=True requires goal observations grouped as 'goal'")
+            raw_obs_dim = env.info.observation_space.shape[0]
+            goal_indices = np.asarray(goal_indices, dtype=int)
+            state_mask = np.ones(raw_obs_dim, dtype=bool)
+            state_mask[goal_indices] = False
+            state_indices = np.arange(raw_obs_dim, dtype=int)[state_mask]
 
     # Create observation history buffer if needed
     if len_obs_history > 1:
@@ -152,19 +145,23 @@ def play_policy(
         obs_buffer = None
 
     if use_mujoco:
-        assert n_envs == 1, "only one mujoco env can run at a time"
+        if n_envs != 1:
+            raise ValueError("MuJoCo playback supports exactly one environment")
 
     config = agent_conf.config.experiment
     train_state = agent_state.train_state
 
-    if deterministic:
-        train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
-
     if config.n_seeds > 1:
-        assert train_state_seed is not None, "loaded train state has multiple seeds; specify train_state_seed"
+        if train_state_seed is None:
+            raise ValueError("Loaded train state has multiple seeds; specify train_state_seed")
         train_state = jax.tree.map(lambda x: x[train_state_seed], train_state)
 
-    if not use_mujoco and getattr(env, "mjx_enabled", False) and getattr(env, "th", None) is not None and env.th.is_numpy:
+    if (
+        not use_mujoco
+        and getattr(env, "mjx_enabled", False)
+        and getattr(env, "th", None) is not None
+        and env.th.is_numpy
+    ):
         env.th.to_jax()
 
     if not render and n_steps is None and not record:
@@ -182,18 +179,7 @@ def play_policy(
     keys = jax.random.split(rng, n_envs + 1)
     rng, env_keys = keys[0], keys[1:]
 
-    def sample_actions(ts, obs, _rng):
-        obs_b = jnp.atleast_2d(obs) if hasattr(obs, "ndim") and obs.ndim == 1 else obs
-        vars_in = {"params": ts.params, "run_stats": ts.run_stats}
-        y, updates = agent_conf.network.apply(vars_in, obs_b, mutable=["run_stats"])
-        pi, _ = y
-        ts_out = ts.replace(run_stats=updates["run_stats"])
-        a = pi.sample(seed=_rng)
-        if hasattr(a, "ndim") and a.ndim > 1 and a.shape[0] == 1:
-            a = a[0]
-        return a, ts_out
-
-    policy_fn = jax.jit(sample_actions)
+    policy_fn = make_policy_action_fn(agent_conf, deterministic=deterministic)
 
     # reset environment
     if use_mujoco and not sequential_mjx:
@@ -252,24 +238,26 @@ def play_policy(
             obs, _reward, _absorbing, done, _info, env_state = env.step(env_state, action)
 
         # Extract termination info
-        terminated = _info.get('terminated', False) if isinstance(_info, dict) else False
-        truncated = _info.get('truncated', False) if isinstance(_info, dict) else False
-        traj_no = _info.get('traj_no', '?') if isinstance(_info, dict) else '?'
-        subtraj_step = _info.get('subtraj_step_no', '?') if isinstance(_info, dict) else '?'
-        traj_len = _info.get('traj_len', '?') if isinstance(_info, dict) else '?'
+        terminated = _info.get("terminated", False) if isinstance(_info, dict) else False
+        truncated = _info.get("truncated", False) if isinstance(_info, dict) else False
+        traj_no = _info.get("traj_no", "?") if isinstance(_info, dict) else "?"
+        motion_name = _info.get("motion_name") if isinstance(_info, dict) else None
+        subtraj_step = _info.get("subtraj_step_no", "?") if isinstance(_info, dict) else "?"
+        traj_len = _info.get("traj_len", "?") if isinstance(_info, dict) else "?"
 
         # Build debug info for video overlay
         debug_info = {
-            'global_step': global_step,
-            'episode_step': episode_step,
-            'done': int(done) if isinstance(done, (bool, np.bool_)) else done,
-            'prev_done': int(prev_done) if isinstance(prev_done, (bool, np.bool_)) else prev_done,
-            'absorbing': int(_absorbing) if isinstance(_absorbing, (bool, np.bool_)) else _absorbing,
-            'terminated': int(terminated) if isinstance(terminated, (bool, np.bool_)) else terminated,
-            'truncated': int(truncated) if isinstance(truncated, (bool, np.bool_)) else truncated,
-            'traj_no': traj_no,
-            'subtraj_step': subtraj_step,
-            'traj_len': traj_len,
+            "global_step": global_step,
+            "episode_step": episode_step,
+            "done": int(done) if isinstance(done, bool | np.bool_) else done,
+            "prev_done": int(prev_done) if isinstance(prev_done, bool | np.bool_) else prev_done,
+            "absorbing": int(_absorbing) if isinstance(_absorbing, bool | np.bool_) else _absorbing,
+            "terminated": int(terminated) if isinstance(terminated, bool | np.bool_) else terminated,
+            "truncated": int(truncated) if isinstance(truncated, bool | np.bool_) else truncated,
+            "traj_no": traj_no,
+            "motion_name": motion_name,
+            "subtraj_step": subtraj_step,
+            "traj_len": traj_len,
         }
 
         if render:
@@ -280,7 +268,7 @@ def play_policy(
                 def _add_batch(x):
                     if hasattr(x, "shape") and x.shape:
                         return x[None]
-                    elif isinstance(x, (int, float, bool, np.number)):
+                    elif isinstance(x, int | float | bool | np.number):
                         return jnp.array([x])
                     return x
 
@@ -298,8 +286,8 @@ def play_policy(
                 episode_count += 1
                 if use_mujoco and not sequential_mjx and isinstance(_info, dict):
                     # Determine termination reason
-                    terminated = _info.get('terminated', False)
-                    truncated = _info.get('truncated', False)
+                    terminated = _info.get("terminated", False)
+                    truncated = _info.get("truncated", False)
                     if terminated:
                         reason = "TERMINATED (early)"
                     elif truncated:
@@ -308,20 +296,22 @@ def play_policy(
                         reason = "DONE"
 
                     # Trajectory progress
-                    traj_no = _info.get('traj_no', '?')
-                    subtraj_step = _info.get('subtraj_step_no', '?')
-                    traj_len = _info.get('traj_len', '?')
+                    traj_no = _info.get("traj_no", "?")
+                    subtraj_step = _info.get("subtraj_step_no", "?")
+                    traj_len = _info.get("traj_len", "?")
                     progress = ""
-                    if isinstance(subtraj_step, (int, float)) and isinstance(traj_len, (int, float)) and traj_len > 0:
+                    if isinstance(subtraj_step, int | float) and isinstance(traj_len, int | float) and traj_len > 0:
                         pct = subtraj_step / traj_len * 100
                         progress = f" ({pct:.0f}%)"
 
-                    print(f"\n--- Episode {episode_count} {reason} | steps={episode_step}, reward={episode_reward:.2f} ---")
+                    print(
+                        f"\n--- Episode {episode_count} {reason} | steps={episode_step}, reward={episode_reward:.2f} ---"
+                    )
                     print(f"  trajectory: #{traj_no}, step {subtraj_step}/{traj_len}{progress}")
 
                     # Reward breakdown
-                    reward_keys = [k for k in _info if k.startswith('reward_')]
-                    penalty_keys = [k for k in _info if k.startswith('penalty_')]
+                    reward_keys = [k for k in _info if k.startswith("reward_")]
+                    penalty_keys = [k for k in _info if k.startswith("penalty_")]
                     if reward_keys:
                         parts = [f"{k.removeprefix('reward_')}={_info[k]:.3f}" for k in sorted(reward_keys)]
                         print(f"  rewards: {', '.join(parts)}")
@@ -330,7 +320,7 @@ def play_policy(
                         print(f"  penalties: {', '.join(parts)}")
 
                     # Error metrics
-                    err_keys = [k for k in _info if k.startswith('err_')]
+                    err_keys = [k for k in _info if k.startswith("err_")]
                     if err_keys:
                         parts = [f"{k.removeprefix('err_')}={_info[k]:.4f}" for k in sorted(err_keys)]
                         print(f"  errors: {', '.join(parts)}")
@@ -356,8 +346,8 @@ def play_policy(
 
 def play_policy_mujoco(
     env: Any,
-    agent_conf: PPOAgentConf,
-    agent_state: PPOAgentState,
+    agent_conf: AgentConfBase,
+    agent_state: AgentStateBase,
     n_steps: int | None = None,
     render: bool = True,
     record: bool = False,

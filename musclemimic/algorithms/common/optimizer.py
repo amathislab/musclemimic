@@ -183,9 +183,14 @@ def get_optimizer(exp: Any) -> optax.GradientTransformation:
             def learning_rate(c):
                 return schedule(c // steps_per_update)
         else:
+
             def learning_rate(c):
                 return linear_lr_schedule(
-                    c, num_minibatches, update_epochs, lr, num_updates,
+                    c,
+                    num_minibatches,
+                    update_epochs,
+                    lr,
+                    num_updates,
                 )
     else:
         learning_rate = lr

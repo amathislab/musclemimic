@@ -62,6 +62,18 @@ class TestConfigHash:
         })
         assert config_hash(cfg1) == config_hash(cfg2)
 
+    def test_excludes_validation_config(self):
+        """Validation-only changes should not block training checkpoint resume."""
+        cfg1 = OmegaConf.create({
+            "lr": 0.001,
+            "validation": {"active": False, "num_steps": 500},
+        })
+        cfg2 = OmegaConf.create({
+            "lr": 0.001,
+            "validation": {"active": True, "num_steps": 1000},
+        })
+        assert config_hash(cfg1) == config_hash(cfg2)
+
     def test_hash_is_12_chars(self):
         """Hash should be 12 characters."""
         cfg = OmegaConf.create({"lr": 0.001})

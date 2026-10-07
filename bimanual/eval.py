@@ -16,7 +16,7 @@ Usage examples:
 - Stochastic policy:
     python bimanual/eval.py --path outputs/.../checkpoint_123 --stochastic
 - Trajectory export:
-    python bimanual/eval.py --path outputs/.../checkpoint_123 --export_trajectory
+    python bimanual/eval.py --path outputs/.../checkpoint_123 --use_mujoco --export_trajectory
 - Headless mode:
     python bimanual/eval.py --path outputs/.../checkpoint_123 --no_render
 - List trajectories:
@@ -25,6 +25,9 @@ Usage examples:
     python bimanual/eval.py --path outputs/.../checkpoint_123 --traj_index 3 --traj_start_step 0
 - Compute validation metrics:
     python bimanual/eval.py --path outputs/.../checkpoint_123 --metrics
+- Evaluate every motion in a group with MJX metrics:
+    python bimanual/eval.py --path outputs/.../checkpoint_123 --motion_group GROUP_NAME \
+        --evaluate_all
 """
 
 import argparse
@@ -34,10 +37,11 @@ import sys
 from omegaconf import OmegaConf
 
 from loco_mujoco.task_factories import TaskFactory
-from musclemimic.algorithms import PPOJax
+from musclemimic.core.goals.bimanual_tracking import bimanual_visual_goal_type
+from musclemimic.core.goals.tracking import rescale_lookahead_steps
+from musclemimic.runner.engine import pick_algorithm
 from musclemimic.runner.eval_utils import (
     add_common_eval_args,
-    align_agent_state,
     apply_temporal_params,
     apply_trajectory_selection,
     check_trajectory_sync,
@@ -47,6 +51,7 @@ from musclemimic.runner.eval_utils import (
     load_checkpoint,
     normalize_eval_args,
     run_validation_metrics,
+    run_validation_metrics_mjx_all,
     run_validation_metrics_mujoco,
     run_with_mujoco_viewer,
     run_with_trajectory_export,
@@ -63,7 +68,7 @@ jax_config.update("jax_default_matmul_precision", "high")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run evaluation with PPOJax.")
+    parser = argparse.ArgumentParser(description="Evaluate a MuscleMimic policy.")
     add_common_eval_args(parser, default_n_envs=5)
 
     parser.add_argument(
@@ -86,6 +91,20 @@ def main() -> int:
         default=False,
         action="store_true",
         help="Start evaluation from the beginning of the motion (default: False).",
+    )
+
+    parser.add_argument(
+        "--evaluate_all",
+        default=False,
+        action="store_true",
+        help="Evaluate every trajectory from frame zero and exit; ignores --n_steps.",
+    )
+    parser.add_argument(
+        "--evaluate_all_passes",
+        type=int,
+        default=1,
+        help="With --evaluate_all --export_trajectory, repeat the full dataset sweep this many "
+        "times (default: 1). With --stochastic each pass is a different rollout.",
     )
 
     parser.add_argument(
@@ -144,7 +163,8 @@ def main() -> int:
         print("   Use --no_render for headless operation")
         return 1
 
-    config, agent_state, _metadata = load_checkpoint(args.path)
+    config, state_data, _metadata = load_checkpoint(args.path)
+    algorithm_cls = pick_algorithm(config)
     OmegaConf.set_struct(config, False)
 
     # Restore training configuration
@@ -182,10 +202,18 @@ def main() -> int:
         print(f"\n=== OVERRIDE: n_substeps={args.n_substeps} ===")
         print(f"   New control_dt: {new_control_dt} ({1 / new_control_dt:.0f}Hz)")
 
-        # Scale n_step_stride to maintain same lookahead time window
+        # Preserve the physical lookahead window at the new control rate.
         goal_params = config.experiment.env_params.get("goal_params", {})
-        old_stride = goal_params.get("n_step_stride")
-        if old_stride is not None:
+        old_lookahead_steps = goal_params.get("lookahead_steps")
+        if old_lookahead_steps is not None:
+            new_lookahead_steps = rescale_lookahead_steps(
+                old_lookahead_steps,
+                training_control_dt,
+                new_control_dt,
+            )
+            config.experiment.env_params["goal_params"]["lookahead_steps"] = list(new_lookahead_steps)
+            print(f"   lookahead_steps: {list(old_lookahead_steps)} -> {list(new_lookahead_steps)}")
+        elif (old_stride := goal_params.get("n_step_stride")) is not None:
             new_stride = round(old_stride * training_control_dt / new_control_dt)
             new_stride = max(1, new_stride)
             config.experiment.env_params["goal_params"]["n_step_stride"] = new_stride
@@ -197,7 +225,8 @@ def main() -> int:
     # Bimanual-specific visualization configuration
     if env_name and "MyoBimanualArm" in env_name:
         print("\nConfiguring MyoBimanualArm evaluation:")
-        configure_goal_visualization(config, args, "GoalBimanualTrajMimicv2", is_mjx_env="Mjx" in env_name)
+        visual_goal_type = bimanual_visual_goal_type(goal_type)
+        configure_goal_visualization(config, args, visual_goal_type, is_mjx_env="Mjx" in env_name)
         print(f"   Training goal_type: {goal_type}")
         print(f"   Evaluation goal_type: {config.experiment.env_params.get('goal_type')}")
         print(
@@ -218,6 +247,14 @@ def main() -> int:
     elif args.motion_group is not None:
         config.experiment.task_factory.params.amass_dataset_conf.dataset_group = args.motion_group
         print(f"Motion group override: {args.motion_group}")
+
+    if args.metrics and args.evaluate_all:
+        print("\nEvaluating all trajectories in the dataset for validation metrics.")
+        if "th_params" not in config.experiment.env_params:
+            config.experiment.env_params.th_params = {}
+        config.experiment.env_params.th_params.random_start = False
+        config.experiment.env_params.th_params.fixed_start_conf = [0, 0]
+        config.experiment.env_params.th_params.start_from_random_step = False
 
     if args.start_from_beginning:
         if "th_params" not in config.experiment.env_params:
@@ -297,8 +334,8 @@ def main() -> int:
     validate_traj_index(env, args.traj_index)
 
     # Build agent configuration and align state for inference
-    agent_conf = PPOJax.init_agent_conf(env, config)
-    agent_state = align_agent_state(agent_state, agent_conf)
+    agent_conf = algorithm_cls.init_agent_conf(env, config)
+    agent_state = algorithm_cls.restore_agent_state(state_data, agent_conf)
 
     # Verify env timing and trajectory sync
     verify_env_dt(env, actual_control_dt)
@@ -323,6 +360,17 @@ def main() -> int:
                 num_steps=args.metrics_steps or 500,
                 deterministic=metrics_deterministic,
                 train_state_seed=args.train_state_seed,
+                evaluate_all=args.evaluate_all,
+                eval_seed=args.eval_seed,
+            )
+        elif args.evaluate_all:
+            metrics_dict = run_validation_metrics_mjx_all(
+                env,
+                agent_conf,
+                agent_state,
+                deterministic=metrics_deterministic,
+                train_state_seed=args.train_state_seed,
+                num_envs=args.metrics_envs,
                 eval_seed=args.eval_seed,
             )
         else:
@@ -330,6 +378,7 @@ def main() -> int:
             _validation_summary, metrics_dict = run_validation_metrics(
                 config,
                 agent_state,
+                agent_conf,
                 train_state_seed=args.train_state_seed,
                 num_steps=args.metrics_steps,
                 num_envs=args.metrics_envs,
@@ -369,6 +418,12 @@ def main() -> int:
                 train_state_seed=args.train_state_seed,
                 trajectory_dir=args.trajectory_dir,
                 file_prefix="bimanual_episodes",
+                evaluate_all=args.evaluate_all,
+                evaluate_all_passes=args.evaluate_all_passes,
+                motion_group=args.motion_group,
+                eval_seed=args.eval_seed,
+                export_kinetics=args.export_kinetics,
+                checkpoint_path=args.path,
             )
 
         elif args.use_mujoco and args.mujoco_viewer:
@@ -389,7 +444,7 @@ def main() -> int:
             viewer.run(n_steps=args.n_steps)
         elif args.use_mujoco:
             print("Running MuJoCo evaluation...")
-            PPOJax.play_policy_mujoco(
+            algorithm_cls.play_policy_mujoco(
                 env,
                 agent_conf,
                 agent_state,
@@ -401,17 +456,19 @@ def main() -> int:
             )
         else:
             print("Running MJX evaluation...")
-            PPOJax.play_policy(
+            mjx_play_envs = 1 if args.traj_index is not None else int(args.num_envs)
+            use_sequential_mjx = args.traj_index is not None and not args.evaluate_all
+            algorithm_cls.play_policy(
                 env,
                 agent_conf,
                 agent_state,
                 deterministic=not args.stochastic,
                 n_steps=args.n_steps,
-                n_envs=int(args.num_envs),
+                n_envs=mjx_play_envs,
                 render=enable_render,
                 record=args.record,
                 train_state_seed=args.train_state_seed,
-                sequential_mjx=False,
+                sequential_mjx=use_sequential_mjx,
             )
 
         print("\nEvaluation completed successfully!")

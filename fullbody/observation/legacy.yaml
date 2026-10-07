@@ -1,0 +1,9 @@
+# @package experiment.env_params
+
+use_egocentric_root_observations: false
+goal_type: GoalTrajMimic
+goal_params:
+  n_step_lookahead: 5
+  n_step_stride: 20
+  enable_motion_phase: true
+  use_concise_lookahead: true

@@ -35,7 +35,6 @@ class TrajectoryHandler(StatefulObject):
     interpolates the trajectory to the desired control frequency.
 
     """
-
     def __init__(
         self,
         model,
@@ -45,10 +44,12 @@ class TrajectoryHandler(StatefulObject):
         random_start=True,
         fixed_start_conf=None,
         start_from_random_step=True,
+        random_start_sampling: str = "trajectory",
         clip_trajectory_to_joint_ranges=False,
         warn=True,
         cache_type: TrajectoryCacheType | str = TrajectoryCacheType.FULL,
         site_names: list[str] | None = None,
+        materialized: bool = False,
         motion_names: Sequence[str | None] | None = None,
     ):
         """
@@ -63,8 +64,11 @@ class TrajectoryHandler(StatefulObject):
                 should be None.
             control_dt (float): Model control frequency used to interpolate the trajectory.
             start_from_random_step (bool): If True, start from a random step in the trajectory.
+            random_start_sampling (str): "trajectory" samples a trajectory first, then a step inside it.
+                "state" samples uniformly over trajectory states when start_from_random_step is enabled.
             warn (bool): If True, a warning will be raised, if some trajectory ranges are violated. todo
             motion_names: Source name for each trajectory, in trajectory index order.
+            materialized (bool): Whether the trajectory already contains the requested runtime cache.
 
         """
 
@@ -83,15 +87,30 @@ class TrajectoryHandler(StatefulObject):
         self.fixed_start_conf = fixed_start_conf
         self.use_fixed_start = True if fixed_start_conf is not None else False
         self.start_from_random_step = start_from_random_step
+        if random_start_sampling not in ("trajectory", "state"):
+            raise ValueError("random_start_sampling must be either 'trajectory' or 'state'.")
+        self.random_start_sampling = random_start_sampling
 
         self.control_dt = control_dt
-        self.traj = materialize_trajectory(
-            traj,
-            model=model,
-            control_dt=control_dt,
-            cache_type=cache_type,
-            site_names=site_names,
-        )
+        self.cache_type = TrajectoryCacheType(cache_type)
+        self.cache_site_names = list(site_names) if site_names is not None else None
+        if materialized:
+            _validate_materialized_trajectory(
+                traj,
+                model,
+                control_dt,
+                self.cache_type,
+                self.cache_site_names,
+            )
+            self.traj = traj
+        else:
+            self.traj = materialize_trajectory(
+                traj,
+                model=model,
+                control_dt=control_dt,
+                cache_type=self.cache_type,
+                site_names=self.cache_site_names,
+            )
         self._is_numpy = True if isinstance(self.traj.data.qpos, np.ndarray) else False
         self.motion_names = self._normalize_motion_names(motion_names)
 
@@ -130,6 +149,58 @@ class TrajectoryHandler(StatefulObject):
         """Return the last valid step index for a trajectory."""
         return self.len_trajectory(traj_ind) - 1
 
+    def _trajectory_lengths(self):
+        split_points = self.traj.data.split_points
+        return split_points[1:] - split_points[:-1]
+
+    def _start_trajectory_probabilities(self, weights, backend):
+        if self.random_start_sampling == "trajectory" or not self.start_from_random_step:
+            return weights
+
+        lengths = self._trajectory_lengths().astype(backend.float32)
+        probabilities = lengths
+        if weights is not None:
+            probabilities = probabilities * backend.asarray(weights, dtype=backend.float32)
+        return probabilities / backend.sum(probabilities)
+
+    def sample_start_indices(self, traj_key, step_key, weights=None, backend=jnp):
+        """Sample a trajectory id and start step using the configured random-start mode."""
+        probabilities = self._start_trajectory_probabilities(weights, backend)
+
+        if backend == jnp:
+            if probabilities is None:
+                traj_idx = jax.random.randint(traj_key, shape=(), minval=0, maxval=self.n_trajectories)
+            else:
+                # ``random.choice`` compares a key-varying sample against this
+                # array. Match its manual-axis variation inside checked
+                # ``shard_map`` without changing the probability values.
+                key_zero = jax.random.key_data(traj_key)[0].astype(probabilities.dtype) * 0
+                probabilities = probabilities + key_zero
+                traj_idx = jax.random.choice(traj_key, self.n_trajectories, p=probabilities)
+
+            if self.start_from_random_step:
+                subtraj_step_idx = jax.random.randint(
+                    step_key,
+                    shape=(),
+                    minval=0,
+                    maxval=self.len_trajectory(traj_idx),
+                    dtype=jnp.int32,
+                )
+            else:
+                subtraj_step_idx = jnp.int32(0)
+            return traj_idx.astype(jnp.int32), subtraj_step_idx
+
+        if probabilities is None:
+            traj_idx = np.random.randint(0, self.n_trajectories)
+        else:
+            traj_idx = np.random.choice(self.n_trajectories, p=np.asarray(probabilities))
+
+        if self.start_from_random_step:
+            subtraj_step_idx = np.random.randint(0, self.len_trajectory(traj_idx))
+        else:
+            subtraj_step_idx = 0
+        return backend.asarray(traj_idx, dtype=backend.int32), backend.asarray(subtraj_step_idx, dtype=backend.int32)
+
     def reached_trajectory_end(self, traj_state, backend):
         """Check whether a trajectory state is at or past its terminal frame."""
         last_step_idx = self.last_step_idx(traj_state.traj_no)
@@ -156,14 +227,14 @@ class TrajectoryHandler(StatefulObject):
             TrajectoryData, TrajectoryInfo: Filtered and extended trajectory data and trajectory info.
 
         """
-
+        
         # Special handling for MyoBimanualArm: detect if this is a MyoBimanualArm trajectory
         # by checking if the trajectory has exactly 7 sites matching MyoBimanualArm's sites_for_mimic
         is_bimanual_muscle_traj = False
-        bimanual_sites = ["right_shoulder_mimic", "right_elbow_mimic", "right_hand_mimic",
+        bimanual_sites = ["right_shoulder_mimic", "right_elbow_mimic", "right_hand_mimic", 
                            "left_shoulder_mimic", "left_elbow_mimic", "left_hand_mimic"]
-
-        if (traj_info.site_names is not None and
+        
+        if (traj_info.site_names is not None and 
             len(traj_info.site_names) == 6 and
             set(traj_info.site_names) == set(bimanual_sites)):
             is_bimanual_muscle_traj = True
@@ -263,7 +334,7 @@ class TrajectoryHandler(StatefulObject):
             # and skip adding sites from the model to maintain memory optimization
             has_many_model_sites = len(site_names) > len(traj_info.site_names) * 10  # Model has 10x more sites than trajectory
             is_muscle_model = is_bimanual_muscle_traj or has_many_model_sites
-
+            
             if not is_muscle_model:
                 # Only add sites for non-muscle models
                 for s_name in site_names:
@@ -293,7 +364,7 @@ class TrajectoryHandler(StatefulObject):
             new_site_order = []
             has_many_model_sites = len(site_names) > len(traj_info.site_names) * 10  # Model has 10x more sites than trajectory
             is_muscle_model = is_bimanual_muscle_traj or has_many_model_sites
-
+            
             if is_muscle_model:
                 # For muscle models, maintain the existing order of mimic sites
                 # without trying to reorder to match all model sites
@@ -324,33 +395,26 @@ class TrajectoryHandler(StatefulObject):
 
         def _selected_idx():
             traj_idx = backend.asarray(carry.selected_traj_idx, dtype=backend.int32)
-            return traj_idx, backend.asarray(0, dtype=backend.int32)
+            selected_step = getattr(carry, "selected_subtraj_step", None)
+            if selected_step is None:
+                return traj_idx, backend.asarray(0, dtype=backend.int32)
+            selected_step = backend.asarray(selected_step, dtype=backend.int32)
+            if backend == jnp:
+                step_idx = jnp.where(selected_step >= 0, selected_step, 0)
+            else:
+                step_idx = selected_step if int(selected_step) >= 0 else backend.asarray(0, dtype=backend.int32)
+            return traj_idx, step_idx
 
         def _random_start_idx():
             if backend == jnp:
                 new_key, _k1, _k2 = jax.random.split(key, 3)
 
                 weights = getattr(carry, "sampling_weights", None)
-                if weights is not None:
-                    traj_idx = jax.random.choice(_k1, self.n_trajectories, p=weights)
-                else:
-                    traj_idx = jax.random.randint(_k1, shape=(), minval=0, maxval=self.n_trajectories)
-
-                if self.start_from_random_step:
-                    subtraj_step_idx = jax.random.randint(_k2, shape=(), minval=0, maxval=self.len_trajectory(traj_idx))
-                else:
-                    subtraj_step_idx = jnp.int32(0)
+                traj_idx, subtraj_step_idx = self.sample_start_indices(_k1, _k2, weights, backend)
                 return new_key, traj_idx, subtraj_step_idx
 
             weights = getattr(carry, "sampling_weights", None)
-            if weights is not None:
-                traj_idx = np.random.choice(self.n_trajectories, p=np.asarray(weights))
-            else:
-                traj_idx = np.random.randint(0, self.n_trajectories)
-            if self.start_from_random_step:
-                subtraj_step_idx = np.random.randint(0, self.len_trajectory(traj_idx))
-            else:
-                subtraj_step_idx = 0
+            traj_idx, subtraj_step_idx = self.sample_start_indices(None, None, weights, backend)
             return key, traj_idx, subtraj_step_idx
 
         def _fixed_start_idx():
@@ -366,12 +430,13 @@ class TrajectoryHandler(StatefulObject):
 
         selected_traj_idx = getattr(carry, "selected_traj_idx", None)
         if backend == jnp and selected_traj_idx is not None:
-            key, traj_idx, subtraj_step_idx = jax.lax.cond(
-                selected_traj_idx >= 0,
-                lambda _: (key, *_selected_idx()),
-                lambda _: _default_idx(),
-                operand=None,
-            )
+            selected_traj_idx = jnp.asarray(selected_traj_idx, dtype=jnp.int32)
+            selected_traj_idx, selected_step_idx = _selected_idx()
+            default_key, default_traj_idx, default_step_idx = _default_idx()
+            use_selected = selected_traj_idx >= 0
+            key = jnp.where(use_selected, key, default_key)
+            traj_idx = jnp.where(use_selected, selected_traj_idx, default_traj_idx)
+            subtraj_step_idx = jnp.where(use_selected, selected_step_idx, default_step_idx)
         elif selected_traj_idx is not None and int(selected_traj_idx) >= 0:
             traj_idx, subtraj_step_idx = _selected_idx()
         else:
@@ -433,6 +498,45 @@ class TrajectoryHandler(StatefulObject):
     @property
     def is_numpy(self):
         return self._is_numpy
+
+
+def _validate_materialized_trajectory(
+    traj: Trajectory,
+    model: "mujoco.MjModel",
+    control_dt: float,
+    cache_type: TrajectoryCacheType | str,
+    site_names: list[str] | None,
+) -> None:
+    """Validate the small set of invariants needed to skip materialization."""
+    cache_type = TrajectoryCacheType(cache_type)
+    expected_frequency = 1.0 / control_dt
+    if not np.isclose(traj.info.frequency, expected_frequency, atol=1e-9):
+        raise ValueError(
+            f"Materialized trajectory frequency is {traj.info.frequency}, expected {expected_frequency}."
+        )
+    if traj.data.qpos.ndim != 2 or traj.data.qpos.shape[1] != model.nq:
+        raise ValueError(f"Materialized qpos shape must be (n, {model.nq}), got {traj.data.qpos.shape}.")
+    if traj.data.qvel.ndim != 2 or traj.data.qvel.shape[1] != model.nv:
+        raise ValueError(f"Materialized qvel shape must be (n, {model.nv}), got {traj.data.qvel.shape}.")
+
+    required_fields = {
+        TrajectoryCacheType.NONE: (),
+        TrajectoryCacheType.FULL: ("xpos", "xquat", "cvel", "subtree_com", "site_xpos", "site_xmat"),
+        TrajectoryCacheType.SPARSE: ("site_xpos", "site_xmat", "cvel_parent", "subtree_com_root"),
+    }[cache_type]
+    n_samples = traj.data.qpos.shape[0]
+    for field_name in required_fields:
+        field = getattr(traj.data, field_name)
+        if field.ndim == 0 or field.shape[0] != n_samples:
+            raise ValueError(
+                f"Materialized trajectory field '{field_name}' has shape {field.shape}; "
+                f"expected first dimension {n_samples}."
+            )
+
+    if cache_type == TrajectoryCacheType.SPARSE and traj.info.site_names != list(site_names or []):
+        raise ValueError(
+            f"Materialized trajectory sites are {traj.info.site_names}, expected {list(site_names or [])}."
+        )
 
 
 def materialize_trajectory(

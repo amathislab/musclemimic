@@ -1,5 +1,6 @@
 defaults:
   - conf_fullbody  # Inherit from base config
+  - _self_
 
 # Override wandb tags to indicate GMR
 wandb:
@@ -12,8 +13,8 @@ experiment:
   task_factory:
     params:
       amass_dataset_conf:
-        dataset_group: "KIT_KINESIS_TRAINING_MOTIONS"
         retargeting_method: gmr
+        gmr_cache_namespace: gmr_v6
         gmr_config:
           src_human: smplh
           target_fps: 30
@@ -27,8 +28,8 @@ experiment:
   # Validation also needs GMR retargeting
   validation:
     amass_dataset_conf:
-      dataset_group: "KIT_KINESIS_TESTING_MOTIONS"
       retargeting_method: gmr
+      gmr_cache_namespace: gmr_v6
       gmr_config:
         src_human: smplh
         target_fps: 30

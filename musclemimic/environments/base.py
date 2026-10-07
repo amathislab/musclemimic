@@ -45,6 +45,9 @@ class LocoCarry(MjxAdditionalCarry):
     selected_traj_idx: jax.Array = struct.field(
         default_factory=lambda: jnp.asarray(-1, dtype=jnp.int32)
     )
+    selected_subtraj_step: jax.Array = struct.field(
+        default_factory=lambda: jnp.asarray(-1, dtype=jnp.int32)
+    )
     sampling_weights: jax.Array | None = None  # Shape (num_envs, n_traj) for weighted sampling
     termination_threshold: jax.Array = struct.field(
         default_factory=lambda: jnp.asarray(0.3, dtype=jnp.float32)
@@ -126,6 +129,7 @@ class LocoEnv(Mjx):
         cache_type="full",
         site_names=None,
         motion_names: Sequence[str | None] | None = None,
+        materialized: bool = False,
     ) -> None:
         """
         Loads trajectories. If there were trajectories loaded already, this function overrides the latter.
@@ -138,6 +142,7 @@ class LocoEnv(Mjx):
                 should be in the shape (joints x observations). If traj_files is specified, this should be None.
             warn (bool): If True, a warning will be raised.
             motion_names: Source name for each trajectory, in trajectory index order.
+            materialized (bool): Whether the trajectory already contains the requested runtime cache.
 
         """
 
@@ -154,6 +159,7 @@ class LocoEnv(Mjx):
             cache_type=cache_type,
             site_names=site_names,
             motion_names=motion_names,
+            materialized=materialized,
             **th_params,
         )
 
@@ -169,6 +175,20 @@ class LocoEnv(Mjx):
             obs_entry.init_from_traj(self.th)
         self._goal.init_from_traj(self.th)
         self._terminal_state_handler.init_from_traj(self.th)
+
+    def _reset_info_dictionary(self, obs: np.ndarray, data: MjData, key: jax.Array) -> dict:
+        """Initialize fixed-shape trajectory and termination diagnostics."""
+        info = super()._reset_info_dictionary(obs, data, key)
+        info["done_trajectory"] = False
+        info["termination_site_position"] = False
+        return info
+
+    def _mjx_reset_info_dictionary(self, obs: jnp.ndarray, data: Data, key: jax.Array) -> dict:
+        """Initialize fixed-shape trajectory and termination diagnostics."""
+        info = super()._mjx_reset_info_dictionary(obs, data, key)
+        info["done_trajectory"] = jnp.asarray(False, dtype=bool)
+        info["termination_site_position"] = jnp.asarray(False, dtype=bool)
+        return info
 
     def _is_done(self, obs: np.ndarray, absorbing: bool, info: dict, data: MjData, carry: LocoCarry) -> bool:
         """
@@ -187,13 +207,15 @@ class LocoEnv(Mjx):
         """
         done = super()._is_done(obs, absorbing, info, data, carry)
 
+        done_trajectory = False
         if self._goal.requires_trajectory or self._reward_function.requires_trajectory:
             # either the goal or the reward function requires the trajectory at each step, so we need to check
             # if the end of the trajectory is reached, if so, we set done to True
             traj_state = carry.traj_state
             # Check if we have a valid trajectory state (not EmptyState)
             if hasattr(traj_state, "subtraj_step_no") and hasattr(traj_state, "traj_no"):
-                done |= self.th.reached_trajectory_end(traj_state, np)
+                done_trajectory = bool(self.th.reached_trajectory_end(traj_state, np))
+                done |= done_trajectory
             else:
                 # EmptyState means no trajectory loaded, so don't terminate based on trajectory
                 done |= False
@@ -201,6 +223,7 @@ class LocoEnv(Mjx):
             # goals can terminate an episode
             done |= self._goal.is_done(self, self._model, data, carry, np)
 
+        info["done_trajectory"] = done_trajectory
         return done
 
     def _update_info_dictionary(self, info: dict, obs: np.ndarray, data: MjData, carry: LocoCarry) -> dict:
@@ -208,9 +231,13 @@ class LocoEnv(Mjx):
         info = super()._update_info_dictionary(info, obs, data, carry)
         traj_state = carry.traj_state
         if hasattr(traj_state, "traj_no") and hasattr(traj_state, "subtraj_step_no"):
-            info["traj_no"] = int(traj_state.traj_no)
+            traj_no = int(traj_state.traj_no)
+            info["traj_no"] = traj_no
             info["subtraj_step_no"] = int(traj_state.subtraj_step_no)
-            info["traj_len"] = int(self.th.len_trajectory(traj_state.traj_no))
+            info["traj_len"] = int(self.th.len_trajectory(traj_no))
+            motion_name = self.th.get_motion_name(traj_no)
+            if motion_name is not None:
+                info["motion_name"] = motion_name
         return info
 
     def _mjx_is_done(self, obs: jnp.ndarray, absorbing: bool, info: dict, data: Data, carry: LocoCarry) -> bool:
@@ -229,15 +256,18 @@ class LocoEnv(Mjx):
         """
         done = super()._mjx_is_done(obs, absorbing, info, data, carry)
 
+        done_trajectory = jnp.asarray(False, dtype=bool)
         if self._goal.requires_trajectory or self._reward_function.requires_trajectory:
             # either the goal or the reward function requires the trajectory at each step, so we need to check
             # if the end of the trajectory is reached, if so, we set done to True
             traj_state = carry.traj_state
             reached_end_of_traj = self.th.reached_trajectory_end(traj_state, jnp)
+            done_trajectory = reached_end_of_traj
             done = jnp.logical_or(done, reached_end_of_traj)
             # goals can terminate an episode
             done = jnp.logical_or(done, self._goal.mjx_is_done(self, self._model, data, carry, jnp))
 
+        info["done_trajectory"] = done_trajectory
         return done
 
     def _simulation_post_step(self, model: MjModel, data: MjData, carry: LocoCarry) -> tuple[MjData, LocoCarry]:
@@ -704,12 +734,13 @@ class LocoEnv(Mjx):
         self,
         key: jax.random.PRNGKey,
         selected_traj_idx: jax.Array | None = None,
+        selected_subtraj_step: jax.Array | None = None,
     ) -> MjxState:
         """
         Resets the environment.
 
         Note: Trajectory must be converted to JAX format before JIT compilation
-        (done in engine.instantiate_env). Converting inside this method would
+        (done in runner.environment_factory). Converting inside this method would
         trigger TracerBoolConversionError since mjx_reset runs within JIT.
 
         Args:
@@ -722,6 +753,7 @@ class LocoEnv(Mjx):
         return super().mjx_reset(
             key,
             selected_traj_idx=selected_traj_idx,
+            selected_subtraj_step=selected_subtraj_step,
         )
 
     def _reset_carry(self, model: MjModel, data: MjData, carry: LocoCarry) -> tuple[MjData, LocoCarry]:

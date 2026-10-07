@@ -1,0 +1,7 @@
+id: relative-mean100cm-root100cm
+type: MeanRelativeSiteDeviationWithRootTerminalStateHandler
+params:
+  mean_site_deviation_threshold: 1.0
+  root_deviation_threshold: 1.0
+  root_orientation_threshold: 1.0
+  enable_site_check: true

@@ -5,6 +5,8 @@ from typing import Any
 
 from omegaconf import OmegaConf
 
+from musclemimic.runner.validation_config import apply_validation_reward_termination
+
 TERMINAL_PARAM_SUPPORT = {
     "MeanSiteDeviationTerminalStateHandler": {"mean_site_deviation_threshold"},
     "MeanRelativeSiteDeviationTerminalStateHandler": {"mean_site_deviation_threshold"},
@@ -38,10 +40,28 @@ def apply_eval_terminal_defaults(env_params: dict[str, Any], config: Any, strict
     print("Using validation terminal state configuration for evaluation")
 
 
+def apply_eval_reward_termination_defaults(
+    env_params: dict[str, Any],
+    config: Any,
+    strict_termination: bool,
+) -> None:
+    """Apply validation reward-termination settings for fullbody evaluation."""
+    if strict_termination:
+        return
+
+    validation_cfg = config.experiment.get("validation", None)
+    if validation_cfg is None:
+        return
+
+    apply_validation_reward_termination(env_params, validation_cfg)
+
+
 def apply_terminal_cli_overrides(env_params: dict[str, Any], args: argparse.Namespace) -> None:
     """Apply CLI terminal-state overrides on top of evaluation defaults."""
     if args.no_termination:
         env_params["terminal_state_type"] = "NoTerminalStateHandler"
+        env_params["reward_termination_type"] = "NoRewardTerminationHandler"
+        env_params["reward_termination_params"] = {}
         print("Early termination disabled")
 
     if args.terminal_state_type is not None:

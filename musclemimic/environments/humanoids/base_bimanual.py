@@ -96,8 +96,11 @@ class BaseBimanualSkeleton(FixedRootEnv):
         # Store mjx_backend for use in _modify_spec_for_mjx
         self.mjx_backend = mjx_backend
 
-        # Store nconmax and num_envs from kwargs for automatic scaling
+        # Warp contact/constraint budget overrides. nconmax remains the MuJoCo
+        # per-env spec limit; naconmax is the total Warp contact budget.
         self.nconmax = kwargs.get("nconmax", None)
+        self.naconmax = kwargs.get("naconmax", None)
+        self.njmax = kwargs.get("njmax", None)
         self.num_envs = kwargs.get("num_envs", 1)
 
         if spec is None:
@@ -272,6 +275,7 @@ class BaseBimanualSkeleton(FixedRootEnv):
         cache_type="full",
         site_names=None,
         motion_names: Sequence[str | None] | None = None,
+        materialized: bool = False,
     ) -> None:
         """
         Loads trajectories. If there were trajectories loaded already, this function overrides the latter.
@@ -299,6 +303,7 @@ class BaseBimanualSkeleton(FixedRootEnv):
             cache_type=cache_type,
             site_names=site_names,
             motion_names=motion_names,
+            materialized=materialized,
             **th_params,
         )
 
@@ -372,16 +377,15 @@ class BaseBimanualSkeleton(FixedRootEnv):
         """
 
         # Set contact budget for Warp backend
-        if hasattr(self, "mjx_backend") and self.mjx_backend == "warp":
-            # MuJoCo 3.3.7+: nconmax is per-env, naconmax is total across all envs
+        if self.mjx_backend == "warp":
+            # MuJoCo 3.3.7+: nconmax is per-env, naconmax is total across all envs.
             per_env_contacts = 10  # Contacts per environment
-            num_envs = getattr(self, "num_envs", 1)
 
-            if not hasattr(self, "nconmax") or self.nconmax is None:
+            if self.nconmax is None:
                 self.nconmax = per_env_contacts  # Per-env contacts
-            if not hasattr(self, "naconmax") or getattr(self, "naconmax", None) is None:
-                self.naconmax = self.nconmax * num_envs  # Total across all envs
-            if not hasattr(self, "njmax") or self.njmax is None:
+            if self.naconmax is None:
+                self.naconmax = self.nconmax * self.num_envs  # Total across all envs
+            if self.njmax is None:
                 self.njmax = 256  # Per-world constraints
             spec.nconmax = self.nconmax
             spec.njmax = self.njmax

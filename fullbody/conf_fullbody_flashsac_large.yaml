@@ -1,0 +1,38 @@
+defaults:
+  - conf_fullbody_flashsac
+  - _self_
+
+hydra:
+  job:
+    env_set:
+      XLA_PYTHON_CLIENT_PREALLOCATE: "true"
+      XLA_PYTHON_CLIENT_MEM_FRACTION: "0.7"
+
+wandb:
+  name: "fullbody-gmr-flashsac-large"
+  tags: ["fullbody", "gmr", "flashsac", "large", "refine"]
+
+experiment:
+  # 500,000 interactions * 2,048 environments.
+  total_timesteps: 1024000000
+
+  env_params:
+    num_envs: 8192
+
+  trajectory:
+    sharding: static
+
+  # Keep lifecycle cadence close to the single-GPU configuration in global
+  # environment steps (2048 interactions * 2048 envs).
+  checkpoint_interval: 2048
+  online_logging_interval: 3
+
+  # These are the global replay and learner sizes for the single-device run.
+  flashsac_config:
+    buffer_capacity: 4194304
+    min_buffer_size: 524288
+    sample_batch_size: 8192
+    update_chunk_size: 1
+    updates_per_interaction: 8
+    actor_hidden_dim: 512
+    actor_num_blocks: 8

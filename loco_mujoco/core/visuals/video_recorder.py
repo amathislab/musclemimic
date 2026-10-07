@@ -80,19 +80,26 @@ class VideoRecorder(object):
             term = debug_info.get('terminated', '?')
             trunc = debug_info.get('truncated', '?')
             traj = debug_info.get('traj_no', '?')
+            motion_name = debug_info.get('motion_name')
             substep = debug_info.get('subtraj_step', '?')
             traj_len = debug_info.get('traj_len', '?')
 
-            # Line 1: step counters
+            line_y = 30
+            if motion_name is not None:
+                cv2.putText(frame, f"motion:{motion_name}", (10, line_y), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (255, 255, 0), 2)
+                line_y += 30
+
+            # Step counters
             text1 = f"global:{g} | episode:{e} | traj:{traj} | step:{substep}/{traj_len}"
-            cv2.putText(frame, text1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.putText(frame, text1, (10, line_y), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (255, 255, 0), 2)
 
-            # Line 2: termination flags (highlight in red if any triggered)
+            # Termination flags (highlight in red if any triggered)
             text2 = f"done:{d} | prev_done:{pd} | absorbing:{ab} | terminated:{term} | truncated:{trunc}"
             # Use red color if done or terminated or truncated
             color = (0, 0, 255) if any(v == 1 for v in [d, pd, term, trunc] if isinstance(v, (int, float))) else (255, 255, 0)
-            cv2.putText(frame, text2, (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.putText(frame, text2, (10, line_y + 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, color, 2)
 
         if self._video_writer is None:
@@ -132,18 +139,8 @@ class VideoRecorder(object):
         if self._video_writer is None:
             return self._video_writer_path
 
-        try:
-            import cv2  # type: ignore
-        except Exception as e:  # pragma: no cover
-            raise ImportError(
-                "Video recording requires OpenCV (`cv2`), but it failed to import. "
-                "If you're on a headless system, you may be missing system OpenGL libs "
-                "(e.g., `libGL.so.1`). Install the appropriate system packages or "
-                "disable recording."
-            ) from e
-
-        cv2.destroyAllWindows()
         self._video_writer.release()
+        self._video_writer = None
 
         # compress video
         if self._compress and self._video_writer_path is not None:
@@ -170,8 +167,6 @@ class VideoRecorder(object):
 
             except subprocess.CalledProcessError as e:
                 print(f"Video compression failed: {e}")
-
-        self._video_writer = None
 
         self._counter += 1
 

@@ -1,5 +1,6 @@
 defaults:
   - conf_fullbody_gmr
+  - _self_
 
 wandb:
   tags: ["fullbody", "demo", "gmr"]

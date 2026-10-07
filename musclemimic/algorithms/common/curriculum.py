@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from flax import struct
 import jax
 import jax.numpy as jnp
+from flax import struct
 
 
 @struct.dataclass

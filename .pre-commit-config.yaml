@@ -48,6 +48,8 @@ default_language_version:
 files: |
   (?x)^(
     bimanual/.*|
+    fullbody/experiment\.py|
+    fullbody/.*\.yaml|
     tests/unit/test_enhanced_fullbody_terminal_handler\.py|
     tests/unit/test_enhanced_fullbody_terminal_handler_integration\.py|
     tests/test_muscle_observations\.py|
@@ -58,11 +60,49 @@ files: |
     musclemimic/utils/metrics\.py|
     tests/unit/test_metrics\.py|
     loco_mujoco/smpl/retargeting\.py|
+    loco_mujoco/task_factories/imitation_factory\.py|
+    loco_mujoco/trajectory/materialized_cache\.py|
+    musclemimic/algorithms/.*\.py|
+    musclemimic/runner/checkpointing\.py|
     musclemimic/runner/engine\.py|
+    musclemimic/runner/environment_factory\.py|
+    musclemimic/runner/eval_utils\.py|
+    musclemimic/runner/experiment_logging\.py|
+    musclemimic/runner/logging\.py|
+    musclemimic/runner/training_runtime\.py|
+    musclemimic/runner/trajectory_sharing\.py|
+    musclemimic/runner/validation_video_logging\.py|
+    musclemimic/runner/validation_video_checkpoint\.py|
+    musclemimic/runner/validation_video_recorder\.py|
+    musclemimic/runner/validation_video_worker\.py|
     musclemimic/core/initial_state_handler\.py|
+    musclemimic/core/reward/trajectory_based\.py|
+    musclemimic/core/wrappers/mjx\.py|
+    musclemimic/environments/humanoids/myofullbody\.py|
     musclemimic/web_viewer/.*\.py|
+    tests/unit/test_host_callback_boundary\.py|
+    tests/unit/test_auto_resume_integration\.py|
+    tests/unit/test_checkpoint_hooks\.py|
+    tests/unit/test_checkpointing_runtime\.py|
+    tests/unit/test_environment_factory\.py|
+    tests/unit/test_eval_utils\.py|
+    tests/unit/test_experiment_entrypoints\.py|
+    tests/unit/test_experiment_logging\.py|
+    tests/unit/test_ppo_early_termination_metrics\.py|
+    tests/unit/test_ppo_evaluation\.py|
+    tests/unit/test_ppo_learning\.py|
+    tests/unit/test_ppo_train\.py|
+    tests/unit/test_run_training_dispatch\.py|
+    tests/unit/test_trajectory_sharding\.py|
+    tests/unit/test_trajectory_sharing\.py|
+    tests/unit/test_validation_video_logging\.py|
+    tests/unit/test_validation_video_checkpoint\.py|
+    tests/unit/test_validation_video_recorder\.py|
     tests/unit/test_c3d_to_smpl\.py|
-    tests/unit/test_c3d_pipeline\.py
+    tests/unit/test_c3d_pipeline\.py|
+    tests/unit/test_materialized_trajectory_cache\.py|
+    tests/unit/test_mimic_reward\.py|
+    tests/unit/test_trajectory_resampling_consistency\.py
   )$
 
 # Always exclude these directories

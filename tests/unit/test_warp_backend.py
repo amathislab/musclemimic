@@ -10,6 +10,8 @@ import pytest
 
 import jax
 import jax.numpy as jnp
+import mujoco
+from mujoco import mjx
 
 # Ensure default registry entries are available for this minimal test env.
 import loco_mujoco.core.reward  # noqa: F401
@@ -172,6 +174,32 @@ def warp_test_xml(tmp_path):
     return str(path)
 
 
+@pytest.fixture
+def warp_template_xml(tmp_path):
+    """Create an XML with template-only fields used by the reset regression test."""
+    xml = """\
+<mujoco model="warp_template_test">
+  <size nuserdata="3"/>
+  <option timestep="0.01"/>
+  <worldbody>
+    <body name="mocap_target" mocap="true" pos="1 2 3">
+      <geom type="sphere" size="0.02" contype="0" conaffinity="0"/>
+    </body>
+    <body name="root" pos="0 0 1">
+      <joint name="root" type="free"/>
+      <geom type="sphere" size="0.1"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <framepos objtype="body" objname="root"/>
+  </sensor>
+</mujoco>
+"""
+    path = tmp_path / "warp_template_model.xml"
+    path.write_text(xml)
+    return str(path)
+
+
 @requires_warp
 def test_warp_backend_mjx_env_reset(warp_test_xml):
     """Verify that MJX environment with Warp backend can reset."""
@@ -184,6 +212,42 @@ def test_warp_backend_mjx_env_reset(warp_test_xml):
     assert state.observation.shape == (7,)
     assert state.done.shape == ()
     assert not np.asarray(state.done)
+
+
+@requires_warp
+def test_warp_backend_reset_uses_put_data_template(monkeypatch, warp_template_xml):
+    """Warp reset should preserve the full CPU template instead of hand-copying fields."""
+    env = _WarpTestEnv(warp_template_xml)
+    env._data.userdata[:] = np.array([7.0, 8.0, 9.0])
+    env._data.qacc_warmstart[:] = np.arange(env._model.nv, dtype=np.float64) + 0.25
+    mujoco.mj_forward(env._model, env._data)
+
+    expected_userdata = env._data.userdata.copy()
+    expected_warmstart = env._data.qacc_warmstart.copy()
+    calls = []
+    real_put_data = mjx.put_data
+
+    def recording_put_data(*args, **kwargs):
+        calls.append(kwargs.copy())
+        return real_put_data(*args, **kwargs)
+
+    def fail_make_data(*args, **kwargs):
+        raise AssertionError("Warp reset should use mjx.put_data, not mjx.make_data")
+
+    monkeypatch.setattr(mjx, "put_data", recording_put_data)
+    monkeypatch.setattr(mjx, "make_data", fail_make_data)
+
+    state = env.mjx_reset(jax.random.PRNGKey(0))
+
+    assert calls == [{"impl": "warp", "naconmax": env._naconmax, "njmax": env._njmax}]
+    np.testing.assert_allclose(np.asarray(state.data.userdata), expected_userdata, atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(np.asarray(state.data.qacc_warmstart), expected_warmstart, atol=0.0, rtol=0.0)
+
+    reset_state = env._mjx_reset_in_step(state)
+
+    assert calls[-1] == {"impl": "warp", "naconmax": env._naconmax, "njmax": env._njmax}
+    np.testing.assert_allclose(np.asarray(reset_state.data.userdata), expected_userdata, atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(np.asarray(reset_state.data.qacc_warmstart), expected_warmstart, atol=0.0, rtol=0.0)
 
 
 @requires_warp
@@ -293,7 +357,7 @@ def test_warp_backend_autoreset_wrapper_swaps_partial_done(warp_test_xml):
     _, state = env.reset(rng_keys)
 
     action = jnp.zeros((batch, 0), dtype=jnp.float32)
-    obs, reward, absorbing, cleared_done, info, next_state = env.step(state, action)
+    obs, reward, absorbing, done_out, info, next_state = env.step(state, action)
 
     initial_carry_keys = _carry_keys_from_reset_keys(rng_keys)
     initial_key_sum = _key_sum_from_carry_keys(initial_carry_keys)
@@ -361,7 +425,8 @@ def test_warp_backend_autoreset_wrapper_swaps_partial_done(warp_test_xml):
         atol=0.0,
         rtol=0.0,
     )
-    np.testing.assert_array_equal(np.asarray(cleared_done), np.zeros((batch,), dtype=bool))
+    np.testing.assert_array_equal(np.asarray(done_out), np.asarray(done_mask))
+    np.testing.assert_array_equal(np.asarray(next_state.done), np.zeros((batch,), dtype=bool))
 
 
 @requires_warp
@@ -391,7 +456,7 @@ def test_warp_backend_autoreset_wrapper_stress_rollout(warp_test_xml):
         expected_step_qpos = key_sum + 100.0
         expected_reset_qpos = reset_key_sum
 
-        obs, reward, absorbing, cleared_done, info, next_state = env.step(state, action)
+        obs, reward, absorbing, done_out, info, next_state = env.step(state, action)
 
         _assert_done_swaps(
             np.asarray(next_state.data.qpos[:, 0]),
@@ -449,7 +514,8 @@ def test_warp_backend_autoreset_wrapper_stress_rollout(warp_test_xml):
         expected_done_count = expected_done_count + np.asarray(done_mask, dtype=np.int32)
         np.testing.assert_array_equal(np.asarray(info["AutoResetWrapper_done_count"]), expected_done_count)
         np.testing.assert_array_equal(np.asarray(next_state.info["AutoResetWrapper_done_count"]), expected_done_count)
-        np.testing.assert_array_equal(np.asarray(cleared_done), np.zeros((batch,), dtype=bool))
+        np.testing.assert_array_equal(np.asarray(done_out), np.asarray(done_mask))
+        np.testing.assert_array_equal(np.asarray(next_state.done), np.zeros((batch,), dtype=bool))
         np.testing.assert_allclose(
             np.asarray(next_state.additional_carry.autoreset_rng),
             np.asarray(expected_rng_next),
@@ -472,7 +538,7 @@ def test_warp_backend_autoreset_wrapper_all_envs_done(warp_test_xml):
     _, state = env.reset(rng_keys)
 
     action = jnp.zeros((batch, 0), dtype=jnp.float32)
-    _, _, _, cleared_done, info, next_state = env.step(state, action)
+    _, _, _, done_out, info, next_state = env.step(state, action)
 
     split = jax.vmap(jax.random.split)(rng_keys)
     reset_keys = split[:, 1]
@@ -496,7 +562,8 @@ def test_warp_backend_autoreset_wrapper_all_envs_done(warp_test_xml):
         atol=0.0,
         rtol=0.0,
     )
-    np.testing.assert_array_equal(np.asarray(cleared_done), np.zeros((batch,), dtype=bool))
+    np.testing.assert_array_equal(np.asarray(done_out), np.ones((batch,), dtype=bool))
+    np.testing.assert_array_equal(np.asarray(next_state.done), np.zeros((batch,), dtype=bool))
 
 
 @requires_warp
@@ -511,7 +578,7 @@ def test_warp_backend_autoreset_wrapper_no_envs_done(warp_test_xml):
     _, state = env.reset(rng_keys)
 
     action = jnp.zeros((batch, 0), dtype=jnp.float32)
-    _, _, _, cleared_done, info, next_state = env.step(state, action)
+    _, _, _, done_out, info, next_state = env.step(state, action)
 
     initial_carry_keys = _carry_keys_from_reset_keys(rng_keys)
     initial_key_sum = _key_sum_from_carry_keys(initial_carry_keys)
@@ -538,7 +605,8 @@ def test_warp_backend_autoreset_wrapper_no_envs_done(warp_test_xml):
         atol=0.0,
         rtol=0.0,
     )
-    np.testing.assert_array_equal(np.asarray(cleared_done), np.zeros((batch,), dtype=bool))
+    np.testing.assert_array_equal(np.asarray(done_out), np.zeros((batch,), dtype=bool))
+    np.testing.assert_array_equal(np.asarray(next_state.done), np.zeros((batch,), dtype=bool))
 
 
 @requires_warp
@@ -555,9 +623,16 @@ def test_warp_backend_autoreset_wrapper_done_count_accumulates(warp_test_xml):
     action = jnp.zeros((batch, 0), dtype=jnp.float32)
 
     for step in range(5):
-        _, _, _, cleared_done, info, state = env.step(state, action)
+        _, _, _, done_out, info, state = env.step(state, action)
         np.testing.assert_array_equal(
-            np.asarray(cleared_done), np.zeros((batch,), dtype=bool), err_msg=f"done should be cleared at step {step}"
+            np.asarray(done_out),
+            np.ones((batch,), dtype=bool),
+            err_msg=f"done_out should report episode boundaries at step {step}",
+        )
+        np.testing.assert_array_equal(
+            np.asarray(state.done),
+            np.zeros((batch,), dtype=bool),
+            err_msg=f"inner done should be cleared at step {step}",
         )
         done_count = np.asarray(info["AutoResetWrapper_done_count"])
         expected = np.full((batch,), step + 1, dtype=np.int32)
@@ -719,7 +794,8 @@ def test_warp_backend_contact_model_reset(warp_contact_xml):
     """Verify Warp backend works with contact-enabled models."""
     env = _WarpContactEnv(warp_contact_xml)
     assert env._backend_impl == "warp"
-    assert env._nconmax == 64
+    assert env.nconmax == 64
+    assert env._naconmax == 64
     assert env._njmax == 128
 
     key = jax.random.PRNGKey(0)
@@ -765,13 +841,19 @@ def test_warp_backend_contact_autoreset_wrapper(warp_contact_xml):
 
     action = jnp.zeros((batch, 0), dtype=jnp.float32)
     for step_idx in range(10):
-        obs, reward, absorbing, done, info, state = env.step(state, action)
+        obs, reward, absorbing, done_out, info, state = env.step(state, action)
         assert obs.shape == (batch, 7), f"Observation shape mismatch at step {step_idx}"
-        assert done.shape == (batch,), f"Done shape mismatch at step {step_idx}"
+        assert done_out.shape == (batch,), f"Done shape mismatch at step {step_idx}"
+        expected_done = np.full((batch,), step_idx == 9, dtype=bool)
         np.testing.assert_array_equal(
-            np.asarray(done),
+            np.asarray(done_out),
+            expected_done,
+            err_msg=f"done_out mismatch at step {step_idx}",
+        )
+        np.testing.assert_array_equal(
+            np.asarray(state.done),
             np.zeros((batch,), dtype=bool),
-            err_msg=f"done should be cleared at step {step_idx}",
+            err_msg=f"inner done should be cleared at step {step_idx}",
         )
 
 

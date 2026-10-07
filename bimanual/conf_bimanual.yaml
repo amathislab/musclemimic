@@ -148,6 +148,18 @@ experiment:
     load_balance_loss_weight: 0.01
     gate_init_std: 0.01
 
+  # Multi-device training (SPMD via jax.pmap)
+  # num_devices: 1 = single-GPU (default), -1 = auto (all visible GPUs),
+  # N = force N. num_envs is global; each
+  # replica runs num_envs/num_devices envs.
+  distributed:
+    num_devices: 1
+  # Motion library placement for compiled training.
+  # none = full library on each device; static = one motion slice per device.
+  # Both modes pass motion data as an explicit compiled input.
+  trajectory:
+    sharding: none
+
   # Seeds and checkpointing
   n_seeds: 1
   seeds: null
@@ -194,8 +206,9 @@ experiment:
     num_steps: 500
     num_envs: 20
     num: 200
-    video_length: 3000
-    video_frequency: 1
+    video_length: 1000
+    video_frequency: 20
+    video_max_motions: 3
     video_fps: 30
     quantities:
       - JointPosition

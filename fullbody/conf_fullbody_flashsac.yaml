@@ -1,0 +1,116 @@
+defaults:
+  - conf_fullbody_gmr
+  - flashsac/termination: loose
+  - _self_
+
+wandb:
+  project: "musclemimic"
+  mode: "online"
+  tags: ["fullbody", "gmr", "flashsac"]
+
+experiment:
+  algorithm: FlashSACJax
+  task_factory:
+    params:
+      amass_dataset_conf:
+        write_materialized_cache: true
+  env_params:
+    num_envs: 8192
+    horizon: 23000
+    th_params:
+      random_start: true
+      start_from_random_step: true
+      random_start_sampling: state
+    reward_params:
+      qpos_w_sum: 0.18
+      qvel_w_sum: 0.14
+      root_pos_w_sum: 0.14
+      root_quat_w_sum: 0.09
+      root_vel_w_sum: 0.14
+      rpos_w_sum: 0.18
+      rquat_w_sum: 0.08
+      rvel_w_sum: 0.08
+      qpos_w_exp: 5.0
+      qvel_w_exp: 1.0
+      root_pos_w_exp: 10.0
+      root_quat_w_exp: 6.25
+      root_vel_w_exp: 2.0
+      rpos_w_exp: 10.0
+      rquat_w_exp: 6.25
+      rvel_w_exp: 1.0
+    terminal_state_type: ${flashsac.termination.type}
+    terminal_state_params: ${flashsac.termination.params}
+    reward_termination_type: NoRewardTerminationHandler
+    reward_termination_params: {}
+  num_envs: ${experiment.env_params.num_envs}
+  # 49,152 interactions with 8,192 environments.
+  total_timesteps: 402653184
+  online_logging_interval: 5
+  normalize_env: false
+  trajectory:
+    sharding: static
+
+  validation:
+    active: true
+    deterministic: true
+    eval_seed: 0
+    evaluate_all: true
+    num_steps: 23000
+    horizon: 23000
+    num_envs: 284
+    nconmax: 128
+    num: 12
+    start_from_beginning: true
+    video_length: 3000
+    video_frequency: 4
+    video_max_motions: 3
+    terminal_state_type: MeanSiteDeviationTerminalStateHandler
+    terminal_state_params:
+      mean_site_deviation_threshold: 0.5
+      reduction: mean
+      minimum_episode_steps: 0
+      enable_site_check: true
+      exclude_sites: []
+    reward_termination_type: NoRewardTerminationHandler
+    reward_termination_params: {}
+  checkpoints_on_validation: false
+  checkpoint_interval: 2048
+  max_checkpoints_to_keep: 3
+  async_checkpointing: true
+  checkpoint_include_replay_buffer: true
+  flashsac_config:
+    buffer_capacity: 2097152
+    min_buffer_size: 1048576
+    sample_batch_size: 16384
+    replay_storage_dtype: bfloat16
+    updates_per_interaction: 2
+    update_chunk_size: 1
+    gamma: 0.99
+    normalize_reward: true
+    normalized_return_max: 5.0
+
+    actor_hidden_dim: 768
+    actor_num_blocks: 4
+    actor_update_period: 4
+    critic_hidden_dim: 512
+    critic_num_blocks: 4
+    critic_num_bins: 101
+    critic_min_value: -5.0
+    critic_max_value: 5.0
+    target_update_tau: 0.01
+
+    initial_temperature: 0.0001
+    target_sigma: 0.20
+    learning_rate: 3e-4
+    end_learning_rate: 1.5e-4
+    warmup_updates: 4000
+    max_grad_norm: 1.0
+
+    noise_zeta_exponent: 2.0
+    noise_max_repeat: 16
+
+hydra:
+  job:
+    env_set:
+      XLA_PYTHON_CLIENT_PREALLOCATE: "true"
+      XLA_PYTHON_CLIENT_MEM_FRACTION: "0.70"

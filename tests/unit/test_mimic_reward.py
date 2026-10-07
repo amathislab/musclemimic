@@ -1,4 +1,4 @@
-"""Tests for MimicReward XY offset correction in qpos comparison."""
+"""Tests for MimicReward pose tracking and XY offset correction."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import jax.numpy as jnp
 import mujoco
 import numpy as np
-
+import pytest
 from flax import struct
 
 from musclemimic.core.reward.trajectory_based import MimicReward, MimicRewardState
@@ -82,7 +82,6 @@ MINIMAL_BIMANUAL_MJCF = """
   </worldbody>
 </mujoco>
 """
-
 
 
 class FakeTrajData:
@@ -539,7 +538,7 @@ def test_qpos_xy_offset_exact_match():
     sim_qpos = np.array([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.5])
     sim_data = make_sim_data(sim_qpos, backend=np)
 
-    total_reward, _, reward_info = reward(
+    _, _, reward_info = reward(
         state=np.zeros(10),
         action=np.zeros(3),
         next_state=np.zeros(10),
@@ -600,3 +599,147 @@ def test_root_position_reward_uses_offset_corrected_root_xyz():
     np.testing.assert_allclose(reward_info["reward_root_pos"], 1.0, atol=1e-5)
     np.testing.assert_allclose(total_reward, 1.0, atol=1e-5)
     np.testing.assert_allclose(reward_info["err_root_xyz"], 0.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("backend", [np, jnp])
+def test_root_orientation_reward_uses_full_geodesic_error(backend):
+    """Root orientation reward should track roll and report its error in radians."""
+    model = mujoco.MjModel.from_xml_string(MINIMAL_MJCF)
+    angle = np.pi / 2.0
+    target_qpos = backend.asarray([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+    sim_qpos = backend.asarray([0.0, 0.0, 1.0, np.cos(angle / 2), np.sin(angle / 2), 0.0, 0.0, 0.0])
+    traj_data = make_traj_data(target_qpos, backend=backend)
+    env = make_env(model, FakeTrajectoryHandler(traj_data))
+    reward = MimicReward(
+        env,
+        qpos_w_sum=0.0,
+        qvel_w_sum=0.0,
+        root_pos_w_sum=0.0,
+        root_quat_w_sum=1.0,
+        root_quat_w_exp=0.5,
+        root_vel_w_sum=0.0,
+        rpos_w_sum=0.0,
+        rquat_w_sum=0.0,
+        rvel_w_sum=0.0,
+    )
+    carry = make_carry().replace(qvel_w_sum=0.0, root_vel_w_sum=0.0)
+
+    total_reward, _, reward_info = reward(
+        state=backend.zeros(10),
+        action=backend.zeros(3),
+        next_state=backend.zeros(10),
+        absorbing=False,
+        info={},
+        env=env,
+        model=model,
+        data=make_sim_data(sim_qpos, backend=backend),
+        carry=carry,
+        backend=backend,
+    )
+
+    expected_reward = np.exp(-0.5 * angle**2)
+    np.testing.assert_allclose(reward_info["err_root_quat"], angle, rtol=1e-6)
+    np.testing.assert_allclose(reward_info["reward_root_quat"], expected_reward, rtol=1e-6)
+    np.testing.assert_allclose(total_reward, expected_reward, rtol=1e-6)
+
+
+def test_root_orientation_reward_is_invariant_to_quaternion_sign():
+    model = mujoco.MjModel.from_xml_string(MINIMAL_MJCF)
+    target_qpos = np.array([0.0, 0.0, 1.0, 0.5, 0.5, -0.5, 0.5, 0.0])
+    sim_qpos = target_qpos.copy()
+    sim_qpos[3:7] *= -1.0
+    traj_data = make_traj_data(target_qpos)
+    env = make_env(model, FakeTrajectoryHandler(traj_data))
+    reward = MimicReward(
+        env,
+        qpos_w_sum=0.0,
+        qvel_w_sum=0.0,
+        root_pos_w_sum=0.0,
+        root_quat_w_sum=1.0,
+        root_vel_w_sum=0.0,
+        rpos_w_sum=0.0,
+        rquat_w_sum=0.0,
+        rvel_w_sum=0.0,
+    )
+    carry = make_carry().replace(qvel_w_sum=0.0, root_vel_w_sum=0.0)
+
+    total_reward, _, reward_info = reward(
+        state=np.zeros(10),
+        action=np.zeros(3),
+        next_state=np.zeros(10),
+        absorbing=False,
+        info={},
+        env=env,
+        model=model,
+        data=make_sim_data(sim_qpos),
+        carry=carry,
+        backend=np,
+    )
+
+    np.testing.assert_allclose(reward_info["err_root_quat"], 0.0, atol=1e-6)
+    np.testing.assert_allclose(reward_info["reward_root_quat"], 1.0, atol=1e-6)
+    np.testing.assert_allclose(total_reward, 1.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("backend", [np, jnp])
+@pytest.mark.parametrize("use_mean_exp_reward", [False, True])
+def test_relative_site_orientation_reward_is_continuous_across_pi(backend, use_mean_exp_reward):
+    """Both reward aggregation modes should use the shortest SO(3) angle."""
+    model = mujoco.MjModel.from_xml_string(MINIMAL_MJCF)
+    epsilon = 1e-3
+
+    def z_rotation(angle):
+        cosine = backend.cos(angle)
+        sine = backend.sin(angle)
+        return backend.asarray(
+            [
+                [cosine, -sine, 0.0],
+                [sine, cosine, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+
+    target_qpos = backend.asarray([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+    traj_data = make_traj_data(target_qpos, backend=backend)
+    sim_data = make_sim_data(target_qpos, backend=backend)
+    identity = backend.eye(3)
+    traj_data.site_xmat = backend.stack([identity, identity, z_rotation(-np.pi + epsilon)]).reshape(3, 9)
+    sim_data.site_xmat = backend.stack([identity, identity, z_rotation(np.pi - epsilon)]).reshape(3, 9)
+
+    env = make_env(model, FakeTrajectoryHandler(traj_data))
+    exponent = 2.0
+    reward = MimicReward(
+        env,
+        qpos_w_sum=0.0,
+        qvel_w_sum=0.0,
+        root_pos_w_sum=0.0,
+        root_quat_w_sum=0.0,
+        root_vel_w_sum=0.0,
+        rpos_w_sum=0.0,
+        rquat_w_sum=1.0,
+        rquat_w_exp=exponent,
+        rvel_w_sum=0.0,
+        use_mean_exp_reward=use_mean_exp_reward,
+    )
+    carry = make_carry().replace(qvel_w_sum=0.0, root_vel_w_sum=0.0)
+
+    total_reward, _, reward_info = reward(
+        state=backend.zeros(10),
+        action=backend.zeros(3),
+        next_state=backend.zeros(10),
+        absorbing=False,
+        info={},
+        env=env,
+        model=model,
+        data=sim_data,
+        carry=carry,
+        backend=backend,
+    )
+
+    angular_errors = np.array([0.0, 2.0 * epsilon])
+    if use_mean_exp_reward:
+        expected_reward = np.mean(np.exp(-exponent * angular_errors**2))
+    else:
+        expected_reward = np.exp(-exponent * np.mean(angular_errors**2))
+    np.testing.assert_allclose(reward_info["reward_rquat"], expected_reward, rtol=1e-5)
+    np.testing.assert_allclose(total_reward, expected_reward, rtol=1e-5)

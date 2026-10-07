@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from loco_mujoco.smpl import retargeting as retargeting_module
-from loco_mujoco.smpl.retargeting import _fps_after_frame_skip
+from loco_mujoco.smpl.motion_spec import AMASSMotionSpec
 from loco_mujoco.trajectory import (
     LoadedTrajectorySet,
     Trajectory,
@@ -20,6 +20,15 @@ from loco_mujoco.trajectory import (
     materialize_trajectory,
     recompute_trajectory_velocities,
 )
+
+
+def test_motion_frames_are_not_upsampled():
+    frames = list(range(30))
+
+    sampled, aligned_fps = retargeting_module._resample_motion_frames(frames, source_fps=30, target_fps=120)
+
+    assert sampled is frames
+    assert aligned_fps == 30
 
 
 def _make_model():
@@ -78,10 +87,7 @@ def _make_two_site_hinge_model():
 
 
 def _make_info(model, frequency):
-    joint_names = [
-        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
-        for i in range(model.njnt)
-    ]
+    joint_names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(model.njnt)]
     return TrajectoryInfo(
         joint_names=joint_names,
         model=TrajectoryModel(njnt=model.njnt, jnt_type=np.array(model.jnt_type)),
@@ -115,14 +121,11 @@ def _assert_qvel_matches_qpos(model, qpos, qvel, split_points, frequency):
             np.testing.assert_allclose(qvel[start], np.zeros(model.nv), atol=1e-6)
             continue
 
-        fwd = np.array([
-            _differentiate(model, qpos[t], qpos[t + 1], dt)
-            for t in range(start, end - 1)
-        ])
+        fwd = np.array([_differentiate(model, qpos[t], qpos[t + 1], dt) for t in range(start, end - 1)])
         np.testing.assert_allclose(qvel[start], fwd[0], atol=1e-5)
         if end - start > 2:
             expected_mid = 0.5 * (fwd[:-1] + fwd[1:])
-            np.testing.assert_allclose(qvel[start + 1:end - 1], expected_mid, atol=1e-5)
+            np.testing.assert_allclose(qvel[start + 1 : end - 1], expected_mid, atol=1e-5)
         np.testing.assert_allclose(qvel[end - 1], fwd[-1], atol=1e-5)
 
 
@@ -163,12 +166,14 @@ def test_interpolation_uses_mujoco_scalar_first_quaternion_order_for_qpos():
 
     alpha = 2 / (len(interpolated.qpos) - 1)
     expected_angle = alpha * np.pi / 2
-    expected_quat = np.array([
-        np.cos(expected_angle / 2),
-        0.0,
-        0.0,
-        np.sin(expected_angle / 2),
-    ])
+    expected_quat = np.array(
+        [
+            np.cos(expected_angle / 2),
+            0.0,
+            0.0,
+            np.sin(expected_angle / 2),
+        ]
+    )
     np.testing.assert_allclose(interpolated.qpos[2, 3:7], expected_quat, atol=1e-6)
 
 
@@ -360,8 +365,63 @@ def test_retarget_extend_motion_returns_source_cache_after_layout_filtering(monk
     )
 
 
+def test_retargeted_motion_preprocess_concatenates_full_and_source_only_caches():
+    model = _make_model()
+    info = _make_info(model, 50.0)
+    source_only = Trajectory(
+        info=info,
+        data=TrajectoryData(
+            qpos=_make_qpos(model, 3),
+            qvel=np.zeros((3, model.nv), dtype=np.float32),
+            split_points=np.array([0, 3]),
+        ),
+    )
+    full_cache = materialize_trajectory(
+        source_only,
+        model=model,
+        control_dt=1.0 / 50.0,
+        cache_type=TrajectoryCacheType.FULL,
+    )
+
+    prepared = [
+        retargeting_module._preprocess_trajectory_for_concatenation(full_cache),
+        retargeting_module._preprocess_trajectory_for_concatenation(source_only),
+    ]
+    combined = Trajectory.concatenate(prepared, backend=np)
+
+    assert combined.data.qpos.shape == (6, model.nq)
+    assert combined.data.qvel.shape == (6, model.nv)
+    np.testing.assert_array_equal(combined.data.split_points, np.array([0, 3, 6]))
+    assert combined.data.xpos.size == 0
+    assert combined.data.site_xpos.size == 0
+    assert combined.info.body_names is None
+    assert combined.info.site_names is None
+
+
+def test_retargeted_motion_preprocess_keeps_core_validation_strict():
+    model = _make_model()
+
+    def make_trajectory(frequency):
+        return Trajectory(
+            info=_make_info(model, frequency),
+            data=TrajectoryData(
+                qpos=_make_qpos(model, 2),
+                qvel=np.zeros((2, model.nv), dtype=np.float32),
+                split_points=np.array([0, 2]),
+            ),
+        )
+
+    prepared = [
+        retargeting_module._preprocess_trajectory_for_concatenation(make_trajectory(50.0)),
+        retargeting_module._preprocess_trajectory_for_concatenation(make_trajectory(100.0)),
+    ]
+
+    with pytest.raises(AssertionError, match="TrajectoryInfos must be compatible"):
+        Trajectory.concatenate(prepared, backend=np)
+
+
 def test_retargeting_helpers_preserve_fractional_fps():
-    assert _fps_after_frame_skip(59.94, 2) == pytest.approx(29.97)
+    assert retargeting_module._fps_after_frame_skip(59.94, 2) == pytest.approx(29.97)
 
 
 def test_concatenation_accepts_distinct_cache_provenance(tmp_path):
@@ -493,6 +553,41 @@ def test_amass_cache_load_keeps_motion_names_and_cache_provenance_separate(tmp_p
 
     assert single.motion_names == ("motion-a",)
     assert isinstance(single.trajectory.data.qpos, np.ndarray)
+
+
+def test_bounded_amass_motion_does_not_reuse_the_full_motion_cache(tmp_path, monkeypatch):
+    model = _make_model()
+    monkeypatch.setattr(retargeting_module, "get_converted_amass_dataset_path", lambda: str(tmp_path))
+    spec = AMASSMotionSpec("motion-a", end_time_s=2.0)
+
+    full_trajectory = Trajectory(
+        info=_make_info(model, 50.0),
+        data=TrajectoryData(
+            qpos=_make_qpos(model, 2, x_offset=1.0),
+            qvel=np.zeros((2, model.nv), dtype=np.float32),
+            split_points=np.array([0, 2]),
+        ),
+    )
+    clipped_trajectory = Trajectory(
+        info=_make_info(model, 50.0),
+        data=TrajectoryData(
+            qpos=_make_qpos(model, 2, x_offset=2.0),
+            qvel=np.zeros((2, model.nv), dtype=np.float32),
+            split_points=np.array([0, 2]),
+        ),
+    )
+    full_trajectory.save(tmp_path / "MyoFullBody" / "motion-a.npz")
+    clipped_trajectory.save(tmp_path / "MyoFullBody" / "_clips" / f"motion-a__{spec.cache_suffix}.npz")
+
+    loaded = retargeting_module.load_retargeted_amass_trajectory_set(
+        "MyoFullBody",
+        spec,
+        robot_conf={},
+        retargeting_method="smpl",
+    )
+
+    np.testing.assert_array_equal(loaded.trajectory.data.qpos, clipped_trajectory.data.qpos)
+    assert loaded.motion_names == ("motion-a",)
 
 
 def test_public_retargeting_loaders_keep_trajectory_return_type(monkeypatch):

@@ -59,6 +59,7 @@ class ObservationContainer(UserDict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._stateful_obs = []
+        self._state_type = None
         self._locked = False
 
     def __setitem__(self, key, observation: Observation):
@@ -123,12 +124,9 @@ class ObservationContainer(UserDict):
         stateful_obs = self.list_all_stateful()
         # Create a dictionary with the stateful observations
         stateful_obs_dict = {obs.name: obs.init_state(env, key, model, data, backend) for obs in stateful_obs}
-        # Dynamically create a class with fields from the dictionary
-        dynamic_class = make_dataclass("ObservationStates", stateful_obs_dict.keys())
-        # convert to flax dataclass
-        dynamic_class = struct.dataclass(dynamic_class, frozen=False)
-        # create instance
-        return dynamic_class(**stateful_obs_dict)
+        if self._state_type is None:
+            raise RuntimeError("ObservationContainer must be locked before initializing state.")
+        return self._state_type(**stateful_obs_dict)
 
     def get_all_group_names(self):
         """
@@ -191,6 +189,9 @@ class ObservationContainer(UserDict):
         """
         Lock the container to prevent further modifications.
         """
+        state_fields = [obs.name for obs in self._stateful_obs]
+        state_type = make_dataclass("ObservationStates", state_fields)
+        self._state_type = struct.dataclass(state_type, frozen=False)
         self._locked = True
 
 

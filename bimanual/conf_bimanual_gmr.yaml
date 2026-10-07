@@ -12,8 +12,9 @@ experiment:
   task_factory:
     params:
       amass_dataset_conf:
-        dataset_group: "AMASS_BIMANUAL_TRAIN_MOTIONS" #"AMASS_BIMANUAL_MARGINAL_MOTIONS" 
+        dataset_group: "AMASS_BIMANUAL_TRAIN_MOTIONS" #"AMASS_BIMANUAL_MARGINAL_MOTIONS"
         retargeting_method: gmr
+        gmr_cache_namespace: gmr_v6
         gmr_config:
           src_human: smplh
           target_fps: 30
@@ -23,7 +24,7 @@ experiment:
           use_velocity_limit: false
           use_fitted_shape: true  # Auto-fit SMPL shape to robot
           shape_fitting_iterations: 500
-  
+
   env_params:
     goal_params:
       n_step_lookahead: 5

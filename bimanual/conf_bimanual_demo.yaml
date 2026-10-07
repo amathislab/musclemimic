@@ -18,6 +18,7 @@ experiment:
           - "s9/banana_peel_1_stageii"
           - "s9/doorknob_use_2_stageii"
         retargeting_method: gmr
+        gmr_cache_namespace: gmr_v6
         gmr_config:
           src_human: smplh
           target_fps: 30

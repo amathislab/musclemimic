@@ -10,10 +10,8 @@ from typing import Any
 import jax.numpy as jnp
 import mujoco
 import numpy as np
-from jax.scipy.spatial.transform import Rotation as jnp_R
 from mujoco import MjData, MjModel
 from mujoco.mjx import Data, Model
-from scipy.spatial.transform import Rotation as np_R
 
 from loco_mujoco.core.observations.goals import Goal
 from loco_mujoco.core.utils.math import calculate_relative_site_quantities
@@ -34,7 +32,7 @@ class GoalTrajMimic(Goal):
         **kwargs: Additional keyword arguments.
     """
 
-    def __init__(self, info_props: dict, rel_body_names: list[str] = None, **kwargs):
+    def __init__(self, info_props: dict, rel_body_names: list[str] | None = None, **kwargs):
         self.n_step_lookahead = int(kwargs.pop("n_step_lookahead", info_props.get("n_step_lookahead", 1)))
         if self.n_step_lookahead < 1:
             raise ValueError(f"n_step_lookahead must be >= 1, got {self.n_step_lookahead}")
@@ -67,7 +65,7 @@ class GoalTrajMimic(Goal):
         self.main_body_name = self._info_props["upper_body_xml_name"]
         self._qpos_ind = None
         self._qvel_ind = None
-        self._root_qpos_ind = None  # Full root qpos indices (xyz + quat)
+        self._root_qpos_ind = None  # Root xyz indices used by concise lookahead.
         self._root_qvel_ind = None  # Full root qvel indices (linear + angular vel)
         self._size_additional_observation = None
 
@@ -110,11 +108,25 @@ class GoalTrajMimic(Goal):
         )
         self._qvel_ind = np.concatenate([mj_jntid2qvelid(i, model) for i in range(model.njnt)])
 
-        # Store full root indices for simplified lookahead (root pos xyz + root vel 6D)
-        self._root_qpos_ind = mj_jntid2qposid(root_free_joint_id, model)[:3]  # xyz only
-        self._root_qvel_ind = mj_jntid2qvelid(root_free_joint_id, model)  # 6D linear + angular vel
+        self._root_qpos_ind = np.asarray(mj_jntid2qposid(root_free_joint_id, model)[:3])
+        self._root_qvel_ind = np.asarray(mj_jntid2qvelid(root_free_joint_id, model))
 
         n_relative_sites = len(self._info_props["sites_for_mimic"]) - 1
+        self._set_goal_dimensions(n_relative_sites)
+
+        self.min = [-np.inf] * self.dim
+        self.max = [np.inf] * self.dim
+        self.data_type_ind = np.arange(data.userdata.size)
+        self.obs_ind = np.arange(current_obs_size, current_obs_size + self.dim)
+
+        # Initialize site mapper for trajectory index mapping
+        env_sites_for_mimic = getattr(env, "sites_for_mimic", [])
+        self._site_mapper = create_site_mapper(model, env.__class__.__name__, env_sites_for_mimic)
+
+        self._initialized_from_mj = True
+
+    def _set_goal_dimensions(self, n_relative_sites: int) -> None:
+        """Set dimensions for the legacy full or concise trajectory encoding."""
         size_for_sites_full = (3 + 3 + 6) * n_relative_sites  # rpos + rvel + rangles
         size_for_sites_rpos_only = 3 * n_relative_sites  # rpos only
 
@@ -136,17 +148,6 @@ class GoalTrajMimic(Goal):
             self._size_additional_observation = size_for_sites_full  # rpos + rvel + rangles
         else:
             self._size_additional_observation = (3 + 6) * n_relative_sites  # rvel + rangles only
-
-        self.min = [-np.inf] * self.dim
-        self.max = [np.inf] * self.dim
-        self.data_type_ind = np.array([i for i in range(data.userdata.size)])
-        self.obs_ind = np.array([j for j in range(current_obs_size, current_obs_size + self.dim)])
-
-        # Initialize site mapper for trajectory index mapping
-        env_sites_for_mimic = getattr(env, "sites_for_mimic", [])
-        self._site_mapper = create_site_mapper(model, env.__class__.__name__, env_sites_for_mimic)
-
-        self._initialized_from_mj = True
 
     def init_from_traj(self, traj_handler: Any):
         """
@@ -359,14 +360,7 @@ class GoalTrajMimic(Goal):
         Returns:
             Any: Updated carry with visualizations set.
         """
-        if backend == np:
-            R = np_R
-        else:
-            R = jnp_R
-
-        traj_state = carry.traj_state
         user_scene = carry.user_scene
-        goal_geoms = user_scene.geoms
 
         traj_data_single = env.th.get_current_traj_data(carry, backend)
         site_xpos = traj_data_single.site_xpos
@@ -440,7 +434,7 @@ class GoalTrajMimicv2(GoalTrajMimic):
     def __init__(
         self,
         info_props: dict,
-        rel_body_names: list[str] = None,
+        rel_body_names: list[str] | None = None,
         target_geom_rgba: tuple[float, float, float, float] = (0.471, 0.38, 0.812, 0.5),
         **kwargs,
     ):

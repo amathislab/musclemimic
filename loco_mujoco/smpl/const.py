@@ -3,6 +3,17 @@ import sys
 
 sys.path.append(os.getcwd())
 
+
+def _load_motion_list(filename):
+    """Load newline-separated motion paths from a manifest next to this module.
+
+    Blank lines and ``#`` comment lines are ignored. Paths are relative to the
+    corresponding dataset root and omit the source file extension.
+    """
+    _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    with open(_path) as _f:
+        return [line.strip() for line in _f if line.strip() and not line.lstrip().startswith("#")]
+
 MANO_LEFT_BONE_ORDER_NAMES = [
     "L_Wrist",
     "L_Index1",
@@ -3615,9 +3626,6 @@ AMASS_RANDOM_TRAINING_MOTIONS = [
     "SSM/SSM_synced/20161014_50033/dribble_kick_sync_poses",
     "SSM/SSM_synced/20161014_50033/hop_on_one_leg_sync_poses",
     "SSM/SSM_synced/20161014_50033/jumping_jacks_sync_poses",
-    "TCD_handMocap/ExperimentDatabase/OK_D_poses",
-    "TCD_handMocap/ExperimentDatabase/SignD_poses",
-    "TCD_handMocap/ExperimentDatabase/Walking02_B_poses",
     "TotalCapture/s1/freestyle1_poses",
     "TotalCapture/s1/freestyle3_poses",
     "TotalCapture/s1/rom1_poses",
@@ -16913,13 +16921,6 @@ AMASS_RANDOM_TRAINING_MOTIONS_2K = [
     'SSM/SSM_synced/20160930_50032/clap_sync_poses',
     'SSM/SSM_synced/20161014_50033/dance_sync_poses',
     'SSM/SSM_synced/20161014_50033/light_hopping_loose_sync_poses',
-    'TCD_handMocap/ExperimentDatabase/direction01_3_poses',
-    'TCD_handMocap/ExperimentDatabase/flute_2_poses',
-    'TCD_handMocap/ExperimentDatabase/grasp3tripod_1_poses',
-    'TCD_handMocap/ExperimentDatabase/OK_B_poses',
-    'TCD_handMocap/ExperimentDatabase/Talking01B_poses',
-    'TCD_handMocap/ExperimentDatabase/TalkingE_poses',
-    'TCD_handMocap/ExperimentDatabase/writing001_poses',
     'TotalCapture/s1/acting1_poses',
     'TotalCapture/s2/acting1_poses',
     'TotalCapture/s2/acting3_poses',
@@ -17034,7 +17035,6 @@ AMASS_RANDOM_TRAINING_MOTIONS_2K = [
     'PosePrior/MPI_Limits/03101/ulr1d_poses',
     'SFU/SFU/0007/0007_Crawling001_poses',
     'SFU/SFU/0008/0008_ChaCha001_poses',
-    'TCD_handMocap/ExperimentDatabase/TalkingB_poses',
     'BioMotionLab_NTroje/rub072/0015_sitting1_poses',
     'EyesJapanDataset/Eyes_Japan_Dataset/kawaguchi/pose-17-one leg-kawaguchi_poses',
     'GRAB/s1/cup_pour_1_stageii',
@@ -17044,3 +17044,9 @@ AMASS_RANDOM_TRAINING_MOTIONS_2K = [
     'MOYO/train/220923/03596/220923_yogi_body_hands_03596_Bridge_Pose_or_Setu_Bandha_Sarvangasana_-d_stageii',
     'PosePrior/MPI_Limits/03101/ulr3_poses',
     ]
+
+# AMASS motions from the PHC-cleaned imitation training set (amass_isaac_im_train.pkl).
+# The 9,796 retained relpaths exclude the two named clips and TCD_handMocap.
+# See amass_cleaned_training_motions.txt (one relpath per line).
+AMASS_CLEANED_TRAINING_MOTIONS = _load_motion_list("amass_cleaned_training_motions.txt")
+

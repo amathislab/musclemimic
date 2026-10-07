@@ -13,7 +13,6 @@ from musclemimic.algorithms import AgentConfBase, AgentStateBase
 from musclemimic.algorithms.common.dataclasses import TrainState
 from musclemimic.algorithms.common.networks import ActorCritic
 
-
 # PPO-specific parameters
 PPO_PARAMS = (
     "num_steps",

@@ -900,6 +900,7 @@ def test_flatten_validation_metrics_skips_error_metrics_for_disabled_quantities(
         early_termination_count=jnp.array(0.0),
         early_termination_rate=jnp.array(0.0),
         err_root_xyz=jnp.array(0.3),
+        err_root_quat=jnp.array(0.35),
         err_root_yaw=jnp.array(0.4),
         err_joint_pos=jnp.array(1.1),
         err_joint_vel=jnp.array(1.2),
@@ -914,8 +915,46 @@ def test_flatten_validation_metrics_skips_error_metrics_for_disabled_quantities(
     )
 
     assert flattened["val_err_root_xyz"] == pytest.approx(0.3)
+    assert flattened["val_err_root_quat"] == pytest.approx(0.35)
     assert flattened["val_err_root_yaw"] == pytest.approx(0.4)
     assert flattened["val_err_joint_pos"] == pytest.approx(1.1)
     assert flattened["val_err_rpos"] == pytest.approx(1.4)
     assert "val_err_joint_vel" not in flattened
     assert "val_err_site_abs" not in flattened
+
+
+def test_flatten_validation_metrics_omits_exact_set_metrics_for_sampled_validation():
+    summary = ValidationSummary(
+        episode_count=jnp.array(4.0),
+        horizon_timeout_count=jnp.array(3.0),
+        horizon_timeout_rate=jnp.array(0.75),
+        frame_coverage=jnp.array(0.5),
+        total_frame=jnp.array(100.0),
+    )
+
+    flattened = flatten_validation_metrics(
+        summary,
+        include_trajectory_set_metrics=False,
+    )
+
+    assert flattened["val_episode_count"] == pytest.approx(4.0)
+    assert "val_horizon_timeout_count" not in flattened
+    assert "val_horizon_timeout_rate" not in flattened
+    assert "val_frame_coverage" not in flattened
+    assert "val_total_frame" not in flattened
+
+
+def test_flatten_validation_metrics_keeps_exact_set_metrics_by_default():
+    summary = ValidationSummary(
+        horizon_timeout_count=jnp.array(3.0),
+        horizon_timeout_rate=jnp.array(0.75),
+        frame_coverage=jnp.array(0.5),
+        total_frame=jnp.array(100.0),
+    )
+
+    flattened = flatten_validation_metrics(summary)
+
+    assert flattened["val_horizon_timeout_count"] == pytest.approx(3.0)
+    assert flattened["val_horizon_timeout_rate"] == pytest.approx(0.75)
+    assert flattened["val_frame_coverage"] == pytest.approx(0.5)
+    assert flattened["val_total_frame"] == pytest.approx(100.0)

@@ -6,15 +6,22 @@ Covers loss functions, optimizer schedules, MoE helpers, and env wrapper order.
 
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
-import pytest
 import types
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+import pytest
 from omegaconf import OmegaConf
 
+from loco_mujoco.core.utils.env import Box
 from musclemimic.algorithms.common.env_utils import wrap_env
+from musclemimic.algorithms.common.optimizer import (
+    build_optimizer,
+    get_optimizer,
+    linear_lr_schedule,
+    warmup_cosine_lr_schedule,
+)
 from musclemimic.algorithms.ppo.loss import (
     PPOLossOutput,
     approx_kl,
@@ -24,15 +31,8 @@ from musclemimic.algorithms.ppo.loss import (
     ppo_value_loss,
 )
 from musclemimic.algorithms.ppo.moe import aggregate_moe_metrics, zero_moe_metrics
-from musclemimic.algorithms.common.optimizer import (
-    build_optimizer,
-    get_optimizer,
-    linear_lr_schedule,
-    warmup_cosine_lr_schedule,
-)
 from musclemimic.algorithms.ppo.ppo import PPOJax
 from musclemimic.core.wrappers.mjx import AutoResetWrapper, LogWrapper, NStepWrapper, VecEnv
-from loco_mujoco.core.utils.env import Box
 
 
 class _DummyEnv:
@@ -46,6 +46,9 @@ class _DummyEnv:
         return obs, obs
 
     def reset_to(self, rng_key, _traj_idx):
+        return self.reset(rng_key)
+
+    def reset_to_step(self, rng_key, _traj_idx, _subtraj_step):
         return self.reset(rng_key)
 
     def step(self, state, _action):
@@ -252,10 +255,13 @@ class TestPPOLoss:
         expected_actor = -jnp.minimum(loss_actor1, loss_actor2).mean()
 
         value_pred_clipped = value_old + (value - value_old).clip(-clip_eps, clip_eps)
-        v_loss = 0.5 * jnp.maximum(
-            jnp.square(value - targets),
-            jnp.square(value_pred_clipped - targets),
-        ).mean()
+        v_loss = (
+            0.5
+            * jnp.maximum(
+                jnp.square(value - targets),
+                jnp.square(value_pred_clipped - targets),
+            ).mean()
+        )
 
         expected_total = expected_actor + vf_coef * v_loss - ent_coef * entropy
         expected_kl = jnp.mean(log_prob_old - log_prob)
@@ -304,10 +310,13 @@ class TestPPOLoss:
         )
 
         value_pred_clipped = value_old + (value - value_old).clip(-clip_eps_vf, clip_eps_vf)
-        expected_value_loss = 0.5 * jnp.maximum(
-            jnp.square(value - targets),
-            jnp.square(value_pred_clipped - targets),
-        ).mean()
+        expected_value_loss = (
+            0.5
+            * jnp.maximum(
+                jnp.square(value - targets),
+                jnp.square(value_pred_clipped - targets),
+            ).mean()
+        )
 
         assert jnp.allclose(output.value_loss, expected_value_loss, atol=1e-6)
 
@@ -403,10 +412,7 @@ class TestPPOLoss:
         advantages = jnp.array([1.0])
         entropy = jnp.array(0.1)
 
-        out1 = ppo_loss(
-            log_prob, log_prob_old, value, value_old,
-            targets, advantages, entropy, 0.2, 1.0, 0.0
-        )
+        out1 = ppo_loss(log_prob, log_prob_old, value, value_old, targets, advantages, entropy, 0.2, 1.0, 0.0)
 
         out2 = ppo_loss(
             jnp.repeat(log_prob, 10),
@@ -416,7 +422,9 @@ class TestPPOLoss:
             jnp.repeat(targets, 10),
             jnp.repeat(advantages, 10),
             entropy,
-            0.2, 1.0, 0.0
+            0.2,
+            1.0,
+            0.0,
         )
 
         assert jnp.allclose(out1.total_loss, out2.total_loss, atol=1e-6)
@@ -523,15 +531,9 @@ class TestLRSchedules:
         warmup_steps = 10
         min_ratio = 0.1
 
-        lr5 = warmup_cosine_lr_schedule(
-            5, num_minibatches, update_epochs, lr, num_updates, warmup_steps, min_ratio
-        )
-        lr10 = warmup_cosine_lr_schedule(
-            10, num_minibatches, update_epochs, lr, num_updates, warmup_steps, min_ratio
-        )
-        lr11 = warmup_cosine_lr_schedule(
-            11, num_minibatches, update_epochs, lr, num_updates, warmup_steps, min_ratio
-        )
+        lr5 = warmup_cosine_lr_schedule(5, num_minibatches, update_epochs, lr, num_updates, warmup_steps, min_ratio)
+        lr10 = warmup_cosine_lr_schedule(10, num_minibatches, update_epochs, lr, num_updates, warmup_steps, min_ratio)
+        lr11 = warmup_cosine_lr_schedule(11, num_minibatches, update_epochs, lr, num_updates, warmup_steps, min_ratio)
 
         assert jnp.isfinite(lr5)
         assert jnp.isfinite(lr10)
@@ -545,10 +547,7 @@ class TestLRSchedules:
         Linear schedule must be non-increasing.
         """
         lr = 1e-3
-        vals = [
-            linear_lr_schedule(i, 1, 1, lr, 10)
-            for i in range(10)
-        ]
+        vals = [linear_lr_schedule(i, 1, 1, lr, 10) for i in range(10)]
 
         assert all(vals[i] >= vals[i + 1] for i in range(len(vals) - 1))
 
@@ -729,3 +728,47 @@ class TestPPOInitAgentConf:
         assert config.experiment.num_updates == 20
         assert config.experiment.minibatch_size == 25
         assert config.experiment.validation_interval == 5
+
+    def test_validation_frequency_is_capped_at_once_per_update(self):
+        env = _DummyTrainEnv()
+        config = OmegaConf.create(
+            {
+                "experiment": {
+                    "total_timesteps": 50,
+                    "num_envs": 10,
+                    "ppo_config": {
+                        "num_steps": 5,
+                        "update_epochs": 1,
+                        "num_minibatches": 1,
+                        "gamma": 0.99,
+                        "gae_lambda": 0.95,
+                        "clip_eps": 0.2,
+                        "clip_eps_vf": 0.2,
+                        "init_std": 1.0,
+                        "learnable_std": True,
+                        "ent_coef": 0.0,
+                        "vf_coef": 0.5,
+                    },
+                    "validation": {"num": 100},
+                    "actor_hidden_layers": [32],
+                    "critic_hidden_layers": [32],
+                    "activation": "tanh",
+                    "use_layernorm": False,
+                    "layernorm_eps": 1e-5,
+                    "lr": 3e-4,
+                    "anneal_lr": False,
+                    "lr_schedule_type": "linear",
+                    "warmup_steps": None,
+                    "min_lr_ratio": 0.0,
+                    "weight_decay": 0.0,
+                    "max_grad_norm": 1.0,
+                    "optimizer_type": "adamw",
+                }
+            }
+        )
+
+        PPOJax.init_agent_conf(env, config)
+
+        assert config.experiment.num_updates == 1
+        assert config.experiment.validation_interval == 1
+        assert config.experiment.validation.num == 1

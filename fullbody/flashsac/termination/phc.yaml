@@ -1,0 +1,12 @@
+id: phc-max25cm
+type: MeanSiteDeviationTerminalStateHandler
+params:
+  mean_site_deviation_threshold: 0.25
+  reduction: max
+  minimum_episode_steps: 2
+  enable_site_check: true
+  exclude_sites:
+    - left_ankle_mimic
+    - left_toes_mimic
+    - right_ankle_mimic
+    - right_toes_mimic

@@ -41,6 +41,16 @@ If you need a different subset, override `PYTEST_ARGS`:
 make test PYTEST_ARGS='tests/unit/test_ppo_config.py -q'
 ```
 
+The AMASS motion-name manifests and the GMR IK configuration are required
+package data. Distribution changes should also pass the packaging smoke test,
+which builds an sdist and a wheel in a temporary directory and loads the
+resources from the extracted wheel. This integration test requires `uv` and
+access to the declared build dependencies.
+
+```bash
+make test PYTEST_ARGS='tests/integration/test_package_distribution.py -q'
+```
+
 ## Pre-commit Scope
 
 `pre-commit` is intentionally scoped to a curated subset of files in `.pre-commit-config.yaml`.

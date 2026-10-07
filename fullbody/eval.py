@@ -1,26 +1,26 @@
 """
-Fullbody policy evaluation and visualization entrypoint.
+Fullbody policy evaluation and visualization module.
 
 Common workflows:
 
 1. Basic MJX playback
-   uv run python fullbody/eval.py --path outputs/.../checkpoint_123
+   uv run python -m fullbody.eval --path outputs/.../checkpoint_123
 
 2. MuJoCo playback or viewer
-   uv run python fullbody/eval.py --path outputs/.../checkpoint_123 --use_mujoco
-   uv run python fullbody/eval.py --path outputs/.../checkpoint_123 --use_mujoco --mujoco_viewer
+   uv run python -m fullbody.eval --path outputs/.../checkpoint_123 --use_mujoco
+   uv run python -m fullbody.eval --path outputs/.../checkpoint_123 --use_mujoco --mujoco_viewer
 
 3. Record a rollout
-   uv run python fullbody/eval.py --path outputs/.../checkpoint_123 --record
+   uv run python -m fullbody.eval --path outputs/.../checkpoint_123 --record
 
 4. Inspect available trajectories
-   uv run python fullbody/eval.py --path outputs/.../checkpoint_123 --list_trajs
+   uv run python -m fullbody.eval --path outputs/.../checkpoint_123 --list_trajs
 
 5. Replay a specific trajectory
-   uv run python fullbody/eval.py --path outputs/.../checkpoint_123 --traj_index 3 --traj_start_step 0
+   uv run python -m fullbody.eval --path outputs/.../checkpoint_123 --traj_index 3 --traj_start_step 0
 
 6. Run validation metrics for the KIT testing group
-   uv run python fullbody/eval.py \
+   uv run python -m fullbody.eval \
      --path hf://amathislab/mm-base-ll \
      --metrics --metrics_only \
      --motion_group KIT_KINESIS_TESTING_MOTIONS \
@@ -29,9 +29,9 @@ Common workflows:
      --eval_seed 0
 
 7. Evaluate all motions with MJX/GPU metrics
-   uv run python fullbody/eval.py \
+   uv run python -m fullbody.eval \
      --path hf://amathislab/mm-base-ll \
-     --evaluate_all --metrics --metrics_only \
+     --evaluate_all \
      --motion_group KIT_KINESIS_TESTING_MOTIONS \
      --terminal_state_type MeanRelativeSiteDeviationWithRootTerminalStateHandler \
      --root_deviation_threshold 0.5 \
@@ -39,16 +39,20 @@ Common workflows:
      --eval_seed 0
 
 8. Evaluate all motions with MuJoCo/CPU metrics
-   uv run python fullbody/eval.py \
+   uv run python -m fullbody.eval \
      --path hf://amathislab/mm-base-ll \
      --use_mujoco \
-     --evaluate_all --metrics --metrics_only \
+     --evaluate_all \
      --motion_group KIT_KINESIS_TESTING_MOTIONS \
      --terminal_state_type MeanRelativeSiteDeviationWithRootTerminalStateHandler \
      --root_deviation_threshold 0.5 \
      --eval_seed 0
 
 Useful notes:
+- Physiological export: --use_mujoco --export_trajectory --export_kinetics.
+- See docs/physiology_export.md for sampling conventions and MM-EvalKit usage.
+- `--evaluate_all` evaluates every trajectory from frame zero and exits after reporting metrics or exporting data.
+- Standalone `--evaluate_all` defaults to deterministic actions; add `--stochastic` for sampled actions.
 - `--traj_index` is 0-based.
 - `--motion_group` loads an entire dataset split; use `--motion_path` for a single motion.
 - `--metrics_envs` only affects MJX metrics, not MuJoCo metrics.
@@ -67,35 +71,52 @@ import sys
 
 from omegaconf import OmegaConf
 
-from fullbody._eval_terminal import apply_eval_terminal_defaults, apply_terminal_cli_overrides
-from musclemimic.algorithms import PPOJax
+from fullbody._eval_terminal import (
+    apply_eval_reward_termination_defaults,
+    apply_eval_terminal_defaults,
+    apply_terminal_cli_overrides,
+)
+from loco_mujoco.task_factories import TaskFactory
+from musclemimic.core.goals.fullbody_tracking import fullbody_visual_goal_type, rescale_lookahead_steps
+from musclemimic.runner.engine import pick_algorithm
 from musclemimic.runner.eval_utils import (
     add_common_eval_args,
-    normalize_eval_args,
-    validate_viewer_args,
-    setup_headless,
-    load_checkpoint,
     apply_temporal_params,
     apply_trajectory_selection,
+    check_trajectory_sync,
     configure_goal_visualization,
     configure_recording,
-    align_agent_state,
-    validate_traj_index,
     format_trajectory_listing,
-    verify_env_dt,
-    check_trajectory_sync,
+    load_checkpoint,
+    normalize_eval_args,
     run_validation_metrics,
     run_validation_metrics_mjx_all,
     run_validation_metrics_mujoco,
     run_with_mujoco_viewer,
     run_with_trajectory_export,
+    setup_headless,
+    validate_traj_index,
+    validate_viewer_args,
+    verify_env_dt,
 )
-from loco_mujoco.task_factories import TaskFactory
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True "
 from jax import config as jax_config
 
 jax_config.update("jax_default_matmul_precision", "high")
+
+
+def _recording_motion_name(task_params, traj_index: int | None) -> str | None:
+    """Return a stable recording tag for AMASS playback."""
+    amass_conf = task_params.get("amass_dataset_conf")
+    motion_paths = amass_conf.get("rel_dataset_path", []) if amass_conf is not None else []
+    if motion_paths:
+        first_path = motion_paths
+        while hasattr(first_path, "__iter__") and not isinstance(first_path, str):
+            first_path = next(iter(first_path), None)
+        if first_path:
+            return str(first_path).replace("/", "_")
+    return None
 
 
 def apply_eval_init_state_overrides(env_params: dict, config) -> None:
@@ -107,7 +128,7 @@ def apply_eval_init_state_overrides(env_params: dict, config) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Evaluate, visualize, or record a fullbody PPO policy.")
+    parser = argparse.ArgumentParser(description="Evaluate, visualize, or record a fullbody policy.")
     add_common_eval_args(parser, default_n_envs=10)
     parser.add_argument(
         "--hfield_length",
@@ -138,7 +159,14 @@ def main() -> int:
         "--evaluate_all",
         default=False,
         action="store_true",
-        help="Evaluate all trajectories in the dataset (default: False).",
+        help="Evaluate every trajectory from frame zero and exit; ignores --n_steps.",
+    )
+    parser.add_argument(
+        "--evaluate_all_passes",
+        type=int,
+        default=1,
+        help="With --evaluate_all --export_trajectory, repeat the full dataset sweep this many "
+        "times (default: 1). With --stochastic each pass is a different rollout.",
     )
     parser.add_argument(
         "--no_termination",
@@ -202,7 +230,8 @@ def main() -> int:
         print("   Use --no_render for headless operation")
         return 1
 
-    config, agent_state, _metadata = load_checkpoint(args.path)
+    config, state_data, _metadata = load_checkpoint(args.path)
+    algorithm_cls = pick_algorithm(config)
     OmegaConf.set_struct(config, False)
 
     # Restore training configuration
@@ -240,10 +269,18 @@ def main() -> int:
         print(f"\n=== OVERRIDE: n_substeps={args.n_substeps} ===")
         print(f"   New control_dt: {new_control_dt} ({1/new_control_dt:.0f}Hz)")
 
-        # Scale n_step_stride to maintain same lookahead time window
+        # Preserve the physical lookahead window at the new control rate.
         goal_params = config.experiment.env_params.get("goal_params", {})
-        old_stride = goal_params.get("n_step_stride")
-        if old_stride is not None:
+        old_lookahead_steps = goal_params.get("lookahead_steps")
+        if old_lookahead_steps is not None:
+            new_lookahead_steps = rescale_lookahead_steps(
+                old_lookahead_steps,
+                training_control_dt,
+                new_control_dt,
+            )
+            config.experiment.env_params["goal_params"]["lookahead_steps"] = list(new_lookahead_steps)
+            print(f"   lookahead_steps: {list(old_lookahead_steps)} -> {list(new_lookahead_steps)}")
+        elif (old_stride := goal_params.get("n_step_stride")) is not None:
             # lookahead_time = stride * control_dt (keep constant)
             new_stride = int(round(old_stride * training_control_dt / new_control_dt))
             new_stride = max(1, new_stride)
@@ -253,7 +290,8 @@ def main() -> int:
     # Fullbody-specific visualization and terminal overrides
     if "MyoFullBody" in env_name:
         print("\nConfiguring MyoFullBody evaluation:")
-        configure_goal_visualization(config, args, "GoalTrajMimicv2", is_mjx_env="Mjx" in env_name)
+        visual_goal_type = fullbody_visual_goal_type(goal_type)
+        configure_goal_visualization(config, args, visual_goal_type, is_mjx_env="Mjx" in env_name)
         print(f"   Training goal_type: {goal_type}")
         print(f"   Evaluation goal_type: {config.experiment.env_params.get('goal_type')}")
         print(
@@ -305,6 +343,7 @@ def main() -> int:
     apply_eval_init_state_overrides(play_env_params, config)
     # Terminal state configuration priority: CLI > validation config > training config.
     apply_eval_terminal_defaults(play_env_params, config, args.strict_termination)
+    apply_eval_reward_termination_defaults(play_env_params, config, args.strict_termination)
     try:
         apply_terminal_cli_overrides(play_env_params, args)
     except ValueError as exc:
@@ -321,17 +360,10 @@ def main() -> int:
     actual_control_dt = training_timestep * (args.n_substeps if args.n_substeps else training_n_substeps)
 
     if args.record:
-        # Extract motion name from dataset config for recording folder name
-        motion_paths = config.experiment.task_factory.params.amass_dataset_conf.get("rel_dataset_path", [])
-        motion_name = None
-        if motion_paths:
-            # Handle nested list/ListConfig - flatten to get first string path
-            first_path = motion_paths
-            while hasattr(first_path, "__iter__") and not isinstance(first_path, str):
-                first_path = list(first_path)[0] if first_path else None
-            if first_path:
-                # Use full path with / replaced by _ (e.g., "KIT/9/walking_run07_poses" -> "KIT_9_walking_run07_poses")
-                motion_name = str(first_path).replace("/", "_")
+        motion_name = _recording_motion_name(
+            config.experiment.task_factory.params,
+            args.traj_index,
+        )
         record_tag = configure_recording(play_env_params, args, actual_control_dt, motion_name)
         print(f"Recording to: {args.record_dir}/{record_tag}/ @ {int(1/actual_control_dt)}fps")
 
@@ -358,8 +390,8 @@ def main() -> int:
     validate_traj_index(env, args.traj_index)
 
     # Build agent configuration and align state for inference
-    agent_conf = PPOJax.init_agent_conf(env, config)
-    agent_state = align_agent_state(agent_state, agent_conf)
+    agent_conf = algorithm_cls.init_agent_conf(env, config)
+    agent_state = algorithm_cls.restore_agent_state(state_data, agent_conf)
 
     # Verify env timing and trajectory sync
     verify_env_dt(env, actual_control_dt)
@@ -403,6 +435,7 @@ def main() -> int:
             _validation_summary, metrics_dict = run_validation_metrics(
                 config,
                 agent_state,
+                agent_conf,
                 train_state_seed=args.train_state_seed,
                 num_steps=args.metrics_steps,
                 num_envs=args.metrics_envs,
@@ -442,6 +475,12 @@ def main() -> int:
                 train_state_seed=args.train_state_seed,
                 trajectory_dir=args.trajectory_dir,
                 file_prefix="myofullbody_episodes",
+                evaluate_all=args.evaluate_all,
+                evaluate_all_passes=args.evaluate_all_passes,
+                motion_group=args.motion_group,
+                eval_seed=args.eval_seed,
+                export_kinetics=args.export_kinetics,
+                checkpoint_path=args.path,
             )
 
         elif args.use_mujoco and args.mujoco_viewer:
@@ -462,7 +501,7 @@ def main() -> int:
             viewer.run(n_steps=args.n_steps)
         elif args.use_mujoco:
             print("Running MuJoCo evaluation...")
-            PPOJax.play_policy_mujoco(
+            algorithm_cls.play_policy_mujoco(
                 env,
                 agent_conf,
                 agent_state,
@@ -476,7 +515,7 @@ def main() -> int:
             print("Running MJX evaluation...")
             mjx_play_envs = 1 if args.traj_index is not None else int(args.num_envs)
             use_sequential_mjx = args.traj_index is not None and not args.evaluate_all
-            PPOJax.play_policy(
+            algorithm_cls.play_policy(
                 env,
                 agent_conf,
                 agent_state,

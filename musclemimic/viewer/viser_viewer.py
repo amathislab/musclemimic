@@ -14,6 +14,8 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 
+from musclemimic.algorithms.inference import make_policy_action_fn
+
 from .viser_tendons import ViserTendonLineRenderer
 
 
@@ -31,9 +33,9 @@ class ViserViewer:
 
         Args:
             env: MuJoCo environment instance (CPU, not MJX)
-            agent_conf: PPOJax agent configuration (network + config)
-            agent_state: PPOJax agent state with trained params
-            deterministic: If True, set log_std to -inf for deterministic actions
+            agent_conf: configured policy and experiment settings
+            agent_state: trained algorithm state
+            deterministic: If True, use deterministic policy actions
             frame_rate: Target FPS for visualization
             include_collision: If True, display collision geoms instead of visual geoms
         """
@@ -53,24 +55,7 @@ class ViserViewer:
 
     def _prepare_policy(self):
         """Create a jitted policy call matching MuscleMimic eval semantics."""
-
-        def sample_actions(ts, obs, _rng):
-            if hasattr(obs, "ndim") and obs.ndim == 1:
-                obs_b = jnp.atleast_2d(obs)
-            else:
-                obs_b = obs
-            vars_in = {"params": ts.params, "run_stats": ts.run_stats}
-            y, updates = self.agent_conf.network.apply(vars_in, obs_b, mutable=["run_stats"])
-            pi, _ = y
-            ts_out = ts.replace(run_stats=updates["run_stats"])
-            a = pi.sample(seed=_rng)
-            if hasattr(a, "ndim") and a.ndim > 1 and a.shape[0] == 1:
-                a = a[0]
-            return a, ts_out
-
         train_state = self.agent_state.train_state
-        if self.deterministic:
-            train_state.params["log_std"] = np.ones_like(train_state.params["log_std"]) * -np.inf
 
         # Handle multi-seed agent state if present
         config = self.agent_conf.config.experiment
@@ -79,7 +64,10 @@ class ViserViewer:
             train_state = jax.tree.map(lambda x: x[0], train_state)
 
         rng = jax.random.key(0)
-        plcy_call = jax.jit(sample_actions)
+        plcy_call = make_policy_action_fn(
+            self.agent_conf,
+            deterministic=self.deterministic,
+        )
         return plcy_call, train_state, rng
 
     def _setup_viser(self, model: mujoco.MjModel):

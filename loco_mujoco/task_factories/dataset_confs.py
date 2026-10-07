@@ -3,7 +3,28 @@ from functools import lru_cache
 
 from omegaconf import ListConfig
 
+from loco_mujoco.smpl.gmr_cache_identity import GMR_CACHE_NAMESPACE
+from loco_mujoco.smpl.motion_manifest import (
+    load_amass_phc_motion_groups,
+    load_amass_phc_quality_motion_groups,
+)
+from loco_mujoco.smpl.motion_spec import AMASSMotionSpec, as_amass_motion_spec
 from loco_mujoco.trajectory.dataclasses import Trajectory
+
+GMR_TRAINING_CACHE_NAMESPACE = GMR_CACHE_NAMESPACE
+
+
+def resolve_training_gmr_cache_namespace(
+    retargeting_method: str | None,
+    requested_namespace: str | None,
+) -> str | None:
+    """Resolve the canonical GMR namespace used by imitation training."""
+    if retargeting_method != "gmr":
+        return requested_namespace
+    resolved_namespace = requested_namespace or GMR_TRAINING_CACHE_NAMESPACE
+    if resolved_namespace != GMR_TRAINING_CACHE_NAMESPACE:
+        raise ValueError(f"GMR training data must use the canonical gmr_v6 cache namespace, got {resolved_namespace!r}")
+    return resolved_namespace
 
 
 @lru_cache(maxsize=1)
@@ -13,6 +34,7 @@ def get_amass_dataset_groups() -> dict[str, list[str]]:
         AMASS_BIMANUAL_MARGINAL_MOTIONS,
         AMASS_BIMANUAL_TEST_MOTIONS,
         AMASS_BIMANUAL_TRAIN_MOTIONS,
+        AMASS_CLEANED_TRAINING_MOTIONS,
         AMASS_EKUT_DATASETS,
         AMASS_LOCOMOTION_DATASETS,
         AMASS_RANDOM_TRAINING_MOTIONS,
@@ -24,7 +46,8 @@ def get_amass_dataset_groups() -> dict[str, list[str]]:
         KIT_KINESIS_TRAINING_MOTIONS_MINT_STRAIGHT_FORWARDS,
         KIT_KINESIS_TRANSITION_TRAINING_MOTIONS,
     )
-    return {
+
+    groups = {
         "AMASS_LOCOMOTION_DATASETS": AMASS_LOCOMOTION_DATASETS,
         "AMASS_EKUT_DATASETS": AMASS_EKUT_DATASETS,
         "AMASS_BIMANUAL_MARGINAL_MOTIONS": AMASS_BIMANUAL_MARGINAL_MOTIONS,
@@ -36,9 +59,32 @@ def get_amass_dataset_groups() -> dict[str, list[str]]:
         "KIT_KINESIS_TRAINING_MOTIONS_MINT_STRAIGHT_FORWARDS": KIT_KINESIS_TRAINING_MOTIONS_MINT_STRAIGHT_FORWARDS,
         "AMASS_RANDOM_TRAINING_MOTIONS": AMASS_RANDOM_TRAINING_MOTIONS,
         "AMASS_RANDOM_TRAINING_MOTIONS_2K": AMASS_RANDOM_TRAINING_MOTIONS_2K,
+        "AMASS_CLEANED_TRAINING_MOTIONS": AMASS_CLEANED_TRAINING_MOTIONS,
         "AMASS_BIMANUAL_TEST_MOTIONS": AMASS_BIMANUAL_TEST_MOTIONS,
         "AMASS_BIMANUAL_TRAIN_MOTIONS": AMASS_BIMANUAL_TRAIN_MOTIONS,
     }
+    groups.update(
+        {group_name: [spec.path for spec in specs] for group_name, specs in load_amass_phc_motion_groups().items()}
+    )
+    groups.update(
+        {
+            group_name: [spec.path for spec in specs]
+            for group_name, specs in load_amass_phc_quality_motion_groups().items()
+        }
+    )
+    return groups
+
+
+@lru_cache(maxsize=1)
+def get_amass_motion_spec_groups() -> dict[str, list[AMASSMotionSpec]]:
+    """Return AMASS groups with optional source-time bounds."""
+    groups = {
+        group_name: [as_amass_motion_spec(path) for path in paths]
+        for group_name, paths in get_amass_dataset_groups().items()
+    }
+    groups.update({group_name: list(specs) for group_name, specs in load_amass_phc_motion_groups().items()})
+    groups.update({group_name: list(specs) for group_name, specs in load_amass_phc_quality_motion_groups().items()})
+    return groups
 
 
 def expand_amass_dataset_group_spec(dataset_group: str | list | None) -> list[str]:
@@ -90,35 +136,64 @@ class AMASSDatasetConf:
     Configuration for loading AMASS datasets.
 
     Attributes:
-        rel_dataset_path (Union[str, list]): A relative path or a list of relative paths to
-            load from the AMASS dataset.
+        rel_dataset_path: A relative path, an ``AMASSMotionSpec``, or a list of
+            either type to load from the AMASS dataset.
         dataset_group (Union[str, list]): A predefined dataset group name, a list of group names,
             or a `GROUP_A + GROUP_B` combination string to load from AMASS.
         retargeting_method (str): The retargeting method to use (e.g., 'smpl', 'gmr'). Optional.
         gmr_config (dict): Configuration for GMR retargeting. Optional.
+        gmr_cache_namespace: Cache namespace for precomputed GMR trajectories.
+            GMR training is restricted to ``gmr_v6``.
         max_motions (int, optional): If set, cap the number of motion paths loaded by
             sampling a subset of this size.
+        max_motions_seed (int): Seed used to select a reproducible capped subset.
         clear_cache (bool): If True, overwrite existing cached retargeted files instead of loading them.
         trajectory_cache_type (str): Runtime trajectory cache layout. Use "sparse"
             to store only mimic site caches, "full" for all body/site caches, or
             "none" for qpos/qvel only.
+        write_materialized_cache (bool): If True, store and reuse persistent materialized AMASS caches.
+            Defaults to False so existing and mixed-dataset configurations keep
+            using the runtime loader.
+        rebuild_materialized_cache (bool): Explicitly rebuild an existing materialized cache.
 
     """
-    rel_dataset_path: str | list = None
+
+    rel_dataset_path: str | AMASSMotionSpec | list = None
     dataset_group: str | list = None
     retargeting_method: str = None
     gmr_config: dict = None
     max_motions: int | None = None
+    max_motions_seed: int = 0
     clear_cache: bool = False
     trajectory_cache_type: str = "sparse"
+    write_materialized_cache: bool = False
+    rebuild_materialized_cache: bool = False
+    gmr_cache_namespace: str | None = None
 
     def __post_init__(self):
-        assert self.rel_dataset_path is not None or self.dataset_group is not None, ("Either `rel_dataset_path` or "
-                                                                                     "`dataset_group` must be set.")
+        assert self.rel_dataset_path is not None or self.dataset_group is not None, (
+            "Either `rel_dataset_path` or `dataset_group` must be set."
+        )
         if self.max_motions is not None:
             self.max_motions = int(self.max_motions)
             if self.max_motions <= 0:
                 raise ValueError(f"max_motions must be > 0, got {self.max_motions}")
+        self.max_motions_seed = int(self.max_motions_seed)
+        if self.gmr_cache_namespace is not None:
+            self.gmr_cache_namespace = str(self.gmr_cache_namespace)
+            if (
+                not self.gmr_cache_namespace
+                or self.gmr_cache_namespace in {".", ".."}
+                or "/" in self.gmr_cache_namespace
+                or "\\" in self.gmr_cache_namespace
+            ):
+                raise ValueError(
+                    f"gmr_cache_namespace must be one non-empty path component, got {self.gmr_cache_namespace!r}"
+                )
+        self.gmr_cache_namespace = resolve_training_gmr_cache_namespace(
+            self.retargeting_method,
+            self.gmr_cache_namespace,
+        )
 
 
 @dataclass
@@ -174,8 +249,9 @@ class LAFAN1DatasetConf:
     trajectory_cache_type: str = "full"
 
     def __post_init__(self):
-        assert self.dataset_name is not None or self.dataset_group is not None, ("Either `dataset_name` or "
-                                                                                 "`dataset_group` must be set.")
+        assert self.dataset_name is not None or self.dataset_group is not None, (
+            "Either `dataset_name` or `dataset_group` must be set."
+        )
 
 
 @dataclass
@@ -187,5 +263,6 @@ class CustomDatasetConf:
         traj (Trajectory): A custom trajectory to load.
 
     """
+
     traj: Trajectory
     trajectory_cache_type: str = "full"

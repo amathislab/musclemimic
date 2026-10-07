@@ -4,8 +4,11 @@ PPO Loss Functions.
 Pure functions for computing PPO losses.
 """
 
+from __future__ import annotations
+
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 
 
@@ -55,6 +58,7 @@ def ppo_actor_loss(
     advantages: jnp.ndarray,
     clip_eps: float,
     return_ratio_stats: bool = False,
+    axis_name: str | None = None,
 ) -> jnp.ndarray | tuple[jnp.ndarray, dict]:
     """
     Clipped surrogate policy loss.
@@ -67,6 +71,7 @@ def ppo_actor_loss(
         advantages: Normalized advantages, shape (batch,)
         clip_eps: Clipping epsilon for policy ratio
         return_ratio_stats: If True, also return ratio statistics dict
+        axis_name: optional mesh axis for global ratio statistics
 
     Returns:
         Scalar mean actor loss, or tuple of (loss, ratio_stats) if return_ratio_stats=True
@@ -78,12 +83,27 @@ def ppo_actor_loss(
     loss = loss_actor.mean()
 
     if return_ratio_stats:
+        metric_ratio = jax.lax.stop_gradient(ratio)
+        ratio_mean = jnp.mean(metric_ratio)
+        ratio_second_moment = jnp.mean(jnp.square(metric_ratio))
+        ratio_min = jnp.min(metric_ratio)
+        ratio_max = jnp.max(metric_ratio)
+        clipped_ratio_fraction = jnp.mean(jnp.abs(metric_ratio - 1.0) > clip_eps)
+        if axis_name is not None:
+            ratio_mean = jax.lax.pmean(ratio_mean, axis_name=axis_name)
+            ratio_second_moment = jax.lax.pmean(ratio_second_moment, axis_name=axis_name)
+            ratio_min = jax.lax.pmin(ratio_min, axis_name=axis_name)
+            ratio_max = jax.lax.pmax(ratio_max, axis_name=axis_name)
+            clipped_ratio_fraction = jax.lax.pmean(
+                clipped_ratio_fraction,
+                axis_name=axis_name,
+            )
         ratio_stats = {
-            "ratio_mean": jnp.mean(ratio),
-            "ratio_std": jnp.std(ratio),
-            "ratio_min": jnp.min(ratio),
-            "ratio_max": jnp.max(ratio),
-            "clipped_ratio_frac": jnp.mean(jnp.abs(ratio - 1.0) > clip_eps),
+            "ratio_mean": ratio_mean,
+            "ratio_std": jnp.sqrt(jnp.maximum(ratio_second_moment - jnp.square(ratio_mean), 0.0)),
+            "ratio_min": ratio_min,
+            "ratio_max": ratio_max,
+            "clipped_ratio_frac": clipped_ratio_fraction,
         }
         return loss, ratio_stats
     return loss
@@ -96,7 +116,7 @@ def approx_kl(
     """
     Sample-based approximate KL divergence.
 
-    KL ≈ E[log π_old(a|s) - log π_new(a|s)]
+    KL ~= E[log pi_old(a|s) - log pi_new(a|s)]
 
     This is the most common KL approximation in PPO implementations.
     Works for any distribution (Gaussian, categorical, squashed, etc.)
@@ -123,6 +143,22 @@ def normalize_advantages(advantages: jnp.ndarray) -> jnp.ndarray:
         Normalized advantages, shape (batch,)
     """
     return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+
+def normalize_advantages_global(
+    advantages: jnp.ndarray,
+    axis_name: str | None = None,
+) -> jnp.ndarray:
+    """Normalize with global data-parallel statistics when ``axis_name`` is set."""
+    if axis_name is None:
+        return normalize_advantages(advantages)
+    mean_local = advantages.mean()
+    mean_global = jax.lax.pmean(mean_local, axis_name=axis_name)
+    sq_local = jnp.square(advantages).mean()
+    sq_global = jax.lax.pmean(sq_local, axis_name=axis_name)
+    var_global = jnp.maximum(sq_global - jnp.square(mean_global), 0.0)
+    std_global = jnp.sqrt(var_global)
+    return (advantages - mean_global) / (std_global + 1e-8)
 
 
 def ppo_loss(

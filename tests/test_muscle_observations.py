@@ -371,6 +371,29 @@ class TestMjxMyoBimanualArmObservations:
 class TestMyoFullBodyObservations:
     """Test suite for MyoFullBody observation flags."""
 
+    def test_egocentric_root_observations_replace_world_frame_root_state(self, base_env_config):
+        env = MyoFullBody(
+            disable_fingers=True,
+            enable_muscle_length_observations=False,
+            enable_muscle_velocity_observations=False,
+            enable_muscle_force_observations=False,
+            enable_muscle_activation_observations=False,
+            enable_touch_sensor_observations=False,
+            use_egocentric_root_observations=True,
+            **base_env_config,
+        )
+
+        observation = env.reset()
+        observation_names = set(env.obs_container.keys())
+
+        assert {"q_root_height", "projected_gravity", "dq_free_joint_heading"} <= observation_names
+        assert "q_free_joint" not in observation_names
+        assert "dq_free_joint" not in observation_names
+        assert env.obs_container["q_root_height"].dim == 1
+        assert env.obs_container["projected_gravity"].dim == 3
+        assert env.obs_container["dq_free_joint_heading"].dim == 6
+        assert np.all(np.isfinite(observation))
+
     def test_myofullbody_all_observations_match_mujoco(self, base_env_config):
         """Test MyoFullBody with all observation flags enabled match MuJoCo values."""
         env = MyoFullBody(

@@ -1,4 +1,6 @@
 import atexit
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import Union, List, Dict, Tuple, Optional
 from types import ModuleType
@@ -15,6 +17,7 @@ import jax.numpy as jnp
 
 from loco_mujoco.core.utils import Box, MDPInfo, info_property
 from loco_mujoco.core.reward.base import Reward
+from loco_mujoco.core.reward_termination import RewardTerminationHandler
 from loco_mujoco.core.observations import (Observation, ObservationType, Goal,
                                            ObservationIndexContainer, ObservationContainer)
 from loco_mujoco.core.control_functions import ControlFunction
@@ -33,6 +36,7 @@ class AdditionalCarry:
     last_action: Union[np.ndarray, jax.Array]
     observation_states: struct.PyTreeNode
     reward_state: struct.PyTreeNode
+    reward_termination_state: struct.PyTreeNode
     domain_randomizer_state: struct.PyTreeNode
     terrain_state: struct.PyTreeNode
     init_state_handler_state: struct.PyTreeNode
@@ -88,6 +92,8 @@ class Mujoco:
                  model_option_conf: Dict = None,
                  reward_type: str = "NoReward",
                  reward_params: Dict = None,
+                 reward_termination_type: str = "NoRewardTerminationHandler",
+                 reward_termination_params: Dict = None,
                  goal_type: str = "NoGoal",
                  goal_params: Dict = None,
                  terminal_state_type: str = "NoTerminalStateHandler",
@@ -117,6 +123,7 @@ class Mujoco:
         # set some attributes
         self._n_substeps = n_substeps
         self._n_intermediate_steps = 1
+        self._physics_step_observer = None
         self._viewer_params = viewer_params
         self._viewer = None
         self._obs = None
@@ -160,6 +167,13 @@ class Mujoco:
         # setup reward function
         reward_cls = Reward.registered[reward_type]
         self._reward_function = reward_cls(self) if reward_params is None else reward_cls(self, **reward_params)
+
+        # setup reward-based termination
+        if reward_termination_params is None:
+            reward_termination_params = {}
+        self._reward_termination_handler = RewardTerminationHandler.registered[reward_termination_type](
+            self, **reward_termination_params
+        )
 
         # setup terrain
         terrain_params = {} if terrain_params is None else terrain_params
@@ -241,6 +255,8 @@ class Mujoco:
         """
 
         cur_info = self._info.copy()
+        action_is_finite = np.all(np.isfinite(action))
+        action = np.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
         carry = self._additional_carry
         carry = carry.replace(last_action=action)
 
@@ -257,7 +273,13 @@ class Mujoco:
 
             # main mujoco step, runs the sim for n_substeps
             self._data.ctrl[self._action_indices] = ctrl_action
-            mujoco.mj_step(self._model, self._data, self._n_substeps)
+            if self._physics_step_observer is None:
+                mujoco.mj_step(self._model, self._data, self._n_substeps)
+            else:
+                for _ in range(self._n_substeps):
+                    step_start = float(self._data.time)
+                    mujoco.mj_step(self._model, self._data)
+                    self._physics_step_observer(self._model, self._data, step_start)
 
         # modify data during simulation, after main step (does nothing by default)
         self._data, carry = self._simulation_post_step(self._model, self._data, carry)
@@ -276,9 +298,24 @@ class Mujoco:
 
         # calculate the reward
         reward, carry = self._reward(self._obs, action, cur_obs, absorbing, cur_info, self._model, self._data, carry)
+        carry, reward_done = self._reward_termination_handler.update(reward, carry, np)
+
+        done_numerical = not (
+            action_is_finite
+            and np.all(np.isfinite(self._obs))
+            and np.all(np.isfinite(cur_obs))
+            and np.all(np.isfinite(reward))
+        )
+        cur_info["done_numerical"] = bool(done_numerical)
+        absorbing = bool(absorbing or done_numerical)
+        cur_obs = np.nan_to_num(cur_obs, nan=0.0, posinf=0.0, neginf=0.0)
+        reward = np.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
 
         # calculate flag indicating whether this is the last obs before resetting
+        cur_info["done_horizon"] = bool(carry.cur_step_in_episode >= self.info.horizon)
+        cur_info["done_reward"] = bool(reward_done)
         done = self._is_done(cur_obs, absorbing, cur_info, self._data, carry)
+        done = bool(np.logical_or(done, reward_done))
 
         carry = carry.replace(cur_step_in_episode=carry.cur_step_in_episode + 1)
 
@@ -286,6 +323,27 @@ class Mujoco:
         self._additional_carry = carry
 
         return np.asarray(cur_obs), reward, absorbing, done, cur_info
+
+    @contextmanager
+    def observe_physics_steps(
+        self, observer: Callable[[MjModel, MjData, float], None]
+    ) -> Iterator[None]:
+        """Observe each native CPU physics step without changing control frequency.
+
+        The observer receives the live model, solved data, and integration start
+        time [s]. ``data.time`` is the interval end. Observers must only read the
+        model/data and must not advance or forward the simulation. Derived forces
+        describe the solver evaluation within that interval; integrated qpos,
+        qvel and activation describe its end. MJX/Warp stepping does not use this
+        host-side hook. Registration is scoped to this environment instance.
+        """
+        if self._physics_step_observer is not None:
+            raise RuntimeError("A physics-step observer is already registered on this environment.")
+        self._physics_step_observer = observer
+        try:
+            yield
+        finally:
+            self._physics_step_observer = None
 
     def render(self, record: bool = False, debug_info: dict = None) -> np.ndarray:
         """
@@ -417,6 +475,7 @@ class Mujoco:
         data, carry = self._init_state_handler.reset(self, model, data, carry, np)
         data, carry = self._domain_randomizer.reset(self, model, data, carry, np)
         data, carry = self._reward_function.reset(self, model, data, carry, np)
+        data, carry = self._reward_termination_handler.reset(self, model, data, carry, np)
 
         return data, carry
 
@@ -459,7 +518,7 @@ class Mujoco:
             A dictionary containing the updated information.
 
         """
-        return {}
+        return {"done_horizon": False, "done_reward": False, "done_numerical": False}
 
     def _update_info_dictionary(self, info: Dict,
                                 obs: np.ndarray,
@@ -855,6 +914,7 @@ class Mujoco:
             last_action=backend.zeros(self.info.action_space.shape),
             observation_states=self.obs_container.init_state(self, _k1, model, data, backend),
             reward_state=self._reward_function.init_state(self, _k2, model, data, backend),
+            reward_termination_state=self._reward_termination_handler.init_state(self, None, model, data, backend),
             domain_randomizer_state=self._domain_randomizer.init_state(self, _k3, model, data, backend),
             terrain_state=self._terrain.init_state(self, _k4, model, data, backend),
             init_state_handler_state=self._init_state_handler.init_state(self, _k5, model, data, backend),

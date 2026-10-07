@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -245,6 +246,107 @@ def test_mean_site_deviation_flags_translation(env, ref_data, carry):
     assert bool(is_terminal)
 
 
+def test_mean_site_deviation_reduction_controls_outlier_sensitivity(env, ref_data, carry):
+    moved = offset_site(ref_data.site_xpos, "right_hand_mimic", np.array([0.4, 0.0, 0.0]))
+    state = make_state_from_traj(moved)
+    set_threshold(carry, 0.1)
+    mean_handler = MeanSiteDeviationTerminalStateHandler(
+        env,
+        mean_site_deviation_threshold=0.1,
+        reduction="mean",
+    )
+    max_handler = MeanSiteDeviationTerminalStateHandler(
+        env,
+        mean_site_deviation_threshold=0.1,
+        reduction="max",
+    )
+    mean_info = {}
+    max_info = {}
+
+    mean_terminal, _ = mean_handler.is_absorbing(env, np.array([]), mean_info, state, carry)
+    max_terminal, _ = max_handler.is_absorbing(env, np.array([]), max_info, state, carry)
+
+    assert not bool(mean_terminal)
+    assert bool(max_terminal)
+    assert not bool(mean_info["termination_site_position"])
+    assert bool(max_info["termination_site_position"])
+
+    excluded_handler = MeanSiteDeviationTerminalStateHandler(
+        env,
+        mean_site_deviation_threshold=0.1,
+        reduction="max",
+        exclude_sites=["right_hand_mimic"],
+    )
+    excluded_terminal, _ = excluded_handler.is_absorbing(env, np.array([]), {}, state, carry)
+    assert not bool(excluded_terminal)
+
+
+def test_mean_site_deviation_minimum_steps_has_cpu_jax_and_jit_parity(env, ref_data):
+    handler = MeanSiteDeviationTerminalStateHandler(
+        env,
+        mean_site_deviation_threshold=0.1,
+        minimum_episode_steps=3,
+    )
+    state_np = make_state_from_traj(
+        ref_data.site_xpos,
+        translation=np.array([0.4, 0.0, 0.0]),
+    )
+
+    cpu_results = []
+    for episode_step in (2, 3):
+        info = {}
+        terminal, _ = handler.is_absorbing(
+            env,
+            np.array([]),
+            info,
+            state_np,
+            SimpleNamespace(
+                termination_threshold=np.asarray(0.1, dtype=np.float32),
+                cur_step_in_episode=np.asarray(episode_step, dtype=np.int32),
+            ),
+        )
+        cpu_results.append((bool(terminal), bool(info["termination_site_position"])))
+
+    state_jax = make_state_from_traj(
+        ref_data.site_xpos,
+        translation=jnp.array([0.4, 0.0, 0.0]),
+        backend=jnp,
+    )
+
+    def evaluate_jax(episode_step):
+        info = {}
+        terminal, _ = handler.mjx_is_absorbing(
+            env,
+            jnp.array([]),
+            info,
+            state_jax,
+            SimpleNamespace(
+                termination_threshold=jnp.asarray(0.1, dtype=jnp.float32),
+                cur_step_in_episode=episode_step,
+            ),
+        )
+        return terminal, info["termination_site_position"]
+
+    eager_results = [tuple(bool(value) for value in evaluate_jax(step)) for step in (2, 3)]
+    compiled_evaluate = jax.jit(evaluate_jax)
+    jit_results = [tuple(bool(value) for value in compiled_evaluate(step)) for step in (2, 3)]
+
+    assert cpu_results == eager_results == jit_results == [(False, False), (True, True)]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"reduction": "median"}, "reduction must be one of"),
+        ({"minimum_episode_steps": -1}, "minimum_episode_steps must be a nonnegative integer"),
+        ({"minimum_episode_steps": 1.5}, "minimum_episode_steps must be a nonnegative integer"),
+    ],
+)
+def test_mean_site_deviation_rejects_invalid_gate_configuration(env, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        MeanSiteDeviationTerminalStateHandler(env, **kwargs)
+
+
 def test_mean_site_deviation_uses_carry_threshold(env, ref_data, carry):
     """Carry threshold should override handler default."""
     handler = MeanSiteDeviationTerminalStateHandler(env, mean_site_deviation_threshold=1.0, enable_site_check=True)
@@ -481,6 +583,26 @@ def test_relative_with_root_perfect_tracking(env, ref_data, carry):
 
     is_terminal, _ = handler.is_absorbing(env, np.array([]), {}, state, carry)
     assert not bool(is_terminal), "Perfect tracking should not trigger termination"
+
+
+def test_relative_with_root_uses_mapper_updated_after_construction(env, ref_data, carry):
+    """Root lookup should use the sparse trajectory order attached by the goal."""
+    handler = MeanRelativeSiteDeviationWithRootTerminalStateHandler(
+        env,
+        mean_site_deviation_threshold=1.0,
+        root_deviation_threshold=0.3,
+        root_site="pelvis_mimic",
+        enable_site_check=True,
+    )
+    model_order_ref = SimpleNamespace(**vars(ref_data))
+    model_order_ref.site_xpos = _positions_in_model_order(ref_data.site_xpos)
+    env.th._ref_data = model_order_ref
+    env._goal._site_mapper._traj_index = {idx: idx for idx in range(len(ENV_SITE_ORDER))}
+    state = make_state_from_traj(ref_data.site_xpos)
+
+    root_violation = handler._check_root_deviation(env, state, carry, np)
+
+    assert not bool(root_violation)
 
 
 def test_relative_with_root_translation_triggers_termination(env, ref_data, carry):

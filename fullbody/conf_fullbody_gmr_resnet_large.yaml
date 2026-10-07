@@ -1,0 +1,8 @@
+# Shared large GMR ResNet architecture for full-body PPO experiments.
+defaults:
+  - conf_fullbody_gmr_resnet
+  - _self_
+
+experiment:
+  actor_hidden_layers: [2048, 4096, 4096, 4096, 4096, 4096, 2048, 1024, 512]
+  critic_hidden_layers: [2048, 4096, 4096, 4096, 4096, 4096, 2048, 1024, 512]

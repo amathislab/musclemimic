@@ -9,6 +9,7 @@ RUFF ?= $(VENV_BIN)/ruff
 PYTEST_ARGS ?= -m "not integration"
 LINT_PATHS := \
 	bimanual \
+	musclemimic/algorithms \
 	tests/unit/test_enhanced_fullbody_terminal_handler.py \
 	tests/unit/test_enhanced_fullbody_terminal_handler_integration.py \
 	tests/test_muscle_observations.py \

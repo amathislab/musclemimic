@@ -7,14 +7,10 @@ import jax.numpy as jnp
 import optax
 from omegaconf import OmegaConf
 
-from musclemimic.algorithms.common import checkpoint_hooks as hooks
 from musclemimic.algorithms.common.checkpoint_utils import TrainingConfig, compute_resume_state
-from musclemimic.algorithms.ppo import runner
-
-
-def _clear_checkpoint_callback_cache() -> None:
-    if hasattr(hooks.create_jax_checkpoint_host_callback, "__cached_instance__"):
-        delattr(hooks.create_jax_checkpoint_host_callback, "__cached_instance__")
+from musclemimic.algorithms.common.dataclasses import TrainState
+from musclemimic.algorithms.ppo import train as ppo_train
+from musclemimic.algorithms.ppo.learning import initialize_train_state
 
 
 def _collect_schedule_counts(opt_state) -> list[int]:
@@ -88,190 +84,17 @@ def test_compute_resume_state_changed_config_uses_current_steps_per_update():
     assert remaining == 8  # 7 full + ceil(extra/current_steps_per_update)
 
 
-def test_handle_checkpointing_passes_updates_done_and_resume_baseline(monkeypatch):
-    """Periodic checkpoint should pass updates_done and resume baseline into callback factory."""
-    _clear_checkpoint_callback_cache()
-
-    captured = []
-    create_calls = []
-
-    def fake_ckpt_cb(*args):
-        captured.append(args)
-        return 0
-
-    def fake_create_cb(*args, **kwargs):
-        create_calls.append(kwargs)
-        return fake_ckpt_cb, object()
-
-    def fake_io_callback(cb, _shape, *args):
-        cb(*args)
-        return jnp.int32(0)
-
-    monkeypatch.setattr(hooks, "create_jax_checkpoint_host_callback", fake_create_cb)
-    monkeypatch.setattr(runner.jax.experimental, "io_callback", fake_io_callback)
-
-    train_state = SimpleNamespace(
-        params={"w": jnp.array([1.0], dtype=jnp.float32)},
-        run_stats={},
-        opt_state={},
-        step=jnp.int32(17),
+def test_training_config_uses_global_num_envs_after_data_sharding():
+    exp = SimpleNamespace(
+        num_envs=256,
+        global_num_envs=1024,
+        num_steps=20,
+        num_minibatches=8,
+        update_epochs=2,
     )
-    cfg = SimpleNamespace(
-        save_checkpoints=True,
-        checkpoint_interval=5,
-        save_checkpoints_on_validation=False,
-        validation_interval=11,
-    )
-
-    runner._handle_checkpointing(  # pylint: disable=protected-access
-        train_state=train_state,
-        rng=jnp.array([0, 1], dtype=jnp.uint32),
-        lr=jnp.float32(3e-4),
-        counter=jnp.int32(10),
-        updates_done=jnp.int32(123),
-        base_global_timestep=55_555,
-        base_completed_updates=100,
-        config=cfg,
-        agent_conf=SimpleNamespace(config=OmegaConf.create({"experiment": {}})),
-        env=SimpleNamespace(),
-    )
-
-    assert len(captured) == 1
-    assert len(create_calls) == 1
-    assert create_calls[0]["base_global_timestep"] == 55_555
-    assert create_calls[0]["base_completed_updates"] == 100
-    callback_args = captured[0]
-    assert len(callback_args) == 7
-    assert int(callback_args[3]) == 17  # train_state.step
-    assert int(callback_args[4]) == 123  # updates_done
-
-
-def test_save_final_checkpoint_uses_total_updates_and_resume_baseline(monkeypatch):
-    """Final checkpoint should save base+remaining updates and carry resume baseline."""
-    _clear_checkpoint_callback_cache()
-
-    captured = []
-    create_calls = []
-
-    def fake_ckpt_cb(*args):
-        captured.append(args)
-        return 0
-
-    def fake_create_cb(*args, **kwargs):
-        create_calls.append(kwargs)
-        return fake_ckpt_cb, object()
-
-    def fake_io_callback(cb, _shape, *args):
-        cb(*args)
-        return jnp.int32(0)
-
-    monkeypatch.setattr(hooks, "create_jax_checkpoint_host_callback", fake_create_cb)
-    monkeypatch.setattr(runner.jax.experimental, "io_callback", fake_io_callback)
-
-    final_train_state = SimpleNamespace(
-        params={"w": jnp.array([1.0], dtype=jnp.float32)},
-        run_stats={},
-        opt_state={},
-        step=jnp.int32(999),
-    )
-    runner_state = (
-        final_train_state,
-        None,
-        None,
-        jnp.array([11, 22], dtype=jnp.uint32),  # rng
-        jnp.float32(1e-4),  # lr
-        None,
-        None,
-        None,
-    )
-
-    runner._save_final_checkpoint(  # pylint: disable=protected-access
-        runner_state=runner_state,
-        base_global_timestep=5_000_000_000,
-        base_completed_updates=80,
-        remaining_updates=20,
-        agent_conf=SimpleNamespace(config=OmegaConf.create({"experiment": {}})),
-        env=SimpleNamespace(),
-    )
-
-    assert len(captured) == 1
-    assert len(create_calls) == 1
-    assert create_calls[0]["base_global_timestep"] == 5_000_000_000
-    assert create_calls[0]["base_completed_updates"] == 80
-    callback_args = captured[0]
-    assert len(callback_args) == 7
-    assert int(callback_args[3]) == 999  # train_state.step
-    assert int(callback_args[4]) == 100  # base_completed + remaining
-
-
-def test_checkpoint_host_callback_uses_explicit_update_and_global_timestep(monkeypatch):
-    """Host callback metadata should reconstruct global timestep from resume baseline."""
-
-    class FakeManager:
-        def __init__(self):
-            self.saved = []
-
-        def save_checkpoint(self, step, agent_conf, agent_state, metadata):
-            self.saved.append((step, agent_conf, agent_state, metadata))
-            return f"/tmp/checkpoint_{step}"
-
-    fake_manager = FakeManager()
-    monkeypatch.setattr(hooks, "create_checkpoint_manager", lambda *args, **kwargs: fake_manager)
-
-    class DummyAlgo:
-        @staticmethod
-        def _agent_state(train_state):
-            return SimpleNamespace(train_state=train_state)
-
-    exp_cfg = OmegaConf.create(
-        {
-            "experiment": {
-                "checkpoint_dir": "/tmp/ckpts",
-                "num_envs": 64,
-                "num_steps": 20,
-                "num_minibatches": 8,
-                "update_epochs": 1,
-            }
-        }
-    )
-    agent_conf = SimpleNamespace(
-        config=exp_cfg,
-        network=lambda *args, **kwargs: None,
-        tx=object(),
-    )
-    env = SimpleNamespace(mjx_backend="jax")
-
-    base_global_timestep = 6_656_000_000
-    base_completed_updates = 16_250
-
-    host_cb, _mgr = hooks.create_jax_checkpoint_host_callback(
-        DummyAlgo,
-        agent_conf,
-        exp_cfg,
-        env,
-        base_global_timestep=base_global_timestep,
-        base_completed_updates=base_completed_updates,
-    )
-    assert _mgr is fake_manager
-
-    host_cb(
-        {"p": jnp.array([1.0], dtype=jnp.float32)},  # ts_params
-        {},  # ts_run_stats
-        {},  # ts_opt_state
-        jnp.int32(0),  # ts_step (would imply update=0 if derived)
-        jnp.int32(base_completed_updates + 50),  # updates_done
-        jnp.array([1, 2], dtype=jnp.uint32),  # rng_key
-        jnp.float32(3e-4),  # current_lr
-    )
-
-    assert len(fake_manager.saved) == 1
-    save_step, _agent_conf, _agent_state, md = fake_manager.saved[0]
-
-    expected_global_timestep = base_global_timestep + 50 * 64 * 20
-    assert save_step == base_completed_updates + 50
-    assert md.update_number == base_completed_updates + 50
-    assert md.global_timestep == expected_global_timestep
-    assert md.step == 0
+    cfg = TrainingConfig.from_experiment_config(exp)
+    assert cfg.num_envs == 1024
+    assert cfg.num_steps == 20
 
 
 def test_init_train_state_resume_with_lr_reset_and_std_reset():
@@ -300,7 +123,7 @@ def test_init_train_state_resume_with_lr_reset_and_std_reset():
     loaded_counts = _collect_schedule_counts(opt_state)
     assert loaded_counts and all(c > 0 for c in loaded_counts)
 
-    loaded_ts = runner.TrainState(
+    loaded_ts = TrainState(
         apply_fn=DummyNetwork().apply,
         params=params,
         tx=tx,
@@ -309,11 +132,11 @@ def test_init_train_state_resume_with_lr_reset_and_std_reset():
         run_stats={},
     )
 
-    resumed = runner._init_train_state(  # pylint: disable=protected-access
+    resumed = initialize_train_state(  # pylint: disable=protected-access
         rng=jnp.array([0, 1], dtype=jnp.uint32),
         env=SimpleNamespace(info=SimpleNamespace(observation_space=SimpleNamespace(shape=(4,)))),
         network=DummyNetwork(),
-        tx=tx,
+        optimizer=tx,
         agent_state=SimpleNamespace(train_state=loaded_ts),
         config=OmegaConf.create(
             {
@@ -343,7 +166,7 @@ def test_init_train_state_resume_without_resets_preserves_step_and_std():
         "w": jnp.array([0.1], dtype=jnp.float32),
         "log_std": jnp.array([0.2, -0.3], dtype=jnp.float32),
     }
-    loaded_ts = runner.TrainState(
+    loaded_ts = TrainState(
         apply_fn=DummyNetwork().apply,
         params=params,
         tx=tx,
@@ -352,17 +175,52 @@ def test_init_train_state_resume_without_resets_preserves_step_and_std():
         run_stats={},
     )
 
-    resumed = runner._init_train_state(  # pylint: disable=protected-access
+    resumed = initialize_train_state(  # pylint: disable=protected-access
         rng=jnp.array([0, 1], dtype=jnp.uint32),
         env=SimpleNamespace(info=SimpleNamespace(observation_space=SimpleNamespace(shape=(4,)))),
         network=DummyNetwork(),
-        tx=tx,
+        optimizer=tx,
         agent_state=SimpleNamespace(train_state=loaded_ts),
         config=OmegaConf.create({"reset_lr_schedule_on_resume": False}),
     )
 
     assert int(resumed.step) == 77
     assert jnp.allclose(resumed.params["log_std"], params["log_std"])
+
+
+def test_init_train_state_resume_does_not_initialize_optimizer_state():
+    """Resume should use the restored optimizer state without allocating a new one."""
+
+    class DummyNetwork:
+        def apply(self, *args, **kwargs):
+            raise NotImplementedError
+
+    class NoInitTx:
+        def init(self, _params):
+            raise AssertionError("resume path must not initialize optimizer state")
+
+    params = {"w": jnp.array([0.1], dtype=jnp.float32)}
+    opt_state = {"raw": jnp.array([0.0], dtype=jnp.float32)}
+    loaded_ts = TrainState(
+        apply_fn=DummyNetwork().apply,
+        params=params,
+        tx=NoInitTx(),
+        opt_state=opt_state,
+        step=jnp.asarray(77, dtype=jnp.int32),
+        run_stats={},
+    )
+
+    resumed = initialize_train_state(  # pylint: disable=protected-access
+        rng=jnp.array([0, 1], dtype=jnp.uint32),
+        env=SimpleNamespace(info=SimpleNamespace(observation_space=SimpleNamespace(shape=(4,)))),
+        network=DummyNetwork(),
+        optimizer=NoInitTx(),
+        agent_state=SimpleNamespace(train_state=loaded_ts),
+        config=OmegaConf.create({"reset_lr_schedule_on_resume": False}),
+    )
+
+    assert resumed.opt_state is opt_state
+    assert int(resumed.step) == 77
 
 
 def test_init_train_state_resume_reset_std_only_preserves_step():
@@ -377,7 +235,7 @@ def test_init_train_state_resume_reset_std_only_preserves_step():
         "w": jnp.array([0.3, -0.7], dtype=jnp.float32),
         "log_std": jnp.array([0.2, -0.3, 0.5], dtype=jnp.float32),
     }
-    loaded_ts = runner.TrainState(
+    loaded_ts = TrainState(
         apply_fn=DummyNetwork().apply,
         params=params,
         tx=tx,
@@ -386,11 +244,11 @@ def test_init_train_state_resume_reset_std_only_preserves_step():
         run_stats={},
     )
 
-    resumed = runner._init_train_state(  # pylint: disable=protected-access
+    resumed = initialize_train_state(  # pylint: disable=protected-access
         rng=jnp.array([0, 1], dtype=jnp.uint32),
         env=SimpleNamespace(info=SimpleNamespace(observation_space=SimpleNamespace(shape=(4,)))),
         network=DummyNetwork(),
-        tx=tx,
+        optimizer=tx,
         agent_state=SimpleNamespace(train_state=loaded_ts),
         config=OmegaConf.create(
             {
@@ -430,7 +288,7 @@ def test_init_train_state_local_auto_resume_skips_one_shot_resets():
     loaded_counts = _collect_schedule_counts(opt_state)
     assert loaded_counts and all(c > 0 for c in loaded_counts)
 
-    loaded_ts = runner.TrainState(
+    loaded_ts = TrainState(
         apply_fn=DummyNetwork().apply,
         params=params,
         tx=tx,
@@ -439,11 +297,11 @@ def test_init_train_state_local_auto_resume_skips_one_shot_resets():
         run_stats={},
     )
 
-    resumed = runner._init_train_state(  # pylint: disable=protected-access
+    resumed = initialize_train_state(  # pylint: disable=protected-access
         rng=jnp.array([0, 1], dtype=jnp.uint32),
         env=SimpleNamespace(info=SimpleNamespace(observation_space=SimpleNamespace(shape=(4,)))),
         network=DummyNetwork(),
-        tx=tx,
+        optimizer=tx,
         agent_state=SimpleNamespace(train_state=loaded_ts),
         config=OmegaConf.create(
             {
@@ -479,14 +337,19 @@ def test_compute_resume_info_stored_target_used_on_auto_resume():
         "update_number": 3,
         "global_timestep": 96,
         "target_global_timestep": 416,
+        "optimizer_step": 3,
         "num_envs": 4,
         "num_steps": 8,
         "num_minibatches": 1,
         "update_epochs": 1,
     }
 
-    completed, remaining, base_ts, base_step, target = runner._compute_resume_info(
-        config, agent_state, resume_info, train_state, preserve_checkpoint_target=True,
+    completed, remaining, base_ts, base_step, target = ppo_train._compute_resume_info(
+        config,
+        agent_state,
+        resume_info,
+        train_state,
+        preserve_checkpoint_target=True,
     )
 
     assert completed == 3
@@ -516,14 +379,18 @@ def test_compute_resume_info_first_explicit_resume_uses_additional():
         "update_number": 3,
         "global_timestep": 96,
         "target_global_timestep": 0,
+        "optimizer_step": 3,
         "num_envs": 4,
         "num_steps": 8,
         "num_minibatches": 1,
         "update_epochs": 1,
     }
 
-    completed, remaining, base_ts, base_step, target = runner._compute_resume_info(
-        config, agent_state, resume_info, train_state,
+    completed, remaining, base_ts, base_step, target = ppo_train._compute_resume_info(
+        config,
+        agent_state,
+        resume_info,
+        train_state,
     )
 
     assert completed == 3
@@ -552,14 +419,19 @@ def test_compute_resume_info_explicit_resume_ignores_stored_target():
         "update_number": 3,
         "global_timestep": 96,
         "target_global_timestep": 416,
+        "optimizer_step": 3,
         "num_envs": 4,
         "num_steps": 8,
         "num_minibatches": 1,
         "update_epochs": 1,
     }
 
-    completed, remaining, base_ts, base_step, target = runner._compute_resume_info(
-        config, agent_state, resume_info, train_state, preserve_checkpoint_target=False,
+    completed, remaining, base_ts, base_step, target = ppo_train._compute_resume_info(
+        config,
+        agent_state,
+        resume_info,
+        train_state,
+        preserve_checkpoint_target=False,
     )
 
     assert completed == 3
@@ -589,14 +461,19 @@ def test_compute_resume_info_absolute_budget_overrides_stored_target():
         "update_number": 3,
         "global_timestep": 96,
         "target_global_timestep": 416,
+        "optimizer_step": 3,
         "num_envs": 4,
         "num_steps": 8,
         "num_minibatches": 1,
         "update_epochs": 1,
     }
 
-    completed, remaining, base_ts, base_step, target = runner._compute_resume_info(
-        config, agent_state, resume_info, train_state, preserve_checkpoint_target=True,
+    completed, remaining, base_ts, base_step, target = ppo_train._compute_resume_info(
+        config,
+        agent_state,
+        resume_info,
+        train_state,
+        preserve_checkpoint_target=True,
     )
 
     assert completed == 3
@@ -627,14 +504,19 @@ def test_compute_resume_info_finetune_preempt_preserves_target():
         "update_number": 10,
         "global_timestep": 1200,
         "target_global_timestep": 1500,
+        "optimizer_step": 10,
         "num_envs": 4,
         "num_steps": 8,
         "num_minibatches": 1,
         "update_epochs": 1,
     }
 
-    completed, remaining, base_ts, base_step, target = runner._compute_resume_info(
-        config, agent_state, resume_info, train_state, preserve_checkpoint_target=True,
+    _completed, remaining, base_ts, _base_step, target = ppo_train._compute_resume_info(
+        config,
+        agent_state,
+        resume_info,
+        train_state,
+        preserve_checkpoint_target=True,
     )
 
     assert target == 1500
@@ -642,84 +524,35 @@ def test_compute_resume_info_finetune_preempt_preserves_target():
     assert base_ts == 1200
 
 
-def test_checkpoint_host_callback_via_io_callback_under_jit_no_concretization(monkeypatch):
-    """JIT + io_callback path should execute host int()/float() casts without tracer errors."""
+def test_resumed_training_preserves_resume_policy(monkeypatch):
+    from musclemimic.algorithms.ppo import ppo as ppo_mod
+    from musclemimic.algorithms.ppo.ppo import PPOJax
 
-    class FakeManager:
-        def __init__(self):
-            self.saved = []
+    loaded_state = SimpleNamespace(train_state="train-state", runtime_state={"step": 3})
+    resume_info = {"global_timestep": 123}
+    monkeypatch.setattr(ppo_mod, "load_checkpoint_for_resume", lambda *a, **k: (loaded_state, resume_info))
+    captured = {}
 
-        def save_checkpoint(self, step, agent_conf, agent_state, metadata):
-            self.saved.append((step, metadata))
-            return f"/tmp/checkpoint_{step}"
+    def fake_build_training(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return "training"
 
-    fake_manager = FakeManager()
-    monkeypatch.setattr(hooks, "create_checkpoint_manager", lambda *args, **kwargs: fake_manager)
+    monkeypatch.setattr(ppo_mod, "build_training", fake_build_training)
 
-    class DummyAlgo:
-        @staticmethod
-        def _agent_state(train_state):
-            return SimpleNamespace(train_state=train_state)
-
-    exp_cfg = OmegaConf.create(
-        {
-            "experiment": {
-                "checkpoint_dir": "/tmp/ckpts",
-                "num_envs": 64,
-                "num_steps": 20,
-                "num_minibatches": 8,
-                "update_epochs": 1,
-            }
-        }
+    training, resume_state = PPOJax.build_resumed_training(
+        env="env",
+        agent_conf="agent-conf",
+        checkpoint_path="/tmp/ckpt",
+        val_env="val-env",
+        apply_resume_resets=False,
+        preserve_checkpoint_target=True,
+        runtime_state_target={"step": 0},
     )
-    agent_conf = SimpleNamespace(
-        config=exp_cfg,
-        network=lambda *args, **kwargs: None,
-        tx=object(),
-    )
-    env = SimpleNamespace(mjx_backend="jax")
-
-    base_global_timestep = 6_656_000_000
-    base_completed_updates = 16_250
-    host_cb, _mgr = hooks.create_jax_checkpoint_host_callback(
-        DummyAlgo,
-        agent_conf,
-        exp_cfg,
-        env,
-        base_global_timestep=base_global_timestep,
-        base_completed_updates=base_completed_updates,
-    )
-    assert _mgr is fake_manager
-
-    params = {"p": jnp.array([1.0], dtype=jnp.float32)}
-    run_stats = {}
-    opt_state = {}
-    rng_key = jnp.array([7, 9], dtype=jnp.uint32)
-
-    @jax.jit
-    def _call_host(step, updates_done, lr):
-        return jax.experimental.io_callback(
-            host_cb,
-            jnp.int32(0),
-            params,
-            run_stats,
-            opt_state,
-            step,
-            updates_done,
-            rng_key,
-            lr,
-        )
-
-    out = _call_host(
-        jnp.int32(12),
-        jnp.int32(base_completed_updates + 5),
-        jnp.float32(1e-4),
-    )
-    jax.block_until_ready(out)
-
-    assert len(fake_manager.saved) == 1
-    save_step, md = fake_manager.saved[0]
-    assert save_step == base_completed_updates + 5
-    assert md.step == 12
-    assert md.update_number == base_completed_updates + 5
-    assert md.global_timestep == base_global_timestep + 5 * 64 * 20
+    assert training == "training"
+    assert resume_state == {"train_state": "train-state", "runtime_state": {"step": 3}}
+    kwargs = captured["kwargs"]
+    assert kwargs["resume_info"] is resume_info
+    assert kwargs["val_env"] == "val-env"
+    assert kwargs["apply_resume_resets"] is False
+    assert kwargs["preserve_checkpoint_target"] is True

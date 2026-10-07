@@ -1,0 +1,42 @@
+defaults:
+  - conf_fullbody_flashsac
+  - _self_
+
+hydra:
+  job:
+    env_set:
+      XLA_PYTHON_CLIENT_PREALLOCATE: "true"
+      XLA_PYTHON_CLIENT_MEM_FRACTION: "0.7"
+
+wandb:
+  name: "fullbody-gmr-flashsac-4gpu"
+  tags: ["fullbody", "gmr", "flashsac", "4gpu"]
+
+experiment:
+  # 500,000 interactions * 2,048 environments.
+  total_timesteps: 1024000000
+
+  env_params:
+    num_envs: 2048  # 512 environments/GPU * 4 GPUs
+
+  distributed:
+    num_devices: 4
+  trajectory:
+    sharding: static
+
+  # Keep lifecycle cadence close to the single-GPU configuration in global
+  # environment steps (2048 interactions * 2048 envs).
+  checkpoint_interval: 2048
+  online_logging_interval: 3
+
+  # These are global totals; the training builder divides them evenly across
+  # the four data shards. They preserve the existing four-device memory profile
+  # while inheriting the fullbody actor and update defaults.
+  flashsac_config:
+    # 4,194,304 total transitions => 1,048,576 transitions/GPU.
+    buffer_capacity: 4194304
+    # 524,288 total transitions => 131,072 transitions/GPU.
+    min_buffer_size: 524288
+    # 8,192 total samples => 2,048 samples/GPU.
+    sample_batch_size: 8192
+    update_chunk_size: 1

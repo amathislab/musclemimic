@@ -82,48 +82,41 @@ class Mjx(Mujoco):
         backend_impl = self._get_mjx_backend()
         self._backend_impl = backend_impl
 
-        self.sys = mjx.put_model(self._model, impl=backend_impl)
+        # Keep the JAX backend as a normal mjx.Model so model randomizers and
+        # test hooks can use ``arr.at[...]`` updates. For Warp, keep the model
+        # host-resident; this avoids pinning the FFI buffers to device 0 before
+        # a device shard first touches them.
+        sys = mjx.put_model(self._model, impl=backend_impl)
+        self.sys = jax.device_get(sys) if backend_impl == "warp" else sys
 
-        # Handle data creation based on backend
         if backend_impl == "warp":
-            # MJX-Warp cannot build Data from an MjData via mjx.put_data, so resets
-            # must start from a fresh mjx.make_data allocation.
-            # new mjx update: nconmax=per-env, naconmax=total across all envs
-            # Use the calculated values from the environment if available, otherwise model defaults
-            nconmax_val = getattr(self, "nconmax", self._model.nconmax)
-            njmax_val = getattr(self, "njmax", self._model.njmax)
-            # naconmax: total contacts across all envs (required for MuJoCo 3.3.7+)
-            naconmax_val = getattr(self, "naconmax", nconmax_val)
-            # Store budgets for use in reset
-            self._nconmax = int(nconmax_val)
+            # spec.nconmax is already baked into the model. Warp Data allocation
+            # only needs the total contact budget and the per-world constraint
+            # budget.
+            naconmax_val = getattr(self, "naconmax", None)
+            if naconmax_val is None:
+                naconmax_val = getattr(self, "nconmax", None)
+            njmax_val = getattr(self, "njmax", None)
+            if njmax_val is None:
+                njmax_val = self._model.njmax
+
             self._njmax = int(njmax_val)
-            self._naconmax = int(naconmax_val)
-            # Avoid debug prints inside initialization to keep tracing pure
-            data = mjx.make_data(self._model, impl=backend_impl, nconmax=nconmax_val, njmax=njmax_val, naconmax=naconmax_val)
+            self._naconmax = None if naconmax_val is None else int(naconmax_val)
 
-            data = data.replace(
-                qpos=jnp.array(self._data.qpos),
-                qvel=jnp.array(self._data.qvel),
-                ctrl=jnp.array(self._data.ctrl),
-                act=jnp.array(self._data.act),
-                xpos=jnp.array(self._data.xpos),
-                xquat=jnp.array(self._data.xquat),
-                site_xpos=jnp.array(self._data.site_xpos),
-                cvel=jnp.array(self._data.cvel),
-                xipos=jnp.array(self._data.xipos),
-                subtree_com=jnp.array(self._data.subtree_com),
-                xmat=jnp.array(self._data.xmat).reshape(-1, 3, 3) if hasattr(self._data, "xmat") else data.xmat,
-                ximat=jnp.array(self._data.ximat).reshape(-1, 3, 3) if hasattr(self._data, "ximat") else data.ximat,
-                site_xmat=jnp.array(self._data.site_xmat).reshape(-1, 3, 3)
-                if hasattr(self._data, "site_xmat")
-                else data.site_xmat,
+        # Fresh Data is created on each reset so vmapped instances never share a
+        # mutable template object.
+
+    def _make_device_data(self) -> Data:
+        """Create fresh MJX Data from the reset+forward CPU template."""
+        if self._backend_impl == "warp":
+            return mjx.put_data(
+                self._model,
+                self._data,
+                impl="warp",
+                naconmax=self._naconmax,
+                njmax=self._njmax,
             )
-        else:
-            data = mjx.put_data(self._model, self._data, impl=backend_impl)
-
-        # NOTE: No longer storing _first_data - it will be created fresh in each reset
-        # This avoids sharing Data objects across vmapped instances (causes BatchTracer leaks)
-        self._backend_impl = backend_impl
+        return mjx.put_data(self._model, self._data, impl=self._backend_impl)
 
     def _get_mjx_backend(self):
         """
@@ -159,6 +152,7 @@ class Mjx(Mujoco):
         self,
         key: jax.random.PRNGKey,
         selected_traj_idx: jax.Array | None = None,
+        selected_subtraj_step: jax.Array | None = None,
     ) -> MjxState:
         """
         Resets the environment.
@@ -173,19 +167,9 @@ class Mjx(Mujoco):
 
         key, subkey = jax.random.split(key)
 
-        # Create fresh Data for this reset
-        # NOTE: This is called OUTSIDE vmap (by VecEnv), so mjx.make_data is safe for all backends
-        if self._backend_impl == "warp":
-            data = mjx.make_data(self._model, impl=self._backend_impl, nconmax=self._nconmax, njmax=self._njmax, naconmax=self._naconmax)
-            # Initialize with current model state
-            data = data.replace(
-                qpos=jnp.array(self._data.qpos),
-                qvel=jnp.array(self._data.qvel),
-                ctrl=jnp.array(self._data.ctrl),
-                act=jnp.array(self._data.act),
-            )
-        else:
-            data = mjx.put_data(self._model, self._data, impl=self._backend_impl)
+        # This reset is vmapped by VecEnv. Data creation is safe under transforms
+        # because it depends only on the static CPU template, not on traced keys.
+        data = self._make_device_data()
 
         # Forward kinematics for initial carry initialization
         data = mjx.forward(self.sys, data)
@@ -194,6 +178,10 @@ class Mjx(Mujoco):
         if selected_traj_idx is not None and hasattr(carry, "selected_traj_idx"):
             carry = carry.replace(
                 selected_traj_idx=jnp.asarray(selected_traj_idx, dtype=jnp.int32),
+            )
+        if selected_subtraj_step is not None and hasattr(carry, "selected_subtraj_step"):
+            carry = carry.replace(
+                selected_subtraj_step=jnp.asarray(selected_subtraj_step, dtype=jnp.int32),
             )
 
         # Sample/reset all episode-specific state (may update qpos/qvel and randomizer/terrain states)
@@ -229,8 +217,7 @@ class Mjx(Mujoco):
         """Reset environment in-step (for auto-reset when done).
 
         Unlike mjx_reset(), this preserves the pytree structure by modifying
-        the existing state object rather than creating a new one. This helper
-        is only available on MJX backends that support ``mjx.put_data``.
+        the existing state object rather than creating a new one.
 
         Args:
             state: Current state to reset
@@ -238,17 +225,11 @@ class Mjx(Mujoco):
         Returns:
             Reset state with same pytree structure as input
         """
-        if self._backend_impl == "warp":
-            raise NotImplementedError(
-                "_mjx_reset_in_step is not available for MJX-Warp because mjx.put_data(..., impl='warp') "
-                "is not implemented. Use the AutoResetWrapper or native mjwarp reset APIs instead."
-            )
-
         carry = state.additional_carry
 
         # Rebuild a fresh MJX Data from the CPU template and then reapply environment-specific reset logic.
         # NOTE: We use self._data as template - it's read-only, not shared mutable state
-        data = mjx.put_data(self._model, self._data, impl=self._backend_impl)
+        data = self._make_device_data()
         data, carry = self._mjx_reset_carry(self.sys, data, carry)
 
         # Reset carry (no special filtering needed - state.info has same structure)
@@ -287,6 +268,8 @@ class Mjx(Mujoco):
         data = state.data
         cur_info = state.info
         carry = state.additional_carry
+        action_is_finite = jnp.all(jnp.isfinite(action))
+        action = jnp.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
         carry = carry.replace(last_action=action)
 
         # reset dones
@@ -340,14 +323,23 @@ class Mjx(Mujoco):
         reward, carry, reward_info = self._mjx_reward(
             state.observation, action, cur_obs, absorbing, cur_info, self._model, data, carry
         )
+        carry, reward_done = self._reward_termination_handler.update(reward, carry, jnp)
         # merge reward components into info for logging
         cur_info.update(reward_info)
 
-        # check if done
-        done = self._mjx_is_done(cur_obs, absorbing, cur_info, data, carry)
+        observation_is_finite = jnp.all(jnp.isfinite(state.observation)) & jnp.all(jnp.isfinite(cur_obs))
+        reward_is_finite = jnp.all(jnp.isfinite(reward))
+        done_numerical = jnp.logical_not(action_is_finite & observation_is_finite & reward_is_finite)
+        cur_info["done_numerical"] = done_numerical
+        absorbing = jnp.logical_or(absorbing, done_numerical)
+        cur_obs = jnp.nan_to_num(cur_obs, nan=0.0, posinf=0.0, neginf=0.0)
+        reward = jnp.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
 
-        done = jnp.logical_or(done, jnp.any(jnp.isnan(cur_obs)))
-        cur_obs = jnp.nan_to_num(cur_obs, nan=0.0)
+        # check if done
+        cur_info["done_horizon"] = jnp.greater_equal(carry.cur_step_in_episode, self.info.horizon)
+        cur_info["done_reward"] = reward_done
+        done = self._mjx_is_done(cur_obs, absorbing, cur_info, data, carry)
+        done = jnp.logical_or(done, reward_done)
 
         # create state
         carry = carry.replace(cur_step_in_episode=carry.cur_step_in_episode + 1)
@@ -397,7 +389,11 @@ class Mjx(Mujoco):
             Dict: The updated info dictionary.
 
         """
-        return {}
+        return {
+            "done_horizon": jnp.array(False, dtype=bool),
+            "done_reward": jnp.array(False, dtype=bool),
+            "done_numerical": jnp.array(False, dtype=bool),
+        }
 
     def _mjx_update_info_dictionary(self, info: dict, obs: jnp.ndarray, data: Data, carry: MjxAdditionalCarry) -> dict:
         """
@@ -581,6 +577,7 @@ class Mjx(Mujoco):
         data, carry = self._init_state_handler.reset(self, model, data, carry, jnp)
         data, carry = self._domain_randomizer.reset(self, model, data, carry, jnp)
         data, carry = self._reward_function.reset(self, model, data, carry, jnp)
+        data, carry = self._reward_termination_handler.reset(self, model, data, carry, jnp)
         return data, carry
 
     def _mjx_step_finalize(

@@ -15,6 +15,8 @@ from musclemimic.utils.logging import setup_logger
 
 logger = setup_logger(__name__, identifier="[FullBodyTerminal]")
 
+SITE_DEVIATION_REDUCTIONS = ("max", "mean")
+
 
 class EnhancedFullBodyTerminalStateHandler(HeightBasedTerminalStateHandler):
     """
@@ -270,20 +272,32 @@ class MeanSiteDeviationTerminalStateHandler(TerminalStateHandler):
         mean_site_deviation_threshold: float = 0.3,
         enable_site_check: bool = True,
         exclude_sites: list[str] | None = None,
+        reduction: str = "mean",
+        minimum_episode_steps: int = 0,
         **handler_config: dict[str, Any],
     ):
         """
         Args:
             env: The environment instance
-            mean_site_deviation_threshold: Max mean deviation across all mimic sites (meters)
+            mean_site_deviation_threshold: Maximum reduced site deviation [m].
             enable_site_check: Whether to check site deviations
-            exclude_sites: Optional list of mimic site names to exclude from mean calculation
+            exclude_sites: Optional mimic sites excluded before reduction.
+            reduction: Site-error reduction, either ``"mean"`` or ``"max"``.
+            minimum_episode_steps: Number of episode steps that must be reached
+                before a site error can terminate the episode [step].
             **handler_config: Additional configuration passed to parent
         """
         super().__init__(env, **handler_config)
 
+        if reduction not in SITE_DEVIATION_REDUCTIONS:
+            raise ValueError(f"reduction must be one of {SITE_DEVIATION_REDUCTIONS}, got {reduction!r}")
+        if minimum_episode_steps < 0 or minimum_episode_steps != int(minimum_episode_steps):
+            raise ValueError("minimum_episode_steps must be a nonnegative integer")
+
         self.mean_site_deviation_threshold = mean_site_deviation_threshold
         self.enable_site_check = enable_site_check
+        self.reduction = reduction
+        self.minimum_episode_steps = int(minimum_episode_steps)
         self._include_indices = np.array([], dtype=int)
         self._has_exclusions = False
         self._n_included: int | None = None
@@ -324,7 +338,9 @@ class MeanSiteDeviationTerminalStateHandler(TerminalStateHandler):
                 logger.warning("failed to resolve root qpos indices for '%s': %s", root_joint_name, exc)
 
         logger.debug("MeanSiteDeviationTerminalStateHandler initialized")
-        logger.debug("  Mean site deviation threshold (default): %sm", self.mean_site_deviation_threshold)
+        logger.debug("  Site deviation threshold (default): %sm", self.mean_site_deviation_threshold)
+        logger.debug("  Site deviation reduction: %s", self.reduction)
+        logger.debug("  Minimum episode steps: %s", self.minimum_episode_steps)
         logger.debug("  Uses: Absolute world positions (no height termination)")
 
     def reset(
@@ -334,7 +350,7 @@ class MeanSiteDeviationTerminalStateHandler(TerminalStateHandler):
         return data, carry
 
     def _check_mean_site_deviation(self, env: Any, state: Any, carry: Any, backend: ModuleType) -> bool | jnp.ndarray:
-        """Check if mean absolute position deviation exceeds threshold."""
+        """Check the reduced absolute site error after the reset grace period."""
         if not self.enable_site_check:
             return backend.array(False)
 
@@ -376,10 +392,18 @@ class MeanSiteDeviationTerminalStateHandler(TerminalStateHandler):
                 return backend.array(False)
             site_deviations = backend.take(site_deviations, self._include_indices, axis=0)
 
-        mean_deviation = backend.mean(site_deviations)
+        if self.reduction == "max":
+            reduced_deviation = backend.max(site_deviations)
+        else:
+            reduced_deviation = backend.mean(site_deviations)
 
         threshold = carry.termination_threshold
-        return backend.greater(mean_deviation, threshold)
+        site_violation = backend.greater(reduced_deviation, threshold)
+        if self.minimum_episode_steps == 0:
+            return site_violation
+
+        eligible = backend.greater_equal(carry.cur_step_in_episode, self.minimum_episode_steps)
+        return backend.logical_and(eligible, site_violation)
 
     def is_absorbing(self, env: Any, obs: np.ndarray, info: dict[str, Any], data: MjData, carry: Any) -> bool | Any:
         """Check if the current state is terminal (CPU Mujoco version)."""
@@ -398,8 +422,9 @@ class MeanSiteDeviationTerminalStateHandler(TerminalStateHandler):
         carry: Any,
         backend: ModuleType,
     ) -> bool | Any:
-        """Check termination based on mean absolute site deviation."""
+        """Check termination based on reduced absolute site deviation."""
         site_violation = self._check_mean_site_deviation(env, data, carry, backend)
+        info["termination_site_position"] = backend.asarray(site_violation, dtype=bool)
 
         return site_violation, carry
 
@@ -596,14 +621,11 @@ class MeanRelativeSiteDeviationWithRootTerminalStateHandler(TerminalStateHandler
 
         # Pre-compute root-site lookup data for the trajectory caches.
         self.root_site_id = None
-        self.root_traj_index = None
         self._root_qpos_ids_xy = None
         self._root_qpos_ids_quat = None
 
         if self.enable_site_check and hasattr(env, "_goal") and hasattr(env._goal, "_site_mapper"):
             self.root_site_id = env.model.site(self.root_site).id
-            if env._goal._site_mapper.requires_mapping:
-                self.root_traj_index = env._goal._site_mapper.model_ids_to_traj_indices([self.root_site_id])[0]
 
         info_props = env._get_all_info_properties() if hasattr(env, "_get_all_info_properties") else {}
         root_joint_name = info_props.get("root_free_joint_xml_name") or getattr(env, "root_free_joint_xml_name", None)
@@ -708,8 +730,9 @@ class MeanRelativeSiteDeviationWithRootTerminalStateHandler(TerminalStateHandler
         current_root_pos = state.site_xpos[self.root_site_id]
 
         # Reference root position, mapped into the trajectory cache layout if needed.
-        if self.root_traj_index is not None:
-            ref_root_pos = ref_data.site_xpos[self.root_traj_index]
+        if env._goal._site_mapper.requires_mapping:
+            root_traj_index = env._goal._site_mapper.model_ids_to_traj_indices([self.root_site_id])[0]
+            ref_root_pos = ref_data.site_xpos[root_traj_index]
         else:
             ref_root_pos = ref_data.site_xpos[self.root_site_id]
 

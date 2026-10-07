@@ -1,0 +1,16 @@
+# Shared four-GPU parent for full-body GMR ResNet PPO experiments.
+defaults:
+  - conf_fullbody_gmr_resnet
+  - _self_
+
+hydra:
+  job:
+    env_set:
+      XLA_PYTHON_CLIENT_PREALLOCATE: "true"
+      XLA_PYTHON_CLIENT_MEM_FRACTION: "0.5"
+
+experiment:
+  distributed:
+    num_devices: 4
+  trajectory:
+    sharding: static

@@ -1,5 +1,6 @@
 import dataclasses
 import random
+from pathlib import Path
 
 import numpy as np
 from omegaconf import DictConfig, ListConfig
@@ -10,11 +11,21 @@ from loco_mujoco.datasets.humanoids.LAFAN1 import (
     LAFAN1_LOCOMOTION_DATASETS,
     load_lafan1_trajectory,
 )
+from loco_mujoco.smpl.motion_spec import AMASSMotionSpec, as_amass_motion_spec
 from loco_mujoco.smpl.retargeting import (
+    get_converted_amass_dataset_path,
+    get_gmr_cache_identity,
+    get_gmr_motion_cache_path,
+    gmr_quality_rejection_path,
     load_retargeted_amass_trajectory_set,
     retarget_smpl_to_bimanual_via_intermediate_set,
 )
-from loco_mujoco.trajectory import LoadedTrajectorySet, Trajectory, TrajectoryCacheType
+from loco_mujoco.trajectory import LoadedTrajectorySet, Trajectory, TrajectoryCacheType, materialize_trajectory
+from loco_mujoco.trajectory.materialized_cache import (
+    MATERIALIZED_MOTION_NAMES_METADATA_KEY,
+    load_or_build_materialized_trajectory,
+    materialized_trajectory_fingerprint,
+)
 
 from .base import TaskFactory
 from .dataset_confs import (
@@ -24,6 +35,8 @@ from .dataset_confs import (
     LAFAN1DatasetConf,
     expand_amass_dataset_group_spec,
     get_amass_dataset_groups,
+    get_amass_motion_spec_groups,
+    resolve_training_gmr_cache_namespace,
 )
 
 
@@ -118,17 +131,27 @@ class ImitationFactory(TaskFactory):
 
         # Load the AMASS trajectory if available
         if amass_dataset_conf is not None:
-            if isinstance(amass_dataset_conf, (dict, DictConfig)):
+            if isinstance(amass_dataset_conf, dict | DictConfig):
                 # Filter out unsupported keys
                 valid_keys = {f.name for f in dataclasses.fields(AMASSDatasetConf)}
                 filtered_conf = {k: v for k, v in amass_dataset_conf.items() if k in valid_keys}
                 amass_dataset_conf = AMASSDatasetConf(**filtered_conf)
-            # Pass along visualization flag for optional logging
-            loaded_sets.append(cls.get_amass_trajectory_set(env, amass_dataset_conf, visualize_goal=visualize_goal))
+            has_other_dataset = any(
+                conf is not None for conf in (c3d_dataset_conf, lafan1_dataset_conf, custom_dataset_conf)
+            )
+            if amass_dataset_conf.write_materialized_cache:
+                if has_other_dataset:
+                    raise ValueError("AMASS materialized cache cannot be combined with other trajectory datasets.")
+                cls._load_materialized_amass_trajectory(env, amass_dataset_conf, visualize_goal)
+                return env
+            if not has_other_dataset:
+                cls._load_runtime_amass_trajectory(env, amass_dataset_conf, visualize_goal)
+                return env
+            loaded_sets.append(cls.get_amass_trajectory_set(env, amass_dataset_conf, visualize_goal))
 
         # Load converted C3D trajectories if available
         if c3d_dataset_conf is not None:
-            if isinstance(c3d_dataset_conf, (dict, DictConfig)):
+            if isinstance(c3d_dataset_conf, dict | DictConfig):
                 valid_keys = {f.name for f in dataclasses.fields(C3DDatasetConf)}
                 filtered_conf = {k: v for k, v in c3d_dataset_conf.items() if k in valid_keys}
                 c3d_dataset_conf = C3DDatasetConf(**filtered_conf)
@@ -136,13 +159,13 @@ class ImitationFactory(TaskFactory):
 
         # Load the LAFAN1 trajectory if available
         if lafan1_dataset_conf is not None:
-            if isinstance(lafan1_dataset_conf, (dict, DictConfig)):
+            if isinstance(lafan1_dataset_conf, dict | DictConfig):
                 lafan1_dataset_conf = LAFAN1DatasetConf(**lafan1_dataset_conf)
             loaded_sets.append(cls.get_lafan1_trajectory_set(env, lafan1_dataset_conf))
 
         # Load the custom trajectory if available
         if custom_dataset_conf is not None:
-            if isinstance(custom_dataset_conf, (dict, DictConfig)):
+            if isinstance(custom_dataset_conf, dict | DictConfig):
                 custom_dataset_conf = CustomDatasetConf(**custom_dataset_conf)
             loaded_sets.append(cls.get_custom_trajectory_set(env, custom_dataset_conf))
 
@@ -169,11 +192,7 @@ class ImitationFactory(TaskFactory):
 
     @staticmethod
     def _get_trajectory_cache_type(*dataset_confs) -> TrajectoryCacheType:
-        cache_types = [
-            TrajectoryCacheType(conf.trajectory_cache_type)
-            for conf in dataset_confs
-            if conf is not None
-        ]
+        cache_types = [TrajectoryCacheType(conf.trajectory_cache_type) for conf in dataset_confs if conf is not None]
         if not cache_types:
             return TrajectoryCacheType.FULL
         if len(set(cache_types)) != 1:
@@ -194,10 +213,20 @@ class ImitationFactory(TaskFactory):
     ) -> LoadedTrajectorySet:
         """Load AMASS trajectories with their source names."""
         # Accept both dataclass instances and raw dict/DictConfig inputs
-        if isinstance(amass_dataset_conf, (dict, DictConfig)):
+        if isinstance(amass_dataset_conf, dict | DictConfig):
             amass_dataset_conf = AMASSDatasetConf(**amass_dataset_conf)
 
-        # Determine dataset paths
+        motion_specs = cls.select_amass_motion_specs(amass_dataset_conf)
+        return cls._load_amass_dataset_paths(env, amass_dataset_conf, motion_specs, visualize_goal)
+
+    @staticmethod
+    def resolve_amass_dataset_paths(
+        amass_dataset_conf: AMASSDatasetConf | dict | DictConfig,
+    ) -> list[str]:
+        """Expand an AMASS configuration to its canonical motion set."""
+        if isinstance(amass_dataset_conf, dict | DictConfig):
+            amass_dataset_conf = AMASSDatasetConf(**amass_dataset_conf)
+
         dataset_paths = []
         if amass_dataset_conf.dataset_group is not None:
             groups = get_amass_dataset_groups()
@@ -206,23 +235,89 @@ class ImitationFactory(TaskFactory):
                     raise ValueError(f"Unknown dataset group: {group_name}")
                 dataset_paths.extend(groups[group_name])
         if amass_dataset_conf.rel_dataset_path is not None:
-            dataset_paths.extend(
+            configured_paths = (
                 amass_dataset_conf.rel_dataset_path
-                if isinstance(amass_dataset_conf.rel_dataset_path, (ListConfig, list))
+                if isinstance(amass_dataset_conf.rel_dataset_path, ListConfig | list | tuple)
                 else [amass_dataset_conf.rel_dataset_path]
             )
-        dataset_paths = list(dict.fromkeys(dataset_paths))
+            dataset_paths.extend(as_amass_motion_spec(path).path for path in configured_paths)
+        return sorted(set(dataset_paths))
 
-        # Optionally cap the number of motions to load when datasets are very large.
-        if amass_dataset_conf.max_motions is not None and isinstance(dataset_paths, list):
-            if len(dataset_paths) > amass_dataset_conf.max_motions:
-                before = len(dataset_paths)
-                dataset_paths = random.sample(dataset_paths, amass_dataset_conf.max_motions)
-                print(
-                    f"[AMASS] INFO: Sampled {amass_dataset_conf.max_motions} trajectories out of {before} "
-                    f"(max_motions={amass_dataset_conf.max_motions})."
+    @staticmethod
+    def resolve_amass_motion_specs(
+        amass_dataset_conf: AMASSDatasetConf | dict | DictConfig,
+    ) -> list[AMASSMotionSpec]:
+        """Expand an AMASS configuration while retaining source-time bounds."""
+        if isinstance(amass_dataset_conf, dict | DictConfig):
+            amass_dataset_conf = AMASSDatasetConf(**amass_dataset_conf)
+
+        motion_specs = []
+        if amass_dataset_conf.dataset_group is not None:
+            groups = get_amass_motion_spec_groups()
+            for group_name in expand_amass_dataset_group_spec(amass_dataset_conf.dataset_group):
+                if group_name not in groups:
+                    raise ValueError(f"Unknown dataset group: {group_name}")
+                motion_specs.extend(groups[group_name])
+        if amass_dataset_conf.rel_dataset_path is not None:
+            configured_paths = (
+                amass_dataset_conf.rel_dataset_path
+                if isinstance(amass_dataset_conf.rel_dataset_path, ListConfig | list | tuple)
+                else [amass_dataset_conf.rel_dataset_path]
+            )
+            motion_specs.extend(as_amass_motion_spec(path) for path in configured_paths)
+
+        specs_by_path = {}
+        for spec in motion_specs:
+            previous = specs_by_path.setdefault(spec.path, spec)
+            if previous != spec:
+                raise ValueError(
+                    f"AMASS motion {spec.path!r} has conflicting time bounds: "
+                    f"{previous.cache_key!r} and {spec.cache_key!r}."
                 )
+        return [specs_by_path[path] for path in sorted(specs_by_path)]
 
+    @classmethod
+    def select_amass_dataset_paths(
+        cls,
+        amass_dataset_conf: AMASSDatasetConf | dict | DictConfig,
+    ) -> list[str]:
+        """Return the reproducible motion subset selected by an AMASS configuration."""
+        if isinstance(amass_dataset_conf, dict | DictConfig):
+            amass_dataset_conf = AMASSDatasetConf(**amass_dataset_conf)
+
+        dataset_paths = cls.resolve_amass_dataset_paths(amass_dataset_conf)
+        if amass_dataset_conf.max_motions is not None and len(dataset_paths) > amass_dataset_conf.max_motions:
+            before = len(dataset_paths)
+            rng = random.Random(amass_dataset_conf.max_motions_seed)
+            dataset_paths = sorted(rng.sample(dataset_paths, amass_dataset_conf.max_motions))
+            print(
+                f"[AMASS] INFO: Sampled {amass_dataset_conf.max_motions} trajectories out of {before} "
+                f"(max_motions={amass_dataset_conf.max_motions}, "
+                f"seed={amass_dataset_conf.max_motions_seed})."
+            )
+        return dataset_paths
+
+    @classmethod
+    def select_amass_motion_specs(
+        cls,
+        amass_dataset_conf: AMASSDatasetConf | dict | DictConfig,
+    ) -> list[AMASSMotionSpec]:
+        """Return the selected motion specifications, including time bounds."""
+        if isinstance(amass_dataset_conf, dict | DictConfig):
+            amass_dataset_conf = AMASSDatasetConf(**amass_dataset_conf)
+
+        specs_by_path = {spec.path: spec for spec in cls.resolve_amass_motion_specs(amass_dataset_conf)}
+        selected_paths = cls.select_amass_dataset_paths(amass_dataset_conf)
+        return [specs_by_path[path] for path in selected_paths]
+
+    @staticmethod
+    def _load_amass_dataset_paths(
+        env,
+        amass_dataset_conf: AMASSDatasetConf,
+        dataset_paths: list[AMASSMotionSpec],
+        visualize_goal: bool,
+    ) -> LoadedTrajectorySet:
+        """Load already-resolved AMASS motion names."""
         env_name = env.__class__.__name__
         if visualize_goal:
             print(f"[Visualization] Building trajectories for env={env_name} with {len(dataset_paths)} paths.")
@@ -231,6 +326,10 @@ class ImitationFactory(TaskFactory):
         # Extract retargeting configs
         retargeting_method = amass_dataset_conf.retargeting_method
         gmr_config = amass_dataset_conf.gmr_config
+        gmr_cache_namespace = resolve_training_gmr_cache_namespace(
+            retargeting_method,
+            amass_dataset_conf.gmr_cache_namespace,
+        )
         clear_cache = amass_dataset_conf.clear_cache
 
         if "MyoBimanualArm" in env_name:
@@ -251,10 +350,139 @@ class ImitationFactory(TaskFactory):
                 dataset_paths,
                 retargeting_method=retargeting_method,
                 gmr_config=gmr_config,
+                gmr_cache_namespace=gmr_cache_namespace,
                 clear_cache=clear_cache,
             )
 
         return loaded
+
+    @classmethod
+    def _load_materialized_amass_trajectory(
+        cls,
+        env,
+        amass_dataset_conf: AMASSDatasetConf,
+        visualize_goal: bool,
+    ) -> None:
+        """Load or create the persistent runtime cache for one AMASS motion set."""
+        motion_specs = cls.select_amass_motion_specs(amass_dataset_conf)
+        motion_names = [spec.path for spec in motion_specs]
+        cache_type = TrajectoryCacheType(amass_dataset_conf.trajectory_cache_type)
+        site_names = list(env.sites_for_mimic) if cache_type == TrajectoryCacheType.SPARSE else None
+        retargeting_method = amass_dataset_conf.retargeting_method or "default"
+        gmr_cache_namespace = resolve_training_gmr_cache_namespace(
+            retargeting_method,
+            amass_dataset_conf.gmr_cache_namespace,
+        )
+        gmr_config = amass_dataset_conf.gmr_config
+        if retargeting_method == "gmr":
+            gmr_cache_identity, _cache_variant = get_gmr_cache_identity(gmr_config)
+            retargeting_identity = f"gmr:{gmr_cache_namespace}:{gmr_cache_identity}"
+        else:
+            retargeting_identity = retargeting_method
+        control_dt = env.dt
+        fingerprint = materialized_trajectory_fingerprint(
+            motion_names=[spec.cache_key for spec in motion_specs],
+            model=env._model,
+            control_dt=control_dt,
+            cache_type=cache_type,
+            site_names=site_names,
+            retargeting_method=retargeting_identity,
+            model_spec=getattr(env, "mjspec", None),
+        )
+
+        cache_env_name = env.__class__.__name__.replace("Mjx", "")
+        converted_root = Path(get_converted_amass_dataset_path())
+        cache_path = converted_root / cache_env_name / retargeting_method / "_materialized" / f"{fingerprint}.npz"
+
+        def build() -> Trajectory:
+            print(f"[AMASS] INFO: Building materialized trajectory cache at {cache_path}")
+            source = cls._load_amass_dataset_paths(env, amass_dataset_conf, motion_specs, visualize_goal)
+            if source.motion_names != tuple(motion_names):
+                loaded_names = set(source.motion_names)
+                missing_specs = [spec for spec in motion_specs if spec.path not in loaded_names]
+                unexpected_missing = [
+                    spec.path
+                    for spec in missing_specs
+                    if retargeting_method != "gmr"
+                    or not gmr_quality_rejection_path(
+                        get_gmr_motion_cache_path(
+                            cache_env_name,
+                            spec,
+                            converted_root,
+                            cache_namespace=gmr_cache_namespace,
+                            gmr_config=gmr_config,
+                        )
+                    ).exists()
+                ]
+                if unexpected_missing:
+                    raise RuntimeError(
+                        "Cannot materialize an incomplete AMASS motion set. "
+                        f"Failed motions: {sorted(unexpected_missing)}"
+                    )
+                print(f"[AMASS] INFO: Excluding {len(missing_specs)} persistent GMR quality rejection(s).")
+            trajectory = materialize_trajectory(
+                source.trajectory,
+                model=env._model,
+                control_dt=control_dt,
+                cache_type=cache_type,
+                site_names=site_names,
+            )
+            metadata = dict(trajectory.info.metadata or {})
+            metadata[MATERIALIZED_MOTION_NAMES_METADATA_KEY] = list(source.motion_names)
+            return dataclasses.replace(
+                trajectory,
+                info=dataclasses.replace(trajectory.info, metadata=metadata),
+            )
+
+        rebuild = amass_dataset_conf.rebuild_materialized_cache or amass_dataset_conf.clear_cache
+        cache_hit = cache_path.exists() and not rebuild
+        if cache_hit:
+            print(f"[AMASS] INFO: Loading materialized trajectory cache from {cache_path}")
+
+        trajectory = load_or_build_materialized_trajectory(
+            cache_path=cache_path,
+            fingerprint=fingerprint,
+            build=build,
+            rebuild=rebuild,
+        )
+        if not cache_hit:
+            print(f"[AMASS] INFO: Saved materialized trajectory cache to {cache_path}")
+        cached_motion_names = tuple(
+            (trajectory.info.metadata or {}).get(
+                MATERIALIZED_MOTION_NAMES_METADATA_KEY,
+                motion_names,
+            )
+        )
+        env.load_trajectory(
+            traj=trajectory,
+            motion_names=cached_motion_names,
+            warn=False,
+            cache_type=cache_type,
+            site_names=site_names,
+            materialized=True,
+        )
+
+    @classmethod
+    def _load_runtime_amass_trajectory(
+        cls,
+        env,
+        amass_dataset_conf: AMASSDatasetConf,
+        visualize_goal: bool,
+    ) -> None:
+        """Load AMASS motions without writing a persistent materialized cache."""
+        cache_type = TrajectoryCacheType(amass_dataset_conf.trajectory_cache_type)
+        sites_for_mimic = getattr(env, "sites_for_mimic", None)
+        site_names = (
+            list(sites_for_mimic) if cache_type == TrajectoryCacheType.SPARSE and sites_for_mimic is not None else None
+        )
+        loaded = cls.get_amass_trajectory_set(env, amass_dataset_conf, visualize_goal)
+        env.load_trajectory(
+            traj=loaded.trajectory,
+            motion_names=loaded.motion_names,
+            warn=False,
+            cache_type=cache_type,
+            site_names=site_names,
+        )
 
     @staticmethod
     def get_c3d_traj(env, c3d_dataset_conf: C3DDatasetConf) -> Trajectory:
@@ -271,7 +499,7 @@ class ImitationFactory(TaskFactory):
 
         dataset_paths = (
             c3d_dataset_conf.rel_dataset_path
-            if isinstance(c3d_dataset_conf.rel_dataset_path, (ListConfig, list))
+            if isinstance(c3d_dataset_conf.rel_dataset_path, ListConfig | list)
             else [c3d_dataset_conf.rel_dataset_path]
         )
         dataset_paths = list(dict.fromkeys(dataset_paths))
@@ -325,7 +553,7 @@ class ImitationFactory(TaskFactory):
         else:
             dataset_paths = (
                 lafan1_dataset_conf.dataset_name
-                if isinstance(lafan1_dataset_conf.dataset_name, (ListConfig, list))
+                if isinstance(lafan1_dataset_conf.dataset_name, ListConfig | list)
                 else [lafan1_dataset_conf.dataset_name]
             )
 

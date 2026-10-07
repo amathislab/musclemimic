@@ -14,7 +14,7 @@ import jax.numpy as jnp
 
 jax.config.update("jax_platform_name", "cpu")
 
-from musclemimic.utils.model import (
+from musclemimic.utils.model import (  # noqa: E402
     count_actor_critic_params,
     count_params,
     count_params_by_path,
@@ -229,6 +229,53 @@ def test_count_params_with_real_actor_critic_network():
     assert counts["critic"] > 0
     assert counts["total"] == counts["actor"] + counts["critic"] + counts["shared"]
     assert counts["total"] == count_params(params)
+
+
+def test_actor_critic_actor_only_does_not_require_critic_params():
+    from flax.core import unfreeze
+
+    from musclemimic.algorithms.common.networks import ActorCritic
+
+    network = ActorCritic(
+        action_dim=4,
+        hidden_layer_dims=(16, 8),
+        critic_hidden_layer_dims=(16, 8),
+    )
+
+    key = jax.random.PRNGKey(0)
+    dummy_obs = jnp.zeros((2, 12))
+    variables = network.init(key, dummy_obs)
+
+    full_pi, _ = network.apply(variables, dummy_obs)
+    actor_only_variables = unfreeze(variables)
+    actor_only_variables["params"].pop("critic")
+    actor_pi = network.apply(actor_only_variables, dummy_obs, actor_only=True)
+
+    np.testing.assert_allclose(np.asarray(actor_pi.mode()), np.asarray(full_pi.mode()))
+
+
+def test_soft_moe_actor_only_does_not_require_critic_params():
+    from flax.core import unfreeze
+
+    from musclemimic.algorithms.common.moe_networks import SoftMoEActorCritic
+
+    network = SoftMoEActorCritic(
+        action_dim=4,
+        hidden_layer_dims=(16, 8),
+        moe_at_layers=(1,),
+        num_experts=2,
+    )
+    dummy_obs = jnp.zeros((2, 12))
+    variables = network.init(jax.random.key(0), dummy_obs)
+    full_pi, _ = network.apply(variables, dummy_obs)
+
+    actor_only_variables = unfreeze(variables)
+    for name in tuple(actor_only_variables["params"]):
+        if name.startswith("critic_"):
+            actor_only_variables["params"].pop(name)
+    actor_pi = network.apply(actor_only_variables, dummy_obs, actor_only=True)
+
+    np.testing.assert_allclose(np.asarray(actor_pi.mode()), np.asarray(full_pi.mode()))
 
 
 def test_count_params_jit_compatible(flat_params):

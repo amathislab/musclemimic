@@ -3,6 +3,8 @@
 # Usage: python fullbody/experiment.py
 # Variants: python fullbody/experiment.py --config-name=<config_name>
 defaults:
+  - observation: tracking
+  - _self_
   - override hydra/job_logging: default
   - override hydra/launcher: basic
 
@@ -34,13 +36,8 @@ experiment:
     enable_touch_sensor_observations: true
 
     init_state_type: TrajInitialStateHandler
-    goal_type: GoalTrajMimic
     goal_params:
-      n_step_lookahead: 5
-      n_step_stride: 20
       upper_body_xml_name: torso
-      enable_motion_phase: true  # Include motion phase [0,1] in goal observation
-      use_concise_lookahead: true  # Use root_pos/vel deltas + site_rpos only (smaller obs)
       sites_for_mimic:
         - pelvis_mimic
         - upper_body_mimic
@@ -63,8 +60,8 @@ experiment:
     control_params: ${control_config.torque_control.control_params}
     reward_type: MimicReward
     reward_params:
-      qpos_w_sum: 0.1
-      qvel_w_sum: 0.1
+      qpos_w_sum: 0.0
+      qvel_w_sum: 0.0
       root_pos_w_sum: 0.1
       root_vel_w_sum: 0.1
       rpos_w_sum: 0.6
@@ -161,6 +158,18 @@ experiment:
     load_balance_loss_weight: 0.01
     gate_init_std: 0.01
 
+  # Multi-device training (SPMD over the data axis)
+  # num_devices: 1 = single-GPU (default), -1 = auto (all visible GPUs),
+  # N = force N. num_envs is global; each device runs
+  # num_envs/num_devices environments.
+  distributed:
+    num_devices: 1
+  # Motion library placement for compiled training.
+  # none = full library on each device; static = one motion slice per device.
+  # Both modes pass motion data as an explicit compiled input.
+  trajectory:
+    sharding: none
+
   # Seeds and checkpointing
   n_seeds: 1
   seeds: null
@@ -169,7 +178,10 @@ experiment:
   max_checkpoints_to_keep: 10
   checkpoints_on_validation: true
   resume_from: null
+  exact_resume: false  # true saves full env_state; large with many envs
   async_checkpointing: false
+  checkpoint_save_concurrent_gb: 4
+  checkpoint_restore_concurrent_gb: 4
   reset_logging_timestep: false
   reset_lr_schedule_on_resume: false  # Reset LR schedule counter (keeps optimizer momentum)
 
@@ -221,16 +233,17 @@ experiment:
     num_steps: 500
     num_envs: 100
     num: 100
-    video_length: 3000
-    video_frequency: 1
+    video_length: 1000
+    video_frequency: 20
+    video_max_motions: 3
     # Motions for validation
     amass_dataset_conf:
       dataset_group: "KIT_KINESIS_TESTING_MOTIONS"
       trajectory_cache_type: "sparse"
-    terminal_state_type: MeanRelativeSiteDeviationTerminalStateHandler
-    terminal_state_params:
-      mean_site_deviation_threshold: 0.5
-      enable_site_check: true
+    terminal_state_type: NoTerminalStateHandler
+    terminal_state_params: {}
+    reward_termination_type: NoRewardTerminationHandler
+    reward_termination_params: {}
     quantities:
       - JointPosition
       - JointVelocity

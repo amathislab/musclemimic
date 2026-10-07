@@ -26,8 +26,16 @@ from loco_mujoco.core.terrain import RoughTerrain
 from loco_mujoco.core.terrain.base import Terrain
 from loco_mujoco.core.utils.env import Box
 from loco_mujoco.trajectory.dataclasses import SingleData
+from musclemimic.algorithms.ppo.rollout import reset_from_trajectory_weights
 from musclemimic.core.mujoco_mjx import Mjx, MjxState
-from musclemimic.core.wrappers.mjx import AutoResetWrapper, LogWrapper, NStepWrapper, NormalizeVecReward, VecEnv
+from musclemimic.core.wrappers.mjx import (
+    AutoResetWrapper,
+    LocoMjxWrapper,
+    LogWrapper,
+    NStepWrapper,
+    NormalizeVecReward,
+    VecEnv,
+)
 from musclemimic.environments.base import LocoEnv
 from musclemimic.environments.humanoids.myofullbody import MjxMyoFullBody, MyoFullBody
 
@@ -529,6 +537,17 @@ class _AutoResetCarry:
 
 
 @struct.dataclass
+class _AutoResetSamplingCarry:
+    autoreset_rng: jax.Array | None
+    key: jax.Array
+    cur_step_in_episode: jax.Array
+    last_action: jax.Array
+    domain_randomizer_state: jax.Array
+    terrain_state: jax.Array
+    sampling_weights: jax.Array | None
+
+
+@struct.dataclass
 class _AutoResetState:
     data: jax.Array
     observation: jax.Array
@@ -574,9 +593,65 @@ class _AutoResetMinimalState:
 
 
 @struct.dataclass
+class _LocoTerminalCarry:
+    final_observation: jax.Array
+    autoreset_rng: jax.Array | None
+
+
+@struct.dataclass
+class _LocoTerminalState:
+    data: jax.Array
+    observation: jax.Array
+    reward: jax.Array
+    absorbing: jax.Array
+    done: jax.Array
+    additional_carry: _LocoTerminalCarry
+    info: dict
+
+
+class _LocoTerminalObservationEnv:
+    """Bare MJX-like env with a deliberately stale final-observation cache."""
+
+    def mjx_reset(self, _rng_key):
+        observation = jnp.zeros((2,), dtype=jnp.float32)
+        return _LocoTerminalState(
+            data=observation,
+            observation=observation,
+            reward=jnp.array(0.0, dtype=jnp.float32),
+            absorbing=jnp.array(False),
+            done=jnp.array(False),
+            additional_carry=_LocoTerminalCarry(
+                final_observation=jnp.zeros_like(observation),
+                autoreset_rng=None,
+            ),
+            info={},
+        )
+
+    def mjx_step(self, state, _action):
+        terminal_observation = jnp.array([7.0, 8.0], dtype=jnp.float32)
+        return state.replace(
+            data=terminal_observation,
+            observation=terminal_observation,
+            reward=jnp.array(1.0, dtype=jnp.float32),
+            absorbing=jnp.array(False),
+            done=jnp.array(True),
+        )
+
+
+@struct.dataclass
 class _AutoResetObsStates:
     hist: jax.Array
     vel: jax.Array
+
+
+@struct.dataclass
+class _AutoResetRewardState:
+    score: jax.Array
+
+
+@struct.dataclass
+class _AutoResetRewardTerminationState:
+    low_reward_steps: jax.Array
 
 
 @struct.dataclass
@@ -592,6 +667,8 @@ class _AutoResetRichCarry:
     key: jax.Array
     cur_step_in_episode: jax.Array
     last_action: jax.Array
+    reward_state: _AutoResetRewardState
+    reward_termination_state: _AutoResetRewardTerminationState
     domain_randomizer_state: jax.Array
     terrain_state: jax.Array
     traj_state: _AutoResetRichTrajState
@@ -656,6 +733,76 @@ class _AutoResetSmokeEnv:
             info={},
         )
         return next_state.observation, next_state.reward, next_state.absorbing, next_state.done, next_state.info, next_state
+
+
+class _AutoResetSamplingTh:
+    def sample_start_indices(self, traj_key, step_key, weights=None, backend=jnp):
+        del traj_key, step_key
+        return backend.argmax(weights).astype(backend.int32), backend.asarray(4, dtype=backend.int32)
+
+
+class _AutoResetSamplingEnv:
+    def __init__(self, *, preload_sampling_weights=True):
+        self.th = _AutoResetSamplingTh()
+        self.preload_sampling_weights = preload_sampling_weights
+
+    def _carry(self, rng_keys):
+        batch = int(rng_keys.shape[0])
+        sampling_weights = None
+        if self.preload_sampling_weights:
+            sampling_weights = jnp.broadcast_to(
+                jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32),
+                (batch, 3),
+            )
+        return _AutoResetSamplingCarry(
+            autoreset_rng=None,
+            key=rng_keys,
+            cur_step_in_episode=jnp.ones((batch,), dtype=jnp.int32),
+            last_action=jnp.zeros((batch, 1), dtype=jnp.float32),
+            domain_randomizer_state=jnp.zeros((batch, 1), dtype=jnp.float32),
+            terrain_state=jnp.zeros((batch, 1), dtype=jnp.float32),
+            sampling_weights=sampling_weights,
+        )
+
+    def reset(self, rng_keys):
+        batch = int(rng_keys.shape[0])
+        obs = jnp.zeros((batch, 2), dtype=jnp.float32)
+        state = _AutoResetState(
+            data=obs,
+            observation=obs,
+            reward=jnp.zeros((batch,), dtype=jnp.float32),
+            absorbing=jnp.zeros((batch,), dtype=bool),
+            done=jnp.zeros((batch,), dtype=bool),
+            additional_carry=self._carry(rng_keys),
+            info={},
+        )
+        return obs, state
+
+    def reset_to_step(self, rng_keys, traj_idx, subtraj_step):
+        obs = jnp.stack([traj_idx, subtraj_step], axis=-1).astype(jnp.float32)
+        state = _AutoResetState(
+            data=obs,
+            observation=obs,
+            reward=jnp.zeros((obs.shape[0],), dtype=jnp.float32),
+            absorbing=jnp.zeros((obs.shape[0],), dtype=bool),
+            done=jnp.zeros((obs.shape[0],), dtype=bool),
+            additional_carry=self._carry(rng_keys),
+            info={},
+        )
+        return obs, state
+
+    def step(self, state, action):
+        del action
+        batch = int(state.observation.shape[0])
+        done = jnp.array([True] + [False] * (batch - 1), dtype=bool)
+        next_state = state.replace(
+            data=state.data + 10.0,
+            observation=state.observation + 10.0,
+            reward=jnp.ones((batch,), dtype=jnp.float32),
+            absorbing=jnp.zeros((batch,), dtype=bool),
+            done=done,
+        )
+        return next_state.observation, next_state.reward, next_state.absorbing, done, next_state.info, next_state
 
 
 class _AutoResetTerrainSwapEnv:
@@ -966,11 +1113,17 @@ class _AutoResetRichEnv:
             scale=encoded + 20.0,
         )
         obs_states = _AutoResetObsStates(hist=encoded + 50.0, vel=encoded + 60.0)
+        reward_state = _AutoResetRewardState(score=encoded + 30.0)
+        reward_termination_state = _AutoResetRewardTerminationState(
+            low_reward_steps=jnp.arange(batch, dtype=jnp.int32),
+        )
         carry = _AutoResetRichCarry(
             autoreset_rng=None,
             key=rng_keys,
             cur_step_in_episode=jnp.ones((batch,), dtype=jnp.int32),
             last_action=encoded + 3.0,
+            reward_state=reward_state,
+            reward_termination_state=reward_termination_state,
             domain_randomizer_state=encoded + 11.0,
             terrain_state=encoded + 13.0,
             traj_state=traj_state,
@@ -1005,6 +1158,12 @@ class _AutoResetRichEnv:
                 key=stepped_key,
                 cur_step_in_episode=state.additional_carry.cur_step_in_episode + 1,
                 last_action=state.additional_carry.last_action + 100.0,
+                reward_state=state.additional_carry.reward_state.replace(
+                    score=state.additional_carry.reward_state.score + 100.0,
+                ),
+                reward_termination_state=state.additional_carry.reward_termination_state.replace(
+                    low_reward_steps=state.additional_carry.reward_termination_state.low_reward_steps + 100,
+                ),
                 domain_randomizer_state=state.additional_carry.domain_randomizer_state + 100.0,
                 terrain_state=state.additional_carry.terrain_state + 100.0,
                 traj_state=state.additional_carry.traj_state.replace(
@@ -1051,6 +1210,9 @@ class _VecEnvBaseEnv:
         return obs, state
 
     def reset_to(self, rng_key, _traj_idx):
+        return self.reset(rng_key)
+
+    def reset_to_step(self, rng_key, _traj_idx, _subtraj_step):
         return self.reset(rng_key)
 
     def step(self, state, action):
@@ -1217,6 +1379,56 @@ def test_autoreset_wrapper_info_has_adaptive_keys_on_reset():
     # Second step is a smoke test for repeated RNG splits and swapping.
     _, _, _, done_after_2, _, _ = env.step(next_state, action=jnp.zeros((batch, 1), dtype=jnp.float32))
     assert np.asarray(done_after_2).shape == (batch,)
+
+
+def test_autoreset_wrapper_weighted_reset_uses_trajectory_handler_sampler():
+    env = AutoResetWrapper(_AutoResetSamplingEnv())
+    rng_keys = jax.random.split(jax.random.PRNGKey(0), 3)
+
+    _, state = env.reset(rng_keys)
+    _, _, _, done, _, next_state = env.step(state, action=jnp.zeros((3, 1), dtype=jnp.float32))
+
+    np.testing.assert_array_equal(np.asarray(done), np.array([True, False, False]))
+    np.testing.assert_array_equal(np.asarray(next_state.data[0]), np.array([2.0, 4.0], dtype=np.float32))
+    np.testing.assert_array_equal(np.asarray(next_state.data[1:]), np.full((2, 2), 10.0, dtype=np.float32))
+
+
+def test_weighted_reset_persists_sampling_weights_across_autoresets():
+    env = AutoResetWrapper(_AutoResetSamplingEnv(preload_sampling_weights=False))
+    rng_keys = jax.random.split(jax.random.PRNGKey(0), 3)
+    weights = jnp.array([0.0, 1.0, 0.0], dtype=jnp.float32)
+    expected_weights = jnp.broadcast_to(weights, (3, 3))
+    expected_environment_keys = jax.vmap(jax.random.split)(rng_keys)[:, 0]
+
+    reset = jax.jit(lambda keys: reset_from_trajectory_weights(env, keys, weights))
+    observation, state = reset(rng_keys)
+    np.testing.assert_array_equal(
+        np.asarray(observation),
+        np.tile(np.array([1.0, 4.0], dtype=np.float32), (3, 1)),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(state.additional_carry.sampling_weights),
+        expected_weights,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(state.additional_carry.key),
+        np.asarray(expected_environment_keys),
+    )
+
+    step = jax.jit(
+        lambda current: env.step(
+            current,
+            action=jnp.zeros((3, 1), dtype=jnp.float32),
+        )
+    )
+    for _ in range(2):
+        _, _, _, done, _, state = step(state)
+        np.testing.assert_array_equal(np.asarray(done), np.array([True, False, False]))
+        np.testing.assert_array_equal(np.asarray(state.data[0]), np.array([1.0, 4.0], dtype=np.float32))
+        np.testing.assert_array_equal(
+            np.asarray(state.additional_carry.sampling_weights),
+            expected_weights,
+        )
 
 
 def test_nstep_wrapper_reset_buffer_structure():
@@ -1636,6 +1848,26 @@ def test_autoreset_wrapper_step_with_transition_keeps_prereset_state():
     np.testing.assert_array_equal(np.asarray(next_state.done), np.zeros((batch,), dtype=bool))
 
 
+def test_loco_autoreset_transition_uses_real_terminal_observation():
+    env = AutoResetWrapper(LogWrapper(VecEnv(LocoMjxWrapper(_LocoTerminalObservationEnv()))))
+    batch = 3
+    rng_keys = jax.random.split(jax.random.PRNGKey(0), batch)
+    _, state = env.reset(rng_keys)
+
+    next_obs, _, absorbing, done, _, next_state, transition_state, transition_obs = env.step_with_transition(
+        state,
+        action=jnp.zeros((batch, 1), dtype=jnp.float32),
+    )
+
+    expected_terminal_obs = jnp.tile(jnp.array([[7.0, 8.0]], dtype=jnp.float32), (batch, 1))
+    np.testing.assert_allclose(transition_obs, expected_terminal_obs, atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(transition_state.observation, expected_terminal_obs, atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(next_obs, np.zeros((batch, 2)), atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(next_state.observation, np.zeros((batch, 2)), atol=0.0, rtol=0.0)
+    np.testing.assert_array_equal(absorbing, np.zeros((batch,), dtype=bool))
+    np.testing.assert_array_equal(done, np.ones((batch,), dtype=bool))
+
+
 def test_normalize_vec_reward_step_with_transition_preserves_inner_prereset_state():
     base_env = _AutoResetTerrainSwapEnv()
     env = NormalizeVecReward(AutoResetWrapper(base_env), gamma=0.99)
@@ -1893,6 +2125,19 @@ def test_autoreset_wrapper_swaps_rich_carry_fields_and_keeps_unbatched_data():
     expected_cur_step = np.where(done_mask, 1, 2)
     np.testing.assert_array_equal(
         np.asarray(next_state.additional_carry.cur_step_in_episode), expected_cur_step.astype(np.int32)
+    )
+
+    _assert_done_swaps(
+        next_state.additional_carry.reward_termination_state.low_reward_steps,
+        jnp.arange(batch, dtype=jnp.int32),
+        jnp.arange(batch, dtype=jnp.int32) + 100,
+        done_mask,
+    )
+    _assert_done_swaps(
+        next_state.additional_carry.reward_state.score,
+        reset_encoded + 30.0,
+        init_encoded + 30.0 + 100.0,
+        done_mask,
     )
 
     done_idx = np.where(done_mask)[0]

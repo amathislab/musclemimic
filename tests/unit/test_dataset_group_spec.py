@@ -4,15 +4,23 @@ import pytest
 from omegaconf import ListConfig
 
 from loco_mujoco.task_factories.dataset_confs import (
+    AMASSDatasetConf,
     expand_amass_dataset_group_spec,
     get_amass_dataset_groups,
 )
 
 
+def test_amass_dataset_conf_normalizes_max_motions_seed():
+    conf = AMASSDatasetConf(rel_dataset_path="motion", max_motions_seed="7")
+
+    assert conf.max_motions_seed == 7
+    assert isinstance(conf.max_motions_seed, int)
+
+
 # --- expand_amass_dataset_group_spec ---
 
-class TestExpandAmassDatasetGroupSpec:
 
+class TestExpandAmassDatasetGroupSpec:
     def test_none_returns_empty(self):
         assert expand_amass_dataset_group_spec(None) == []
 
@@ -71,8 +79,8 @@ class TestExpandAmassDatasetGroupSpec:
 
 # --- get_amass_dataset_groups ---
 
-class TestGetAmassDatasetGroups:
 
+class TestGetAmassDatasetGroups:
     def test_returns_dict(self):
         groups = get_amass_dataset_groups()
         assert isinstance(groups, dict)
@@ -84,6 +92,7 @@ class TestGetAmassDatasetGroups:
             "AMASS_RANDOM_TRAINING_MOTIONS",
             "KIT_KINESIS_TRAINING_MOTIONS",
             "AMASS_BIMANUAL_TRAIN_MOTIONS",
+            "AMASS_BIMANUAL_TEST_MOTIONS",
         ]
         for key in expected_keys:
             assert key in groups, f"Expected group '{key}' not found"

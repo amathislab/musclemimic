@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import ast
 import logging
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -14,13 +13,19 @@ import jax.numpy as jnp
 from omegaconf import ListConfig, open_dict
 
 from musclemimic.algorithms import ActorCritic, JaxRLAlgorithmBase
-from musclemimic.algorithms.common.moe_networks import SoftMoEActorCritic
-from musclemimic.algorithms.ppo.checkpoint import load_checkpoint_for_resume
-from musclemimic.algorithms.ppo.config import PPOAgentConf, PPOAgentState, get_ppo_config
+from musclemimic.algorithms.common.dataclasses import TrainState
 from musclemimic.algorithms.common.env_utils import expand_obs_indices_for_history, wrap_env
-from musclemimic.algorithms.ppo.inference import play_policy, play_policy_mujoco
+from musclemimic.algorithms.common.inference import play_policy, play_policy_mujoco
+from musclemimic.algorithms.common.moe_networks import SoftMoEActorCritic
 from musclemimic.algorithms.common.optimizer import get_optimizer
-from musclemimic.algorithms.ppo.runner import train
+from musclemimic.algorithms.ppo.checkpoint import (
+    agent_state_to_training_input,
+    build_runtime_state_restore_target,
+    create_agent_state_from_orbax,
+    load_checkpoint_for_resume,
+)
+from musclemimic.algorithms.ppo.config import PPOAgentConf, PPOAgentState, get_ppo_config
+from musclemimic.algorithms.ppo.train import build_training
 
 if TYPE_CHECKING:
     from musclemimic.utils.metrics import MetricsHandler
@@ -50,24 +55,33 @@ class PPOJax(JaxRLAlgorithmBase):
         # Merge ppo_config into experiment for backward compatibility
         exp = get_ppo_config(config.experiment)
         adaptive_cfg = exp.get("adaptive_sampling", {})
-        if adaptive_cfg.get("enabled", False) and exp.get("n_trajectories", None) is None:
+        traj_cfg = exp.get("trajectory", {}) or {}
+        _needs_n_traj = (
+            adaptive_cfg.get("enabled", False) or str(traj_cfg.get("sharding", "none") or "none").lower() != "none"
+        )
+        if _needs_n_traj and exp.get("n_trajectories", None) is None:
             base_env = env
             if hasattr(env, "unwrapped"):
-                unwrapped_attr = getattr(env, "unwrapped")
+                unwrapped_attr = env.unwrapped
                 base_env = unwrapped_attr() if callable(unwrapped_attr) else unwrapped_attr
             if hasattr(base_env, "th") and base_env.th is not None:
                 with open_dict(exp):
                     exp.n_trajectories = int(base_env.th.n_trajectories)
             else:
                 raise ValueError(
-                    "adaptive_sampling enabled but env has no trajectory handler to derive n_trajectories"
+                    "adaptive_sampling or motion sharding is enabled but the env "
+                    "has no trajectory handler to derive n_trajectories from"
                 )
 
         # compute derived config values
         with open_dict(exp):
             exp.num_updates = exp.total_timesteps // exp.num_steps // exp.num_envs
             exp.minibatch_size = exp.num_envs * exp.num_steps // exp.num_minibatches
-            exp.validation_interval = exp.num_updates // exp.validation.num
+            requested_validations = int(exp.validation.num)
+            if requested_validations <= 0:
+                raise ValueError("experiment.validation.num must be positive.")
+            # Validation can run at most once per PPO update.
+            exp.validation_interval = max(1, exp.num_updates // requested_validations)
             exp.validation.num = int(exp.num_updates // exp.validation_interval)
 
         # utd override
@@ -195,38 +209,82 @@ class PPOJax(JaxRLAlgorithmBase):
         return get_optimizer(config.experiment)
 
     @classmethod
-    def _train_fn(
+    def build_training(
         cls,
-        rng: jax.Array,
         env: Any,
         agent_conf: PPOAgentConf,
-        agent_state: PPOAgentState | None = None,
-        mh: MetricsHandler | None = None,
-        online_logging_callback: Callable[[dict], None] | None = None,
-        logging_interval: int = 10,
-        resume_info: dict | None = None,
+        *,
+        metrics_handler: MetricsHandler | None = None,
+        resume_info: dict[str, Any] | None = None,
         val_env: Any | None = None,
         apply_resume_resets: bool = True,
-    ) -> dict[str, Any]:
-        """Run PPO training (delegates to runner module)."""
-        return train(
-            rng=rng,
-            env=env,
-            agent_conf=agent_conf,
-            agent_state_cls=cls._agent_state,
-            agent_state=agent_state,
-            mh=mh,
-            online_logging_callback=online_logging_callback,
-            logging_interval=logging_interval,
+        preserve_checkpoint_target: bool = False,
+    ):
+        """Prepare PPO training."""
+        return build_training(
+            env,
+            agent_conf,
+            cls._agent_state,
+            metrics_handler=metrics_handler,
             resume_info=resume_info,
             val_env=val_env,
             apply_resume_resets=apply_resume_resets,
+            preserve_checkpoint_target=preserve_checkpoint_target,
         )
 
     @classmethod
     def _wrap_env(cls, env: Any, config: Any) -> Any:
         """Wrap environment (delegates to env_utils module)."""
         return wrap_env(env, config)
+
+    @classmethod
+    def build_runtime_state_restore_target(
+        cls,
+        rng: jax.Array,
+        env: Any,
+        agent_conf: PPOAgentConf,
+        *,
+        local_num_envs: int | None = None,
+    ) -> Any:
+        """Build the typed exact-resume runtime target for PPO."""
+        return build_runtime_state_restore_target(
+            rng,
+            env,
+            agent_conf,
+            local_num_envs=local_num_envs,
+        )
+
+    @classmethod
+    def build_inference_state(
+        cls,
+        policy_state: dict[str, Any],
+        agent_conf: PPOAgentConf,
+    ) -> PPOAgentState:
+        """Build policy-only PPO state for evaluation processes."""
+        train_state = TrainState(
+            apply_fn=agent_conf.network.apply,
+            tx=agent_conf.tx,
+            params=policy_state["params"],
+            run_stats=policy_state["run_stats"],
+            opt_state=None,
+            step=0,
+        )
+        return PPOAgentState(train_state=train_state)
+
+    @classmethod
+    def restore_agent_state(
+        cls,
+        state_data: dict[str, Any],
+        agent_conf: PPOAgentConf,
+    ) -> PPOAgentState:
+        """Restore a typed PPO state for standalone evaluation."""
+        restored = create_agent_state_from_orbax(state_data)
+        return PPOAgentState(
+            train_state=restored.train_state.replace(
+                apply_fn=agent_conf.network.apply,
+                tx=agent_conf.tx,
+            )
+        )
 
     @classmethod
     def play_policy(
@@ -289,49 +347,35 @@ class PPOJax(JaxRLAlgorithmBase):
         )
 
     @classmethod
-    def build_resume_train_fn(
-        cls,
-        env: Any,
-        agent_conf: PPOAgentConf,
-        mh: MetricsHandler | None = None,
-        online_logging_callback: Callable[[dict], None] | None = None,
-        logging_interval: int = 10,
-    ) -> Callable[[jax.Array, PPOAgentState], dict[str, Any]]:
-        """Return a train fn that resumes from a provided agent_state."""
-        return lambda rng_key, agent_state: cls._train_fn(
-            rng_key,
-            env,
-            agent_conf,
-            agent_state,
-            mh=mh,
-            online_logging_callback=online_logging_callback,
-            logging_interval=logging_interval,
-        )
-
-    @classmethod
-    def build_resume_train_fn_from_path(
+    def build_resumed_training(
         cls,
         env: Any,
         agent_conf: PPOAgentConf,
         checkpoint_path: str,
-        mh: MetricsHandler | None = None,
-        online_logging_callback: Callable[[dict], None] | None = None,
-        logging_interval: int = 10,
+        metrics_handler: MetricsHandler | None = None,
         val_env: Any | None = None,
         apply_resume_resets: bool = True,
-    ) -> Callable[[jax.Array], dict[str, Any]]:
-        """Load checkpoint and return a train fn that only needs RNG."""
-        loaded_state, resume_info = load_checkpoint_for_resume(checkpoint_path, agent_conf)
+        preserve_checkpoint_target: bool = False,
+        runtime_state_target: Any | None = None,
+    ) -> tuple[Any, Any]:
+        """Load a checkpoint and prepare the resumed training run."""
+        if runtime_state_target is None and not apply_resume_resets:
+            raise ValueError("runtime_state_target is required when apply_resume_resets=False")
+        loaded_state, resume_info = load_checkpoint_for_resume(
+            checkpoint_path,
+            agent_conf,
+            runtime_state_target=runtime_state_target,
+            require_runtime_state=not apply_resume_resets,
+        )
+        resume_state = agent_state_to_training_input(loaded_state)
 
-        return lambda rng_key: cls._train_fn(
-            rng_key,
+        training = cls.build_training(
             env,
             agent_conf,
-            loaded_state,
-            mh=mh,
-            online_logging_callback=online_logging_callback,
-            logging_interval=logging_interval,
+            metrics_handler=metrics_handler,
             resume_info=resume_info,
             val_env=val_env,
             apply_resume_resets=apply_resume_resets,
+            preserve_checkpoint_target=preserve_checkpoint_target,
         )
+        return training, resume_state

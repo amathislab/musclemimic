@@ -2,14 +2,16 @@
 MyoFullBody environment - A full-body muscle-actuated humanoid model.
 """
 
-import loco_mujoco
 import mujoco
+import musclemimic_models
+from mujoco import MjSpec
+
+import loco_mujoco
 from loco_mujoco.core import ObservationType
 from loco_mujoco.core.utils import info_property
+from musclemimic.core.observations import HeadingFrameFreeJointVelocity
 from musclemimic.environments import LocoEnv
 from musclemimic.utils.logging import setup_logger
-from mujoco import MjSpec
-import musclemimic_models
 
 logger = setup_logger(__name__, identifier="[MyoFullBody]")
 
@@ -64,9 +66,10 @@ class MyoFullBody(LocoEnv):
         enable_muscle_excitation_observations: bool = False,
         enable_muscle_activation_observations: bool = False,
         enable_touch_sensor_observations: bool = True,
-        spec: str | MjSpec = None,
-        observation_spec: list[ObservationType] = None,
-        actuation_spec: list[str] = None,
+        use_egocentric_root_observations: bool = False,
+        spec: str | MjSpec | None = None,
+        observation_spec: list[ObservationType] | None = None,
+        actuation_spec: list[str] | None = None,
         mjx_backend: str = "jax",
         **kwargs,
     ) -> None:
@@ -84,6 +87,8 @@ class MyoFullBody(LocoEnv):
             enable_muscle_force_observations (bool): If True, include muscle force in observations
             enable_muscle_excitation_observations (bool): If True, include muscle excitation (neural drive from data.ctrl) in observations
             enable_muscle_activation_observations (bool): If True, include muscle activation (actual state from data.act) in observations
+            use_egocentric_root_observations (bool): Replace raw root orientation and velocity with root height,
+                projected gravity, and heading-frame velocity.
             spec (Union[str, MjSpec]): Path to XML file or MjSpec object. If None, uses default.
             observation_spec (List[ObservationType]): Custom observation specification.
             actuation_spec (List[str]): Custom action specification.
@@ -99,12 +104,15 @@ class MyoFullBody(LocoEnv):
         self._enable_muscle_excitation_observations = enable_muscle_excitation_observations
         self._enable_muscle_activation_observations = enable_muscle_activation_observations
         self._enable_touch_sensor_observations = enable_touch_sensor_observations
+        self._use_egocentric_root_observations = use_egocentric_root_observations
 
         # Store mjx_backend for use in _modify_spec_for_mjx
         self.mjx_backend = mjx_backend
 
-        # Store nconmax and num_envs from kwargs for automatic scaling
+        # Warp contact/constraint budget overrides. nconmax remains the MuJoCo
+        # per-env spec limit; naconmax is the total Warp contact budget.
         self.nconmax = kwargs.get("nconmax", None)
+        self.naconmax = kwargs.get("naconmax", None)
         self.njmax = kwargs.get("njmax", None)  # Also handle njmax
         self.num_envs = kwargs.get("num_envs", 1)
 
@@ -313,7 +321,6 @@ class MyoFullBody(LocoEnv):
                 pos=pos,
             )
 
-        
         # Modify control range to -1 to 1
         for actuator in spec.actuators:
             # Only modify muscle actuators (type 4 in MuJoCo), not motor actuators
@@ -340,15 +347,36 @@ class MyoFullBody(LocoEnv):
 
         # Add joint position observations if enabled
         if self._enable_joint_pos_observations:
-            # Add free joint observation (position without x,y)
-            obs_spec.append(ObservationType.FreeJointPosNoXY("q_free_joint", self.root_free_joint_xml_name))
+            if self._use_egocentric_root_observations:
+                obs_spec.extend(
+                    [
+                        ObservationType.EntryFromFreeJointPos(
+                            entry_index=2,
+                            obs_name="q_root_height",
+                            xml_name=self.root_free_joint_xml_name,
+                        ),
+                        ObservationType.ProjectedGravityVector(
+                            "projected_gravity",
+                            self.root_free_joint_xml_name,
+                        ),
+                    ]
+                )
+            else:
+                obs_spec.append(ObservationType.FreeJointPosNoXY("q_free_joint", self.root_free_joint_xml_name))
             # Add all joint positions
             obs_spec.append(ObservationType.JointPosArray("q_all_pos", j_names))
 
         # Add joint velocity observations if enabled
         if self._enable_joint_vel_observations:
-            # Add free joint velocities
-            obs_spec.append(ObservationType.FreeJointVel("dq_free_joint", self.root_free_joint_xml_name))
+            if self._use_egocentric_root_observations:
+                obs_spec.append(
+                    HeadingFrameFreeJointVelocity(
+                        "dq_free_joint_heading",
+                        self.root_free_joint_xml_name,
+                    )
+                )
+            else:
+                obs_spec.append(ObservationType.FreeJointVel("dq_free_joint", self.root_free_joint_xml_name))
             # Add all joint velocities
             obs_spec.append(ObservationType.JointVelArray("dq_all_vel", j_names))
 
@@ -412,16 +440,15 @@ class MyoFullBody(LocoEnv):
         Uses the same contact-simplification idea as the older full-body setup,
         adapted for the maintained MyoFullBody asset.
         """
-        if hasattr(self, "mjx_backend") and self.mjx_backend == "warp":
-            # MuJoCo 3.3.7+: nconmax is per-env, naconmax is total across all envs
+        if self.mjx_backend == "warp":
+            # MuJoCo 3.3.7+: nconmax is per-env, naconmax is total across all envs.
             per_env_contacts = 96  # Contacts per environment
-            num_envs = getattr(self, "num_envs", 1)
 
-            if not hasattr(self, "nconmax") or self.nconmax is None:
+            if self.nconmax is None:
                 self.nconmax = per_env_contacts  # Per-env contacts
-            if not hasattr(self, "naconmax") or getattr(self, "naconmax", None) is None:
-                self.naconmax = self.nconmax * num_envs  # Total across all envs
-            if not hasattr(self, "njmax") or self.njmax is None:
+            if self.naconmax is None:
+                self.naconmax = self.nconmax * self.num_envs  # Total across all envs
+            if self.njmax is None:
                 self.njmax = 768  # Per-world constraints
 
             # Apply the limits to the spec (spec uses per-env values)
@@ -560,7 +587,11 @@ class MjxMyoFullBody(MyoFullBody):
                 extracted_goal_params[param] = kwargs.pop(param)
 
         if "model_option_conf" not in kwargs.keys():
-            model_option_conf = dict(iterations=4, ls_iterations=8, disableflags=mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
+            model_option_conf = {
+                "iterations": 4,
+                "ls_iterations": 8,
+                "disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
+            }
         else:
             model_option_conf = kwargs["model_option_conf"]
             del kwargs["model_option_conf"]

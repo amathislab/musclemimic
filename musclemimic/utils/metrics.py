@@ -14,6 +14,7 @@ from loco_mujoco.core.utils.math import (
     quat_scalarfirst2scalarlast,
 )
 from loco_mujoco.core.utils.mujoco import mj_jntid2qposid, mj_jntid2qvelid, mj_jntname2qposid
+from musclemimic.core.reward.orientation import scalar_first_quaternion_geodesic_distance
 from musclemimic.core.utils.site_mapping import create_site_mapper
 from musclemimic.core.wrappers import SummaryMetrics
 
@@ -38,6 +39,7 @@ VALIDATION_STEP_METRIC_KEYS = (
     "reward_qpos",
     "reward_qvel",
     "reward_root_pos",
+    "reward_root_quat",
     "reward_rpos",
     "reward_rquat",
     "reward_rvel_rot",
@@ -46,6 +48,7 @@ VALIDATION_STEP_METRIC_KEYS = (
     "penalty_total",
     "penalty_activation_energy",
     "err_root_xyz",
+    "err_root_quat",
     "err_root_yaw",
     "err_joint_pos",
     "err_joint_vel",
@@ -77,6 +80,13 @@ class QuantityContainer:
 
 @struct.dataclass
 class ValidationSummary(SummaryMetrics):
+    # Completed episodes behind the episode-level means/rates; cross-replica
+    # reductions reweight by this count.
+    episode_count: float = 0.0
+    # Frame-weighted coverage of the selected trajectory set. Exact online
+    # validation can censor trajectories at a fixed horizon.
+    frame_coverage: float = 0.0
+    total_frame: float = 0.0
     euclidean_distance: QuantityContainer = struct.field(default_factory=QuantityContainer)
     dynamic_time_warping: QuantityContainer = struct.field(default_factory=QuantityContainer)
     discrete_frechet_distance: QuantityContainer = struct.field(default_factory=QuantityContainer)
@@ -509,8 +519,9 @@ class MetricsHandler:
         # err_rpos: RMSE of relative site positions
         err_rpos = jnp.sqrt(jnp.mean(jnp.square(rel_site_pos - traj_rel_site_pos))) if rel_site_pos.size > 0 else 0.0
 
-        # err_root_xyz / err_root_yaw: root position and orientation errors
+        # Root position, full orientation, and yaw-only errors.
         err_root_xyz = 0.0
+        err_root_quat = 0.0
         err_root_yaw = 0.0
         if self._root_qpos_ids is not None and self._traj_data is not None:
             sim_qpos = env_states.data.qpos
@@ -523,9 +534,10 @@ class MetricsHandler:
             if offset is not None:
                 traj_root_xyz = traj_root_xyz - offset
             err_root_xyz = jnp.sqrt(jnp.mean(jnp.square(root_xyz - traj_root_xyz)))
-            # Root yaw error: extract yaw from quaternion [w,x,y,z]
+            # Full SO(3) and yaw-only root orientation errors.
             root_quat = sim_qpos[..., self._root_qpos_ids[3:7]]
             traj_root_quat = traj_qpos_full[..., self._root_qpos_ids[3:7]]
+            err_root_quat = jnp.mean(scalar_first_quaternion_geodesic_distance(root_quat, traj_root_quat, jnp))
             yaw_diff = _quat_to_yaw_wxyz(root_quat) - _quat_to_yaw_wxyz(traj_root_quat)
             err_root_yaw = jnp.mean(jnp.abs(jnp.arctan2(jnp.sin(yaw_diff), jnp.cos(yaw_diff))))
 
@@ -538,12 +550,14 @@ class MetricsHandler:
         )
 
         return ValidationSummary(
+            episode_count=num_done,
             mean_episode_return=mean_episode_return,
             mean_episode_length=mean_episode_length,
             max_timestep=max_timestep,
             early_termination_count=early_term_count,
             early_termination_rate=early_term_rate,
             err_root_xyz=err_root_xyz,
+            err_root_quat=err_root_quat,
             err_root_yaw=err_root_yaw,
             err_joint_pos=err_joint_pos,
             err_joint_vel=err_joint_vel,
@@ -784,12 +798,16 @@ class MetricsHandler:
         )
 
         return ValidationSummary(
+            episode_count=jnp.array(0.0),
+            frame_coverage=jnp.array(0.0),
+            total_frame=jnp.array(0.0),
             mean_episode_return=jnp.array(0.0),
             mean_episode_length=jnp.array(0.0),
             max_timestep=jnp.array(0),
             early_termination_count=jnp.array(0.0),
             early_termination_rate=jnp.array(0.0),
             err_root_xyz=jnp.array(0.0),
+            err_root_quat=jnp.array(0.0),
             err_root_yaw=jnp.array(0.0),
             err_joint_pos=jnp.array(0.0),
             err_joint_vel=jnp.array(0.0),
@@ -807,6 +825,8 @@ def flatten_validation_metrics(
     validation_metrics,
     enabled_measures: list[str] | None = None,
     enabled_quantities: list[str] | None = None,
+    *,
+    include_trajectory_set_metrics: bool = True,
 ) -> dict[str, float]:
     """Flatten ValidationSummary to dict for logging.
 
@@ -816,16 +836,30 @@ def flatten_validation_metrics(
                          If None, logs all measures.
         enabled_quantities: List of enabled quantity names (e.g., ["JointPosition"]).
                          If None, logs all error metrics for backward compatibility.
+        include_trajectory_set_metrics: Whether to include metrics that require
+            exact trajectory-set evaluation. Sampled validation leaves these
+            fields at their structural defaults, so callers should pass False.
     """
     metrics: dict[str, float] = {
+        "val_episode_count": float(validation_metrics.episode_count),
         "val_mean_episode_return": float(validation_metrics.mean_episode_return),
         "val_mean_episode_length": float(validation_metrics.mean_episode_length),
         "val_early_termination_count": float(validation_metrics.early_termination_count),
         "val_early_termination_rate": float(validation_metrics.early_termination_rate),
         # Root error metrics do not depend on configured quantity selection.
         "val_err_root_xyz": float(validation_metrics.err_root_xyz),
+        "val_err_root_quat": float(validation_metrics.err_root_quat),
         "val_err_root_yaw": float(validation_metrics.err_root_yaw),
     }
+    if include_trajectory_set_metrics:
+        metrics.update(
+            {
+                "val_horizon_timeout_count": float(validation_metrics.horizon_timeout_count),
+                "val_horizon_timeout_rate": float(validation_metrics.horizon_timeout_rate),
+                "val_frame_coverage": float(validation_metrics.frame_coverage),
+                "val_total_frame": float(validation_metrics.total_frame),
+            }
+        )
     enabled_quantities_set = set(enabled_quantities) if enabled_quantities is not None else None
 
     error_metric_quantities = {

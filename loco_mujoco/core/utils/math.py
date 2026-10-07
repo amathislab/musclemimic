@@ -187,26 +187,27 @@ def calculate_global_rotation_matrices(main_rot, relative_rots, backend):
 
 
 def calculate_relative_velocity_in_local_frame(vel_a, vel_b, rot_mat_w_a, rot_mat_a_b, backend):
-    """
-    Calculate the relative velocity vel_a-vel_b expressed in the local frame of vel_a.
+    """Compute reference-local angular differences and legacy linear features.
+
+    Both inputs use world axes and store angular [rad/s] before linear [m/s]
+    velocity. The angular output is R_A.T @ (omega_B - omega_A). The linear
+    output retains R_A @ (v_A - v_B) for compatibility with existing features;
+    it is not the derivative of position in a rotating reference frame.
 
     Args:
-        vel_a (array): 6D velocity vector of body A in world frame. Shape (6,) or (batch_size, 6)
-        vel_b (array): 6D velocity vector of body B in world frame. Shape (6,) or (batch_size, 6)
-        rot_mat_w_a (array): Rotation matrix to transform from world frame to the frame of vel_a.
-            Shape (3, 3) or (batch_size, 3, 3)
-        rot_mat_a_b (array): Rotation matrix to transform from the frame of vel_a to the frame of vel_b.
-            Shape (3, 3) or (batch_size, 3, 3)
-        backend: Backend to use (either np or jnp).
+        vel_a (array): Reference site's world velocity, shape (6,).
+        vel_b (array): Other sites' world velocities, shape (6,) or (N, 6).
+        rot_mat_w_a (array): Reference local-to-world rotation R_A, shape (3, 3).
+        rot_mat_a_b (array): Retained for API compatibility; no longer used.
+        backend: NumPy or JAX NumPy. Batch reference frames with vmap.
 
     Returns:
-        array: Relative 6D velocity vector of vel_a in the local frame of vel_b. Shape (batch_size, 6)
+        array: Angular differences followed by linear features, shape (N, 6).
     """
     # Ensure the inputs are at least 2D arrays for batch processing
     vel_a = backend.atleast_1d(vel_a)  # Shape: (6,)
     vel_b = backend.atleast_2d(vel_b)  # Shape: (1, 6) or (batch_size, 6)
     rot_mat_w_a = backend.atleast_2d(rot_mat_w_a)  # Shape: (3, 3)
-    rot_mat_a_b = atleast_3d(rot_mat_a_b, backend)  # Shape: (1, 3, 3) or (batch_size, 3, 3)
 
     # Extract angular and linear components.
     ang_a = vel_a[:3]  # Angular components of A (Shape: (3,))
@@ -215,14 +216,11 @@ def calculate_relative_velocity_in_local_frame(vel_a, vel_b, rot_mat_w_a, rot_ma
     ang_b = vel_b[:, :3]  # Angular components of B (Shape: (batch_size, 3))
     lin_b = vel_b[:, 3:]  # Linear components of B (Shape: (batch_size, 3))
 
-    # Transform the relativ linear velocity of vel_a-vel_b to the local frame of vel_a
+    # Preserve the historical linear feature independently of the angular fix.
     relative_lin_vel = backend.einsum('jk,ik->ij', rot_mat_w_a, lin_a - lin_b)  # Shape: (batch_size, 3)
 
-    # Transform the angular velocity of vel_b to the local frame of vel_a (einsum is taking the transpose of rot_mat_a_b)
-    ang_b_transformed_to_a = backend.einsum('ikj,ik->ij', rot_mat_a_b, ang_b)  # Shape: (batch_size, 3)
-
-    # Calculate the relative velocities in the local frame of vel_b
-    relative_ang_vel = ang_b_transformed_to_a - ang_a  # Shape: (batch_size, 3)
+    # Subtract in world axes before projecting both terms into reference axes.
+    relative_ang_vel = backend.einsum('kj,ik->ij', rot_mat_w_a, ang_b - ang_a)
 
     # Combine into a 6D vector
     relative_velocity = backend.hstack([relative_ang_vel, relative_lin_vel])  # Shape: (batch_size, 6)

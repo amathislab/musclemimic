@@ -16,12 +16,3 @@ experiment:
 
   # Enable MoE
   use_moe: true
-  moe_config:
-    num_experts: 16
-    moe_at_layers: [3]
-    apply_moe_to: "both"
-    apply_moe_to_output: false
-    expert_hidden_ratio: 0.5
-    temperature: 0.5
-    load_balance_loss_weight: 0.01
-    gate_init_std: 0.01

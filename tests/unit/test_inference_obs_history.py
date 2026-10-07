@@ -1,10 +1,11 @@
-import numpy as np
-import jax.numpy as jnp
 from types import SimpleNamespace
 
+import jax.numpy as jnp
+import numpy as np
 from omegaconf import OmegaConf
 
-import musclemimic.algorithms.ppo.inference as inference
+import musclemimic.algorithms.common.inference as inference
+from musclemimic.algorithms.ppo.config import PPOAgentConf
 
 
 class FakePolicy:
@@ -19,10 +20,16 @@ class FakeNetwork:
     def __init__(self, action_dim: int = 2):
         self.action_dim = action_dim
         self.seen_obs = []
+        self.actor_only_flags = []
 
-    def apply(self, vars_in, obs_b, mutable=None):
+    def apply(self, vars_in, obs_b, actor_only=False):
+        del vars_in
         self.seen_obs.append(np.array(obs_b))
-        return (FakePolicy(self.action_dim), None), {"run_stats": vars_in["run_stats"]}
+        self.actor_only_flags.append(actor_only)
+        policy = FakePolicy(self.action_dim)
+        if actor_only:
+            return policy
+        return policy, None
 
 
 class FakeTrainState:
@@ -59,6 +66,14 @@ class FakeEnv:
         pass
 
 
+def _ppo_conf(experiment, network):
+    return PPOAgentConf(
+        config=OmegaConf.create({"experiment": experiment}),
+        network=network,
+        tx=None,
+    )
+
+
 def test_observation_history_buffer_rolls():
     buffer = inference.ObservationHistoryBuffer(3)
     obs0 = np.array([1.0, 2.0], dtype=np.float32)
@@ -79,9 +94,9 @@ def test_play_policy_mujoco_stacks_history(monkeypatch):
 
     env = FakeEnv()
     network = FakeNetwork(action_dim=2)
-    agent_conf = SimpleNamespace(
-        config=OmegaConf.create({"experiment": {"len_obs_history": 3, "n_seeds": 1}}),
-        network=network,
+    agent_conf = _ppo_conf(
+        {"len_obs_history": 3, "n_seeds": 1},
+        network,
     )
     agent_state = SimpleNamespace(train_state=FakeTrainState())
 
@@ -98,6 +113,7 @@ def test_play_policy_mujoco_stacks_history(monkeypatch):
     )
 
     assert len(network.seen_obs) == 2
+    assert network.actor_only_flags == [True, True]
     np.testing.assert_allclose(
         network.seen_obs[0].reshape(-1),
         np.array([0.0, 0.0, 0.0, 0.0, 1.0, 2.0], dtype=np.float32),
@@ -106,6 +122,49 @@ def test_play_policy_mujoco_stacks_history(monkeypatch):
         network.seen_obs[1].reshape(-1),
         np.array([0.0, 0.0, 1.0, 2.0, 2.0, 3.0], dtype=np.float32),
     )
+
+
+def test_play_policy_forwards_motion_name_to_video_overlay(monkeypatch):
+    monkeypatch.setattr(inference.jax, "jit", lambda f: f)
+
+    class RecordingEnv(FakeEnv):
+        def __init__(self):
+            super().__init__()
+            self.debug_info = None
+
+        def step(self, action):
+            obs, reward, absorbing, done, _info = super().step(action)
+            info = {
+                "traj_no": 2,
+                "motion_name": "KIT/walk_01",
+                "subtraj_step_no": 4,
+                "traj_len": 20,
+            }
+            return obs, reward, absorbing, done, info
+
+        def render(self, record=False, debug_info=None):
+            self.debug_info = debug_info
+
+    env = RecordingEnv()
+    agent_conf = _ppo_conf(
+        {"len_obs_history": 1, "n_seeds": 1},
+        FakeNetwork(action_dim=2),
+    )
+    agent_state = SimpleNamespace(train_state=FakeTrainState())
+
+    inference.play_policy(
+        env,
+        agent_conf,
+        agent_state,
+        n_envs=1,
+        n_steps=1,
+        render=True,
+        record=True,
+        use_mujoco=True,
+        do_wrap_env=False,
+    )
+
+    assert env.debug_info["motion_name"] == "KIT/walk_01"
 
 
 def test_observation_history_buffer_split_goal_reset():
@@ -194,12 +253,8 @@ class FakeEnvWithGoal:
         self._goal = SimpleNamespace(dim=goal_dim)
         self._step = 0
         # Goal indices are at the end
-        self.obs_container = FakeObsContainer(
-            goal_indices=np.arange(state_dim, state_dim + goal_dim)
-        )
-        self.info = SimpleNamespace(
-            observation_space=SimpleNamespace(shape=(state_dim + goal_dim,))
-        )
+        self.obs_container = FakeObsContainer(goal_indices=np.arange(state_dim, state_dim + goal_dim))
+        self.info = SimpleNamespace(observation_space=SimpleNamespace(shape=(state_dim + goal_dim,)))
 
     def reset(self):
         self._step = 0
@@ -227,15 +282,13 @@ def test_play_policy_mujoco_split_goal(monkeypatch):
 
     env = FakeEnvWithGoal(state_dim=2, goal_dim=2)
     network = FakeNetwork(action_dim=2)
-    agent_conf = SimpleNamespace(
-        config=OmegaConf.create({
-            "experiment": {
-                "len_obs_history": 3,
-                "split_goal": True,
-                "n_seeds": 1,
-            }
-        }),
-        network=network,
+    agent_conf = _ppo_conf(
+        {
+            "len_obs_history": 3,
+            "split_goal": True,
+            "n_seeds": 1,
+        },
+        network,
     )
     agent_state = SimpleNamespace(train_state=FakeTrainState())
 
@@ -252,6 +305,7 @@ def test_play_policy_mujoco_split_goal(monkeypatch):
     )
 
     assert len(network.seen_obs) == 2
+    assert network.actor_only_flags == [True, True]
 
     # After reset: state_hist = [0, 0, 0, 0, 0, 1], goal = [100, 101]
     expected0 = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 100.0, 101.0], dtype=np.float32)

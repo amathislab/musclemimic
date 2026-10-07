@@ -114,9 +114,7 @@ def set_converted_lafan1_path():
     parser = argparse.ArgumentParser(description="Set the path to which the converted LAFAN1 dataset is stored.")
     parser.add_argument("--path", type=str, help="Path to which the converted LAFAN1 dataset is stored.")
     args = parser.parse_args()
-    _set_path_in_yaml_conf(
-        args.path, "MUSCLEMIMIC_CONVERTED_LAFAN1_PATH", path_to_conf=loco_mujoco.get_variables_path()
-    )
+    _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_CONVERTED_LAFAN1_PATH", path_to_conf=loco_mujoco.get_variables_path())
 
 
 def _set_path_in_yaml_conf(path: str, attr: str, path_to_conf: str):

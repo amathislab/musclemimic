@@ -111,27 +111,8 @@ class GoalBimanualTrajMimic(Goal):
                 raise ValueError(f"Site '{name}' not found in model")
             self._rel_site_ids.append(site_id)
 
-        # Bimanual tasks do not need special root-joint handling here.
-        n_joints = model.njnt
         n_sites = len(self._info_props["sites_for_mimic"])
         n_relative_sites = n_sites - 1
-
-        size_for_joint_pos = n_joints * self.n_step_lookahead
-        size_for_joint_vel = n_joints * self.n_step_lookahead
-
-        # Target trajectory site features exclude the root/reference site.
-        if self.use_concise_lookahead:
-            size_for_site_targets = 3 * n_relative_sites * self.n_step_lookahead
-        else:
-            size_for_site_targets = (3 + 3 + 6) * n_relative_sites * self.n_step_lookahead
-
-        # Current simulator site features are always included in full.
-        size_for_current_sites = (3 + 6 + 3) * n_relative_sites
-
-        motion_phase_dim = 1 if self.enable_motion_phase else 0
-
-        self._dim = size_for_joint_pos + size_for_joint_vel + size_for_site_targets + size_for_current_sites + motion_phase_dim
-        self._size_additional_observation = 0
 
         self._rel_site_ids = np.array(self._rel_site_ids)
         self._body_rootid = model.body_rootid
@@ -145,21 +126,56 @@ class GoalBimanualTrajMimic(Goal):
         self._qpos_ind = np.concatenate([mj_jntid2qposid(i, model) for i in range(model.njnt)])
         self._qvel_ind = np.concatenate([mj_jntid2qvelid(i, model) for i in range(model.njnt)])
 
-        # Sanity-check that the gathered qpos/qvel indices cover the full state.
-        expected_qpos_size = model.nq
-        expected_qvel_size = model.nv
+        self._set_goal_dimensions(
+            n_qpos=len(self._qpos_ind),
+            n_qvel=len(self._qvel_ind),
+            n_relative_sites=n_relative_sites,
+        )
 
-        if len(self._qpos_ind) != expected_qpos_size:
-            raise ValueError(f"Joint position indices size mismatch: {len(self._qpos_ind)} != {expected_qpos_size}")
-        if len(self._qvel_ind) != expected_qvel_size:
-            raise ValueError(f"Joint velocity indices size mismatch: {len(self._qvel_ind)} != {expected_qvel_size}")
+        # Sanity-check that the gathered qpos/qvel indices cover the full state.
+        if len(self._qpos_ind) != model.nq:
+            raise ValueError(f"Joint position indices size mismatch: {len(self._qpos_ind)} != {model.nq}")
+        if len(self._qvel_ind) != model.nv:
+            raise ValueError(f"Joint velocity indices size mismatch: {len(self._qvel_ind)} != {model.nv}")
 
         self.min = [-np.inf] * self.dim
         self.max = [np.inf] * self.dim
-        self.data_type_ind = np.array([i for i in range(data.userdata.size)])
-        self.obs_ind = np.array([j for j in range(current_obs_size, current_obs_size + self.dim)])
+        self.data_type_ind = np.arange(data.userdata.size)
+        self.obs_ind = np.arange(current_obs_size, current_obs_size + self.dim)
 
         self._initialized_from_mj = True
+
+    def _set_goal_dimensions(
+        self,
+        *,
+        n_qpos: int,
+        n_qvel: int,
+        n_relative_sites: int,
+    ) -> None:
+        """Set dimensions for the legacy full or concise trajectory encoding."""
+
+        size_for_joint_pos = n_qpos * self.n_step_lookahead
+        size_for_joint_vel = n_qvel * self.n_step_lookahead
+
+        # Target trajectory site features exclude the root/reference site.
+        if self.use_concise_lookahead:
+            size_for_site_targets = 3 * n_relative_sites * self.n_step_lookahead
+        else:
+            size_for_site_targets = (3 + 3 + 6) * n_relative_sites * self.n_step_lookahead
+
+        # Current simulator site features are always included in full.
+        size_for_current_sites = (3 + 6 + 3) * n_relative_sites
+
+        motion_phase_dim = 1 if self.enable_motion_phase else 0
+
+        self._dim = (
+            size_for_joint_pos
+            + size_for_joint_vel
+            + size_for_site_targets
+            + size_for_current_sites
+            + motion_phase_dim
+        )
+        self._size_additional_observation = 0
 
     def init_from_traj(self, traj_handler: Any):
         """

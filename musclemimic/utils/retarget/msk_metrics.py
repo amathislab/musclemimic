@@ -7,16 +7,17 @@ indexing consistent. The module stays quiet unless run as ``__main__``.
 
 from __future__ import annotations
 
-import os
 import argparse
+import os
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
 
-import numpy as np
 import mujoco as mj
+import numpy as np
+from musclemimic_models import get_xml_path
 
 import loco_mujoco
-from musclemimic_models import get_xml_path
+from loco_mujoco.core.utils.ground import FloorSurfaceDistanceEvaluator
 
 
 def _get_converted_amass_path() -> Path:
@@ -49,17 +50,47 @@ def apply_spec_changes(spec: mj.MjSpec) -> mj.MjSpec:
 
     finger_joints = {
         # right
-        "cmc_flexion_r","cmc_abduction_r","mp_flexion_r","ip_flexion_r",
-        "mcp2_flexion_r","mcp2_abduction_r","mcp3_flexion_r","mcp3_abduction_r",
-        "mcp4_flexion_r","mcp4_abduction_r","mcp5_flexion_r","mcp5_abduction_r",
-        "md2_flexion_r","md3_flexion_r","md4_flexion_r","md5_flexion_r",
-        "pm2_flexion_r","pm3_flexion_r","pm4_flexion_r","pm5_flexion_r",
+        "cmc_flexion_r",
+        "cmc_abduction_r",
+        "mp_flexion_r",
+        "ip_flexion_r",
+        "mcp2_flexion_r",
+        "mcp2_abduction_r",
+        "mcp3_flexion_r",
+        "mcp3_abduction_r",
+        "mcp4_flexion_r",
+        "mcp4_abduction_r",
+        "mcp5_flexion_r",
+        "mcp5_abduction_r",
+        "md2_flexion_r",
+        "md3_flexion_r",
+        "md4_flexion_r",
+        "md5_flexion_r",
+        "pm2_flexion_r",
+        "pm3_flexion_r",
+        "pm4_flexion_r",
+        "pm5_flexion_r",
         # left
-        "cmc_flexion_l","cmc_abduction_l","mp_flexion_l","ip_flexion_l",
-        "mcp2_flexion_l","mcp2_abduction_l","mcp3_flexion_l","mcp3_abduction_l",
-        "mcp4_flexion_l","mcp4_abduction_l","mcp5_flexion_l","mcp5_abduction_l",
-        "md2_flexion_l","md3_flexion_l","md4_flexion_l","md5_flexion_l",
-        "pm2_flexion_l","pm3_flexion_l","pm4_flexion_l","pm5_flexion_l",
+        "cmc_flexion_l",
+        "cmc_abduction_l",
+        "mp_flexion_l",
+        "ip_flexion_l",
+        "mcp2_flexion_l",
+        "mcp2_abduction_l",
+        "mcp3_flexion_l",
+        "mcp3_abduction_l",
+        "mcp4_flexion_l",
+        "mcp4_abduction_l",
+        "mcp5_flexion_l",
+        "mcp5_abduction_l",
+        "md2_flexion_l",
+        "md3_flexion_l",
+        "md4_flexion_l",
+        "md5_flexion_l",
+        "pm2_flexion_l",
+        "pm3_flexion_l",
+        "pm4_flexion_l",
+        "pm5_flexion_l",
     }
 
     joints_to_remove = [j for j in spec.joints if j.name in finger_joints]
@@ -89,7 +120,7 @@ def joint_violation_pct(
     """
     assert qpos_traj.ndim == 2
 
-    T = qpos_traj.shape[0]
+    num_frames = qpos_traj.shape[0]
     total_violations = 0
     total_checks = 0
 
@@ -104,7 +135,7 @@ def joint_violation_pct(
 
         violations = (vals < (low - threshold)) | (vals > (high + threshold))
         total_violations += int(np.sum(violations))
-        total_checks += T
+        total_checks += num_frames
 
     return 100.0 * total_violations / max(1, total_checks)
 
@@ -117,7 +148,7 @@ def ground_penetration_stats(
     return_info: bool = False,
 ):
     """
-    Ground penetration over trajectory using MuJoCo contacts.
+    Ground penetration over a trajectory using signed collision-surface distance.
 
     Returns:
       pen_pct: % frames with any penetration deeper than tol
@@ -126,42 +157,22 @@ def ground_penetration_stats(
     If return_info=True, also returns:
       (max_pen_m, max_pen_frame, max_pen_geom_name)
     """
-    data = mj.MjData(model)
-    floor_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, floor)
-    if floor_id < 0:
-        raise ValueError(f"No geom named '{floor}' found")
-
-    T = len(qpos)
-    violated_frames = 0
-
-    max_pen_m = 0.0
+    distance_evaluator = FloorSurfaceDistanceEvaluator(model, floor_name=floor)
+    distances_m, closest_geom_ids = distance_evaluator.measure_trajectory(qpos)
+    num_frames = len(qpos)
+    violation_mask = distances_m < -tol
+    violated_frames = int(np.count_nonzero(violation_mask))
     max_pen_frame = -1
     max_pen_geom_name = None
+    if np.any(violation_mask):
+        violating_distances_m = np.where(violation_mask, distances_m, np.inf)
+        max_pen_frame = int(np.argmin(violating_distances_m))
+        max_pen_m = float(-distances_m[max_pen_frame])
+        max_pen_geom_name = model.geom(int(closest_geom_ids[max_pen_frame])).name
+    else:
+        max_pen_m = 0.0
 
-    for t in range(T):
-        data.qpos[:] = qpos[t]
-        mj.mj_forward(model, data)
-
-        frame_has_violation = False
-
-        for i in range(data.ncon):
-            c = data.contact[i]
-            if c.geom1 == floor_id or c.geom2 == floor_id:
-                # c.dist < 0 => penetration. depth in meters = -c.dist
-                if c.dist < -tol:
-                    frame_has_violation = True
-
-                    depth_m = float(-c.dist)  # positive penetration depth
-                    if depth_m > max_pen_m:
-                        max_pen_m = depth_m
-                        max_pen_frame = t
-                        offending_geom = c.geom2 if c.geom1 == floor_id else c.geom1
-                        max_pen_geom_name = model.geom(offending_geom).name
-
-        if frame_has_violation:
-            violated_frames += 1
-
-    pen_pct = 100.0 * violated_frames / max(1, T)
+    pen_pct = 100.0 * violated_frames / max(1, num_frames)
 
     if return_info:
         return pen_pct, max_pen_m, max_pen_frame, max_pen_geom_name
@@ -170,29 +181,11 @@ def ground_penetration_stats(
 
 def floating_height(model, qpos):
     """
-    Return the minimum geom z-height over the whole trajectory (meters),
-    skipping the geom named "floor" if it exists.
+    Return the minimum signed collision-surface distance to the floor in meters.
     """
-    data = mj.MjData(model)
-    min_z = np.inf
-
-    # Precompute non-floor geom ids once
-    non_floor_geom_ids = []
-    for geom_id in range(model.ngeom):
-        name = model.geom(geom_id).name
-        if name == "floor":
-            continue
-        non_floor_geom_ids.append(geom_id)
-
-    # Fallback: if nothing left (unlikely), use all geoms
-    use_ids = non_floor_geom_ids if non_floor_geom_ids else list(range(model.ngeom))
-
-    for q in qpos:
-        data.qpos[:] = q
-        mj.mj_forward(model, data)
-        min_z = min(min_z, float(np.min(data.geom_xpos[use_ids, 2])))
-
-    return float(min_z)
+    distance_evaluator = FloorSurfaceDistanceEvaluator(model)
+    distances_m, _closest_geom_ids = distance_evaluator.measure_trajectory(qpos)
+    return float(np.min(distances_m))
 
 
 def tendon_jump_max(
@@ -223,7 +216,7 @@ def tendon_jump_max(
 
     data = mj.MjData(model)
     nt = model.ntendon
-    T = qpos.shape[0]
+    num_frames = qpos.shape[0]
 
     prev_len = None
     ema_abs_change = np.zeros(nt)
@@ -232,31 +225,28 @@ def tendon_jump_max(
     max_t = -1
     max_k = -1
 
-    L0 = model.tendon_length0.astype(np.float64)
+    reference_lengths = model.tendon_length0.astype(np.float64)
 
-    for t in range(T):
+    for t in range(num_frames):
         data.qpos[:] = qpos[t]
         mj.mj_forward(model, data)
         cur_len = data.ten_length.copy()
 
         if prev_len is not None:
-            dL_rel = np.abs(cur_len - prev_len) / np.maximum(L0, 1e-6)
+            relative_length_change = np.abs(cur_len - prev_len) / np.maximum(reference_lengths, 1e-6)
 
             # Initialize EMA on first delta
             if t == 1:
-                ema_abs_change[:] = dL_rel
+                ema_abs_change[:] = relative_length_change
             else:
-                ema_abs_change[:] = (
-                    (1.0 - ema_alpha) * ema_abs_change
-                    + ema_alpha * dL_rel
-                )
+                ema_abs_change[:] = (1.0 - ema_alpha) * ema_abs_change + ema_alpha * relative_length_change
 
             threshold = np.maximum(jump_factor * ema_abs_change, min_rel_jump)
 
-            mask = dL_rel > threshold
+            mask = relative_length_change > threshold
             if np.any(mask):
-                k_local = np.argmax(np.where(mask, dL_rel, -np.inf))
-                val = float(dL_rel[k_local])
+                k_local = np.argmax(np.where(mask, relative_length_change, -np.inf))
+                val = float(relative_length_change[k_local])
 
                 if val > max_jump:
                     max_jump = val
@@ -268,7 +258,6 @@ def tendon_jump_max(
     if return_info:
         tendon_name = model.tendon(max_k).name if max_k >= 0 else None
         return max_jump, max_t, max_k, tendon_name
-
     return max_jump
 
 
@@ -298,7 +287,7 @@ def speed_stats(motion_file: Path | str):
         pos_rmse = None
         if "pos_error" in d:
             pe = np.asarray(d["pos_error"])
-            pos_rmse = float(np.sqrt(np.mean(pe ** 2)))
+            pos_rmse = float(np.sqrt(np.mean(pe**2)))
 
         return fps, sec_per_frame, pos_rmse
 
@@ -309,7 +298,7 @@ def speed_stats(motion_file: Path | str):
 def compute_msk_metrics(
     motion_file: Path | str,
     compute: Iterable[str] = ("joint", "penetration", "float", "tendon", "speed"),
-) -> Dict[str, Dict[str, float]]:
+) -> dict[str, dict[str, float]]:
 
     motion_file = Path(motion_file)
     model = load_model()
@@ -351,13 +340,9 @@ def compute_msk_metrics(
         out["mimic"]["tendon_max_jump_tendon_name"] = name
 
     if "speed" in compute:
-        out["gmr"]["fps"], out["gmr"]["sec_per_frame"], out["gmr"]["pos_rmse"] = speed_stats(
-            gmr_dir / motion_file
-        )
-        out["mimic"]["fps"], out["mimic"]["sec_per_frame"], out["mimic"]["pos_rmse"] = speed_stats(
-            base / motion_file
-        )
-        
+        out["gmr"]["fps"], out["gmr"]["sec_per_frame"], out["gmr"]["pos_rmse"] = speed_stats(gmr_dir / motion_file)
+        out["mimic"]["fps"], out["mimic"]["sec_per_frame"], out["mimic"]["pos_rmse"] = speed_stats(base / motion_file)
+
     return out
 
 

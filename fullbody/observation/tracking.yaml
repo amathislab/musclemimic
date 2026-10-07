@@ -1,0 +1,7 @@
+# @package experiment.env_params
+
+use_egocentric_root_observations: true
+goal_type: GoalFullBodyTracking
+goal_params:
+  lookahead_steps: [1, 20, 40, 60, 80]
+  include_support_intent: false

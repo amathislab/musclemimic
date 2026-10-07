@@ -1,0 +1,32 @@
+# Four-GPU GMR ResNet training on KIT Kinesis motions.
+# num_envs is global; the runner assigns 2048 environments per GPU.
+defaults:
+  - conf_fullbody_gmr_resnet_4gpu
+  - _self_
+
+wandb:
+  name: "fullbody-gmr-resnet-kit-kinesis-4gpu"
+  tags: ["fullbody", "gmr", "resnet", "kit_kinesis", "4gpu"]
+
+experiment:
+  actor_hidden_layers: [2048, 512, 512, 512, 512, 512, 512]
+  critic_hidden_layers: [2048, 512, 512, 512, 512, 512, 512]
+  total_timesteps: 12288000000
+  async_checkpointing: true
+
+  env_params:
+    timestep: 0.002
+    n_substeps: 5  # control_dt = 0.01 s (100 Hz)
+
+  ppo_config:
+    learnable_std: false
+
+  validation:
+    num: 1000
+
+  task_factory:
+    params:
+      amass_dataset_conf:
+        dataset_group:
+          - "KIT_KINESIS_TRAINING_MOTIONS"
+        write_materialized_cache: true

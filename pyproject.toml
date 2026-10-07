@@ -32,9 +32,9 @@ dependencies = [
     "scipy>=1.14.0",
 
     # MuJoCo/JAX stack
-    "mujoco-mjx==3.4.0",
-    "mujoco==3.4.0",
-    "warp-lang==1.10.0",
+    "mujoco-mjx==3.7.0",
+    "mujoco==3.7.0",
+    "warp-lang==1.12.0",
     "jax==0.7.2",
     "jaxlib==0.7.2",
     "flax==0.12.0",
@@ -67,7 +67,7 @@ dependencies = [
     "viser>=1.0.10",
     "trimesh>=4.0.0",
     "Pillow>=10.0.0",
-    "musclemimic_models>=1.0.2",
+    "musclemimic_models==1.0.6",
 ]
 
 [project.optional-dependencies]
@@ -90,7 +90,7 @@ smpl = [
 
 # GMR (General Motion Retargeting)
 gmr = [
-    "general-motion-retargeting @ git+https://github.com/amathislab/gmr_plus.git",
+    "general-motion-retargeting @ git+https://github.com/amathislab/gmr_plus.git@43ed2c895dea411371ccfe18c9b3b5a2823dee6a",
 ]
 
 # C3D file visualization
@@ -141,7 +141,13 @@ where = ["."]
 include = ["musclemimic*", "loco_mujoco*", "bimanual*", "fullbody*"]
 
 [tool.setuptools.package-data]
-"loco_mujoco.smpl" = ["robot_confs/*.yaml"]
+"loco_mujoco.smpl" = [
+    "robot_confs/*.yaml",
+    "amass_cleaned_training_motions.txt",
+    "amass_phc_cleaned_split_seed42.tsv",
+    "amass_phc_gmr_v6_quality_split.tsv",
+    "gmr_configs/smplh_to_myofullbody.json",
+]
 
 [tool.ruff]
 line-length = 120

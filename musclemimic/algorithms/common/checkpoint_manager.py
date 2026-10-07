@@ -1,5 +1,6 @@
 import os
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ class CheckpointMetadata:
     algo_version: str = "PPOJax_v1"
     backend: str = "warp"
     env_name: str = ""
+    wandb_run_id: str = ""
 
 
 class CheckpointFormat:
@@ -46,6 +48,45 @@ class CheckpointFormat:
 
     PICKLE = "pickle"
     ORBAX = "orbax"
+
+
+def checkpoint_path_for_step(checkpoint_dir: str | Path, step: int) -> str:
+    """Return the canonical Orbax directory for one checkpoint step."""
+    return str(Path(checkpoint_dir).resolve() / f"checkpoint_{int(step)}")
+
+
+def _is_zero_size_array(x: Any) -> bool:
+    shape = getattr(x, "shape", None)
+    if shape is None or getattr(x, "dtype", None) is None:
+        return False
+    return any(int(dim) == 0 for dim in tuple(shape))
+
+
+def replace_zero_size_arrays(tree: Any) -> Any:
+    """Orbax cannot write empty arrays; they carry no values, so write a placeholder."""
+    import jax
+    import jax.numpy as jnp
+
+    def _replace(x):
+        return jnp.zeros((1,), dtype=x.dtype) if _is_zero_size_array(x) else x
+
+    return jax.tree_util.tree_map(_replace, tree, is_leaf=lambda x: x is None or _is_zero_size_array(x))
+
+
+def restore_zero_size_arrays_from_target(tree: Any, target: Any | None) -> Any:
+    """Put empty arrays back using the typed restore target."""
+    if target is None:
+        return tree
+
+    import jax
+    import jax.numpy as jnp
+
+    def _restore(x, target_x):
+        if _is_zero_size_array(target_x):
+            return jnp.zeros(tuple(target_x.shape), dtype=target_x.dtype)
+        return x
+
+    return jax.tree_util.tree_map(_restore, tree, target, is_leaf=lambda x: x is None)
 
 
 class BaseCheckpointManager:
@@ -63,7 +104,11 @@ class BaseCheckpointManager:
         """Save a checkpoint. Must be implemented by subclasses."""
         raise NotImplementedError
 
-    def load_checkpoint(self, checkpoint_path: str) -> tuple[Any, Any, CheckpointMetadata]:
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        train_state_target: Any | None = None,
+    ) -> tuple[Any, Any, CheckpointMetadata]:
         """Load a checkpoint. Must be implemented by subclasses."""
         raise NotImplementedError
 
@@ -121,7 +166,13 @@ class OrbaxCheckpointManager(BaseCheckpointManager):
     """Modern Orbax-based checkpoint manager for optimal performance."""
 
     def __init__(
-        self, checkpoint_dir: str, max_to_keep: int = 5, save_interval_steps: int = 1, async_save: bool = True
+        self,
+        checkpoint_dir: str,
+        max_to_keep: int = 5,
+        save_interval_steps: int = 1,
+        async_save: bool = True,
+        save_concurrent_gb: int = 4,
+        restore_concurrent_gb: int = 4,
     ):
         if not ORBAX_AVAILABLE:
             raise ImportError("Orbax is not available. Install with: pip install orbax-checkpoint")
@@ -141,8 +192,21 @@ class OrbaxCheckpointManager(BaseCheckpointManager):
 
         # Define item names for composite checkpoints
         item_names = ("train_state", "config", "metadata")
+        item_handlers = {
+            "train_state": ocp.StandardCheckpointHandler(
+                save_concurrent_gb=int(save_concurrent_gb),
+                restore_concurrent_gb=int(restore_concurrent_gb),
+            ),
+            "config": ocp.JsonCheckpointHandler(),
+            "metadata": ocp.JsonCheckpointHandler(),
+        }
 
-        self.manager = ocp.CheckpointManager(str(self.checkpoint_dir), options=options, item_names=item_names)
+        self.manager = ocp.CheckpointManager(
+            str(self.checkpoint_dir),
+            options=options,
+            item_names=item_names,
+            item_handlers=item_handlers,
+        )
 
     def save_checkpoint(
         self, step: int, agent_conf: Any, agent_state: Any, metadata: CheckpointMetadata | None = None
@@ -170,6 +234,7 @@ class OrbaxCheckpointManager(BaseCheckpointManager):
                 "algo_version": metadata.algo_version,
                 "backend": metadata.backend,
                 "env_name": metadata.env_name,
+                "wandb_run_id": metadata.wandb_run_id,
             }
         else:
             # Create default metadata
@@ -197,11 +262,13 @@ class OrbaxCheckpointManager(BaseCheckpointManager):
         # In async mode, do not block here; wait at close().
         if not self.async_save:
             self.manager.wait_until_finished()
-        checkpoint_path = str(self.checkpoint_dir / f"checkpoint_{step}")
-        return checkpoint_path
+        return checkpoint_path_for_step(self.checkpoint_dir, step)
 
     def load_checkpoint(
-        self, checkpoint_path: str | None = None, step: int | None = None
+        self,
+        checkpoint_path: str | None = None,
+        step: int | None = None,
+        train_state_target: Any | None = None,
     ) -> tuple[Any, Any, CheckpointMetadata]:
         """Load checkpoint from Orbax format."""
         # Determine step either from explicit arg, from path, or via latest_step.
@@ -223,17 +290,23 @@ class OrbaxCheckpointManager(BaseCheckpointManager):
                 if step is None:
                     raise ValueError("No checkpoints found")
 
-        # Restore with a clear policy: always place arrays on the first
-        # available local device using fallback_sharding. This is the
-        # recommended simple approach for cross-device restores in Orbax.
         import jax
         from jax.sharding import SingleDeviceSharding
 
-        fallback_sharding = SingleDeviceSharding(jax.devices()[0])
+        # Saved host arrays and ShapeDtypeStruct targets have no sharding, so
+        # Orbax restores them as NumPy arrays. The training dispatcher owns
+        # subsequent device placement.
+        orbax_train_state_target = (
+            replace_zero_size_arrays(train_state_target) if train_state_target is not None else None
+        )
+        # Checkpoints saved as device arrays record their device. Orbax uses the
+        # fallback only when that device is absent, e.g. a released checkpoint
+        # saved from cpu:0 and restored under a GPU backend.
+        fallback_sharding = SingleDeviceSharding(jax.local_devices()[0])
 
         restore_args = ocp.args.Composite(
             train_state=ocp.args.StandardRestore(
-                item=None,
+                item=orbax_train_state_target,
                 strict=True,
                 fallback_sharding=fallback_sharding,
             ),
@@ -244,7 +317,7 @@ class OrbaxCheckpointManager(BaseCheckpointManager):
         checkpoint_data = self.manager.restore(step, args=restore_args)
 
         # Extract components (Composite result supports attribute-style access).
-        train_state_data = checkpoint_data.train_state
+        train_state_data = restore_zero_size_arrays_from_target(checkpoint_data.train_state, train_state_target)
         config_data = checkpoint_data.config
         metadata_dict = getattr(checkpoint_data, "metadata", {}) or {}
 
@@ -267,6 +340,7 @@ class OrbaxCheckpointManager(BaseCheckpointManager):
             algo_version=metadata_dict.get("algo_version", "PPOJax_v1"),
             backend=metadata_dict.get("backend", "jax"),
             env_name=metadata_dict.get("env_name", ""),
+            wandb_run_id=metadata_dict.get("wandb_run_id", ""),
         )
 
         return (config_data, train_state_data), metadata
@@ -301,17 +375,20 @@ class OrbaxCheckpointManager(BaseCheckpointManager):
 
     def _extract_train_state(self, agent_state: Any) -> dict:
         """Extract training state from agent state."""
+        if isinstance(agent_state, Mapping):
+            return dict(agent_state)
         if hasattr(agent_state, "train_state"):
             ts = agent_state.train_state
-            return {
+            payload = {
                 "params": ts.params,
                 "opt_state": ts.opt_state,
                 "step": ts.step,
                 "run_stats": ts.run_stats if hasattr(ts, "run_stats") else {},
             }
-        else:
-            # Fallback for different agent state formats
-            return {"state": agent_state}
+            if hasattr(agent_state, "runtime_state"):
+                payload["runtime_state"] = replace_zero_size_arrays(agent_state.runtime_state)
+            return payload
+        raise TypeError("checkpoint state must be a serialized mapping or expose train_state")
 
     def _extract_config(self, agent_conf: Any) -> dict:
         """Extract configuration from agent conf."""
@@ -334,6 +411,8 @@ class UnifiedCheckpointManager:
         prefer_orbax: bool = True,
         async_save: bool = True,
         save_interval_steps: int = 1,
+        save_concurrent_gb: int = 4,
+        restore_concurrent_gb: int = 4,
     ):
         # Note: format and prefer_orbax are kept for API compatibility but not used
         # since we always use Orbax for saving
@@ -343,7 +422,12 @@ class UnifiedCheckpointManager:
         # Always use Orbax for saving if available
         if ORBAX_AVAILABLE:
             self.save_manager = OrbaxCheckpointManager(
-                checkpoint_dir, max_to_keep=max_to_keep, save_interval_steps=save_interval_steps, async_save=async_save
+                checkpoint_dir,
+                max_to_keep=max_to_keep,
+                save_interval_steps=save_interval_steps,
+                async_save=async_save,
+                save_concurrent_gb=save_concurrent_gb,
+                restore_concurrent_gb=restore_concurrent_gb,
             )
             self.format = CheckpointFormat.ORBAX
         else:
@@ -357,10 +441,16 @@ class UnifiedCheckpointManager:
         """Save checkpoint using Orbax format only."""
         return self.save_manager.save_checkpoint(step, agent_conf, agent_state, metadata)
 
-    def load_checkpoint(self, checkpoint_path: str | None = None) -> tuple[Any, Any, CheckpointMetadata]:
+    def load_checkpoint(
+        self,
+        checkpoint_path: str | None = None,
+        train_state_target: Any | None = None,
+    ) -> tuple[Any, Any, CheckpointMetadata]:
         """Load checkpoint (Orbax only)."""
-        # Load latest or specific Orbax checkpoint
-        return self.save_manager.load_checkpoint(checkpoint_path)
+        return self.save_manager.load_checkpoint(
+            checkpoint_path,
+            train_state_target=train_state_target,
+        )
 
     def list_checkpoints(self) -> list:
         """List all Orbax checkpoints."""
@@ -396,6 +486,8 @@ def create_checkpoint_manager(
     max_to_keep: int = 5,
     async_save: bool = True,
     save_interval_steps: int = 1,
+    save_concurrent_gb: int = 4,
+    restore_concurrent_gb: int = 4,
     **kwargs,
 ) -> UnifiedCheckpointManager:
     """Factory function to create a checkpoint manager.
@@ -409,5 +501,7 @@ def create_checkpoint_manager(
         max_to_keep=max_to_keep,
         async_save=async_save,
         save_interval_steps=save_interval_steps,
+        save_concurrent_gb=save_concurrent_gb,
+        restore_concurrent_gb=restore_concurrent_gb,
         **kwargs,
     )

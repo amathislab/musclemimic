@@ -3,11 +3,14 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
+
+from huggingface_hub import hf_hub_download
 
 import loco_mujoco
-from huggingface_hub import hf_hub_download
+from loco_mujoco.smpl.gmr_cache_identity import GMR_CACHE_NAMESPACE, gmr_motion_relative_path
+from loco_mujoco.smpl.motion_spec import AMASSMotionSpec
 from musclemimic.utils.logging import setup_logger
 
 logger = setup_logger(__name__, identifier="[GMRCache]")
@@ -76,19 +79,38 @@ def resolve_gmr_dataset_names(dataset_group: str | Sequence[str]) -> list[str]:
     return dataset_names
 
 
-def _remote_gmr_cache_path(env_name: str, dataset_name: str) -> str:
+def resolve_gmr_motion_specs(dataset_group: str | Sequence[str]) -> list[AMASSMotionSpec]:
+    """Expand download groups while preserving clip intervals and group order."""
+    from loco_mujoco.task_factories.dataset_confs import (
+        expand_amass_dataset_group_spec,
+        get_amass_motion_spec_groups,
+    )
+
+    groups = get_amass_motion_spec_groups()
+    selected = {}
+    for name in expand_amass_dataset_group_spec(dataset_group):
+        if name not in groups:
+            raise ValueError(f"Unknown dataset group: {name}")
+        for motion in groups[name]:
+            selected.setdefault(motion.cache_key, motion)
+    return list(selected.values())
+
+
+def _remote_gmr_cache_path(env_name: str, dataset_name: str | AMASSMotionSpec) -> str:
     normalized_env_name = normalize_gmr_env_name(env_name)
-    return f"{normalized_env_name}/gmr/{dataset_name}.npz"
+    return gmr_motion_relative_path(normalized_env_name, dataset_name).as_posix()
 
 
-def _local_gmr_cache_path(env_name: str, dataset_name: str, cache_root: str | Path | None = None) -> Path:
+def _local_gmr_cache_path(
+    env_name: str, dataset_name: str | AMASSMotionSpec, cache_root: str | Path | None = None
+) -> Path:
     root = resolve_gmr_cache_root(cache_root)
     normalized_env_name = normalize_gmr_env_name(env_name)
-    return root / normalized_env_name / "gmr" / f"{dataset_name}.npz"
+    return root / gmr_motion_relative_path(normalized_env_name, dataset_name)
 
 
 def download_gmr_cache(
-    dataset_name: str,
+    dataset_name: str | AMASSMotionSpec,
     env_name: str = "MyoFullBody",
     repo_id: str | None = None,
     cache_dir: str | Path | None = None,
@@ -117,7 +139,7 @@ def download_gmr_cache(
 
 
 def try_download_gmr_cache(
-    dataset_name: str,
+    dataset_name: str | AMASSMotionSpec,
     env_name: str = "MyoFullBody",
     repo_id: str | None = None,
     cache_dir: str | Path | None = None,
@@ -147,7 +169,7 @@ def download_gmr_dataset_group(
     cache_dir: str | Path | None = None,
     force_download: bool = False,
 ) -> list[Path]:
-    dataset_names = resolve_gmr_dataset_names(dataset_group)
+    dataset_names = resolve_gmr_motion_specs(dataset_group)
     normalized_env_name = normalize_gmr_env_name(env_name)
     repo_id = repo_id or get_gmr_dataset_repo_id(normalized_env_name)
     cache_root = resolve_gmr_cache_root(cache_dir)
@@ -174,7 +196,7 @@ def download_gmr_dataset_group(
             logger.info("  [%s/%s] %s", index, len(dataset_names), dataset_name)
             downloaded_paths.append(path)
         except Exception as exc:
-            failures.append(dataset_name)
+            failures.append(dataset_name.cache_key)
             logger.warning("  [%s/%s] failed: %s (%s)", index, len(dataset_names), dataset_name, exc)
 
     if failures:

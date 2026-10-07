@@ -4,27 +4,52 @@ import json
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+import uuid
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from omegaconf import OmegaConf
+import jax
+from omegaconf import OmegaConf, open_dict
+
+from musclemimic.algorithms.common.distributed import device_count
+from musclemimic.algorithms.common.trajectory_sharding import (
+    ShardSpec,
+    shard_trajectory_data,
+    trajectory_sharding_mode,
+)
+
+from .environment_factory import instantiate_env
 
 # Fields excluded from config hash (they don't affect training identity)
-_HASH_EXCLUDE_FIELDS = frozenset({
-    "resume_from",
-    "reset_logging_timestep",
-    "checkpoint_dir",
-    "checkpoint_root",
-    "run_id",
-    "auto_resume",
-})
+_HASH_EXCLUDE_FIELDS = frozenset(
+    {
+        "resume_from",
+        "reset_logging_timestep",
+        "checkpoint_dir",
+        "checkpoint_root",
+        "run_id",
+        "auto_resume",
+        "wandb_run_id",
+        "validation",
+    }
+)
 
 
-def _is_checkpoint_complete(checkpoint_path: Path) -> bool:
+def generate_run_suffix() -> str:
+    """Return a per-run unique suffix for non-resumable checkpoint directories."""
+    timestamp = datetime.now(UTC).strftime("%y%m%dT%H%M%S")
+    job_number = os.environ.get("HYDRA_JOB_NUM")
+    job_suffix = f"-job{job_number}" if job_number is not None else ""
+    return f"{timestamp}-pid{os.getpid()}{job_suffix}-{uuid.uuid4().hex[:6]}"
+
+
+def is_checkpoint_complete(checkpoint_path: str | Path) -> bool:
     """Check if checkpoint has completed writing (Orbax finalized)."""
     from orbax.checkpoint import utils as ocp_utils
 
+    checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists() or not checkpoint_path.is_dir():
         return False
 
@@ -55,7 +80,7 @@ def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | None:
                 step = int(name.split("_")[1])
                 ckpt_path = checkpoint_dir / name
                 # Only include checkpoints with completed metadata
-                if _is_checkpoint_complete(ckpt_path):
+                if is_checkpoint_complete(ckpt_path):
                     checkpoints.append((step, ckpt_path))
             except (IndexError, ValueError):
                 continue
@@ -64,6 +89,13 @@ def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | None:
         return None
 
     return str(max(checkpoints, key=lambda x: x[0])[1])
+
+
+def read_checkpoint_metadata(checkpoint_path: str | Path) -> dict[str, Any]:
+    """Read the JSON metadata item from an Orbax checkpoint directory."""
+    metadata_path = Path(checkpoint_path) / "metadata" / "metadata"
+    with open(metadata_path) as f:
+        return json.load(f)
 
 
 def config_hash(config: Any, exclude: frozenset[str] | None = None) -> str:
@@ -138,7 +170,7 @@ def write_manifest(
     manifest = {
         "config_hash": config_hash_value,
         "git_sha": _get_git_sha(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
         "experiment_config": OmegaConf.to_container(config, resolve=True),
     }
 
@@ -171,7 +203,7 @@ def validate_checkpoint_compatibility(
 
         saved_hash = manifest.get("config_hash")
         if saved_hash and saved_hash != current_hash:
-            print(f"WARNING: Config hash mismatch!")
+            print("WARNING: Config hash mismatch!")
             print(f"  Checkpoint: {saved_hash}")
             print(f"  Current:    {current_hash}")
             print("  Continuing anyway (override with explicit resume_from if needed)")
@@ -209,9 +241,13 @@ def resolve_checkpoint_dir(
     if checkpoint_root:
         base = checkpoint_root if os.path.isabs(checkpoint_root) else os.path.join(launch_dir, checkpoint_root)
     elif auto_resume:
-        base = configured_ckpt_dir if os.path.isabs(configured_ckpt_dir) else os.path.join(launch_dir, configured_ckpt_dir)
+        base = (
+            configured_ckpt_dir if os.path.isabs(configured_ckpt_dir) else os.path.join(launch_dir, configured_ckpt_dir)
+        )
     else:
-        base = configured_ckpt_dir if os.path.isabs(configured_ckpt_dir) else os.path.join(result_dir, configured_ckpt_dir)
+        base = (
+            configured_ckpt_dir if os.path.isabs(configured_ckpt_dir) else os.path.join(result_dir, configured_ckpt_dir)
+        )
 
     # Append experiment_id for auto_resume, otherwise use unique suffix
     if auto_resume:
@@ -220,7 +256,7 @@ def resolve_checkpoint_dir(
         return base  # Caller adds unique suffix
 
 
-def _download_from_huggingface(repo_id: str, revision: str = None) -> str:
+def _download_from_huggingface(repo_id: str, revision: str | None = None) -> str:
     """Download checkpoint from HuggingFace and return local path.
 
     Args:
@@ -239,7 +275,7 @@ def _download_from_huggingface(repo_id: str, revision: str = None) -> str:
     return local_dir
 
 
-def _canonicalize_resume_path(path_like: str, revision: str = None) -> str:
+def _canonicalize_resume_path(path_like: str, revision: str | None = None) -> str:
     r"""Return a concrete checkpoint path to resume from.
 
     Accepts multiple user-friendly inputs and normalizes to an Orbax checkpoint
@@ -276,7 +312,7 @@ def _canonicalize_resume_path(path_like: str, revision: str = None) -> str:
     # Directory that may contain multiple checkpoint_* subdirs
     subdirs = [d for d in p.iterdir() if d.is_dir() and re.match(r"^checkpoint_\d+$", d.name)]
     # Filter to only complete checkpoints (have metadata)
-    complete_subdirs = [d for d in subdirs if _is_checkpoint_complete(d)]
+    complete_subdirs = [d for d in subdirs if is_checkpoint_complete(d)]
     if complete_subdirs:
         # Pick latest complete checkpoint by numeric step
         step = max(int(d.name.split("_")[-1]) for d in complete_subdirs)
@@ -286,6 +322,7 @@ def _canonicalize_resume_path(path_like: str, revision: str = None) -> str:
     if (p / "train_state").is_dir():
         # Read step from metadata/metadata and create expected checkpoint_<step> structure
         import json
+
         metadata_file = p / "metadata" / "metadata"
         if metadata_file.is_symlink():
             metadata_file = metadata_file.resolve()
@@ -301,18 +338,76 @@ def _canonicalize_resume_path(path_like: str, revision: str = None) -> str:
     raise ValueError(f"No valid checkpoints found in: {path_like}")
 
 
+def build_resume_runtime_state_target(config: Any, algorithm_cls: Any) -> Any:
+    """Build the typed runtime-state restore target for one device replica."""
+    target_config = OmegaConf.create(OmegaConf.to_container(config, resolve=True, throw_on_missing=False))
+    n_devices = device_count(config)
+    global_num_envs = int(config.experiment.num_envs)
+    if global_num_envs % n_devices != 0:
+        raise ValueError("num_envs must be divisible by num_devices to restore runtime_state.")
+
+    local_num_envs = global_num_envs // n_devices
+    with open_dict(target_config.experiment):
+        target_config.experiment.env_params.num_envs = local_num_envs
+
+    target_env = instantiate_env(target_config, localize_num_envs=False)
+    try:
+        _prepare_runtime_target_trajectory(
+            target_env,
+            target_config,
+            n_devices,
+        )
+        agent_conf = algorithm_cls.init_agent_conf(target_env, target_config)
+        target = algorithm_cls.build_runtime_state_restore_target(
+            jax.random.PRNGKey(0),
+            target_env,
+            agent_conf,
+            local_num_envs=local_num_envs,
+        )
+        return jax.device_get(target)
+    finally:
+        if hasattr(target_env, "stop"):
+            target_env.stop()
+
+
+def _prepare_runtime_target_trajectory(
+    env: Any,
+    config: Any,
+    n_devices: int,
+) -> None:
+    """Place only the trajectory data needed to shape an exact-resume target."""
+    if not getattr(env, "mjx_enabled", False) or env.th is None or not env.th.is_numpy:
+        return
+
+    if trajectory_sharding_mode(config) == "none":
+        env.th.to_jax()
+        return
+
+    spec = ShardSpec.build(int(env.th.n_trajectories), n_devices)
+    shards, _plan = shard_trajectory_data(
+        jax.device_get(env.th.traj.data),
+        spec,
+        global_indexed_split_points=True,
+    )
+    env.th.traj = replace(
+        env.th.traj,
+        data=shards[0].to_jax(),
+    )
+    env.th._is_numpy = False
+
+
 def resume_or_fresh(
     env: Any,
     agent_conf: Any,
     algorithm_cls: Any,
     config: Any,
     mh: Any,
-    logging_callback,
-    logging_interval: int = 1,
     val_env: Any = None,
     apply_resume_resets: bool = True,
+    preserve_checkpoint_target: bool = False,
+    runtime_state_target: Any | None = None,
 ):
-    """Return a train function that resumes from checkpoint or starts fresh.
+    """Prepare a fresh or resumed PPO training run.
 
     If `experiment.resume_from` is set, validates the path and raises ValueError
     if invalid. If not set, starts fresh training.
@@ -325,30 +420,24 @@ def resume_or_fresh(
 
     # Fresh training
     if not resume_from:
-        return algorithm_cls.build_train_fn(
+        training = algorithm_cls.build_training(
             env,
             agent_conf,
-            mh=mh,
-            online_logging_callback=logging_callback,
-            logging_interval=getattr(
-                config.experiment, "online_logging_interval", logging_interval
-            ),
+            metrics_handler=mh,
             val_env=val_env,
         )
+        return training, None
 
     # Normalize resume path to a specific checkpoint (raises ValueError if invalid)
     canonical = _canonicalize_resume_path(resume_from, revision=revision)
 
-    # Build resume train fn that loads on first call
-    return algorithm_cls.build_resume_train_fn_from_path(
+    return algorithm_cls.build_resumed_training(
         env,
         agent_conf,
         canonical,
-        mh=mh,
-        online_logging_callback=logging_callback,
-        logging_interval=getattr(
-            config.experiment, "online_logging_interval", logging_interval
-        ),
+        metrics_handler=mh,
         val_env=val_env,
         apply_resume_resets=apply_resume_resets,
+        preserve_checkpoint_target=preserve_checkpoint_target,
+        runtime_state_target=runtime_state_target,
     )

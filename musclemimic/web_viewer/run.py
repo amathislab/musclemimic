@@ -133,7 +133,7 @@ def parse_args():
         "--gmr-offset-to-ground",
         action="store_true",
         default=False,
-        help="Offset the trajectory to the ground plane.",
+        help="Enable GMR's per-frame source-joint grounding, which changes vertical motion.",
     )
     parser.add_argument(
         "--gmr-use-velocity-limit",

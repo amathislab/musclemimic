@@ -54,4 +54,7 @@ jobs:
       - name: Run tests
         env:
           MUJOCO_GL: glfw
+          JAX_PLATFORMS: cpu
+          CUDA_VISIBLE_DEVICES: ""
+          XLA_FLAGS: --xla_force_host_platform_device_count=4
         run: xvfb-run -a make test
