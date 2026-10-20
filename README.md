@@ -21,6 +21,7 @@ and retargeted motion datasets.
 
 ## News
 
+- **2026-10**: Updated contribution guide and roadmap! See [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md). Help us improve the project by filing issues, & submitting PRs!
 - **2026-06**: Added C3D browser tooling for fitting motion-capture markers,
   exporting AMASS/SMPL-H-compatible motion, and retargeting to MuscleMimic
   trajectories. See the [web viewer guide](musclemimic/web_viewer/README.md).
