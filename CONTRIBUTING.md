@@ -1,6 +1,12 @@
 # Contributing
 
-Thanks for contributing to `musclemimic`.
+Thanks for your interest in contributing to MuscleMimic! We welcome bug fixes, new features, documentation improvements, tests, and general maintenance contributions.
+
+Checkout [our roadmap](ROADMAP.md] for a list of planned features. Contributions that help us reach those goals are especially welcome.
+
+We especially encourage contributions from people from backgrounds that are underrepresented in open-source software. If you want to discuss an idea before opening a pull request, feel free to open an issue or email the team!
+
+If you are new to GitHub, the [GitHub Guides](https://docs.github.com/en) are a great place to start.
 
 ## Development Setup
 
