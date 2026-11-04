@@ -229,10 +229,11 @@ class TrajectoryHandler(StatefulObject):
                     site_to_be_removed[s_name] = i
 
         # create new traj_data and traj_info with removed joints, bodies and sites
+        backend = np if isinstance(traj_data.qpos, np.ndarray) else jnp
         if joint_to_be_removed_qpos:
             qpos_ind = jnp.concatenate(list(joint_to_be_removed_qpos.values()))
             qvel_ind = jnp.concatenate(list(joint_to_be_removed_qvel.values()))
-            traj_data = traj_data.remove_joints(qpos_ind, qvel_ind)
+            traj_data = traj_data.remove_joints(qpos_ind, qvel_ind, backend=backend)
             traj_info = traj_info.remove_joints(list(joint_to_be_removed_qpos.keys()))
         if bodies_to_be_removed:
             traj_data = traj_data.remove_bodies(jnp.array(list(bodies_to_be_removed.values())))
@@ -245,8 +246,8 @@ class TrajectoryHandler(StatefulObject):
         for j_name, j_id in zip(joint_names, joint_ids):
             j_type = model.jnt_type[j_id]
             if j_name not in traj_info.joint_names:
-                traj_info = traj_info.add_joint(j_name, j_type)
-                traj_data = traj_data.add_joint()
+                traj_info = traj_info.add_joint(j_name, j_type, backend=backend)
+                traj_data = traj_data.add_joint(backend=backend)
 
         if traj_info.body_names is not None:
             for b_name in body_names:
